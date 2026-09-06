@@ -108,8 +108,13 @@ jobs:
         run: |
           set -eu
           VERSION="${GITHUB_REF_NAME#v}"
+          # arca-shell is excluded from the workspace, so --manifest-path
+          # builds it into its own target directory and not the root one.
+          # Pointing the installer at the root target is what broke v0.3.0.
           cargo build --release --target ${{ matrix.target }} \
             --manifest-path windows/arca-shell/Cargo.toml
+          DLL="windows/arca-shell/target/${{ matrix.target }}/release/arca_shell.dll"
+          test -f "$DLL" || { echo "the shell extension is not at $DLL"; exit 1; }
           mkdir -p windows/assets
           # Inno Setup ships with the windows runner image, but not being able
           # to build the installer is not something to discover in a release.
@@ -120,7 +125,7 @@ jobs:
           "$ISCC" \
             //DVersion=$VERSION \
             "//DBinDir=..\\target\\${{ matrix.target }}\\release" \
-            "//DShellDir=..\\target\\${{ matrix.target }}\\release" \
+            "//DShellDir=arca-shell\\target\\${{ matrix.target }}\\release" \
             windows/arca.iss
           ls -la dist
           ARCHIVO=$(ls dist/arca-setup-*.exe)
