@@ -980,35 +980,6 @@ impl Arca {
         });
     }
 
-    fn start_test(&mut self, ctx: &egui::Context) {
-        let Some(a) = self.archive.clone() else { return };
-        let s: &'static Strings = self.s();
-        self.title = s.testing.to_string();
-        self.close_when_done = false;
-        let total = self.entries.len();
-        let ctx2 = ctx.clone();
-        self.spawn(ctx, total, move |tx| {
-            let notify = |i: usize, n: usize, name: &str| {
-                let _ = tx.send(Message::Progress(i, n, name.to_string()));
-                ctx2.request_repaint();
-            };
-            let _ = tx.send(match test_archive(&a, &notify) {
-                Ok((good, bad)) if bad.is_empty() => {
-                    Message::Done(fill(s.verified_ok, &[("n", &good.to_string())]))
-                }
-                Ok((good, bad)) => Message::Failed(format!(
-                    "{}: {}",
-                    fill(
-                        s.errors_found,
-                        &[("good", &good.to_string()), ("bad", &bad.len().to_string())]
-                    ),
-                    bad.join("; ")
-                )),
-                Err(e) => Message::Failed(e.to_string()),
-            });
-        });
-    }
-
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let s = self.s();
         ui.add_space(6.0);
@@ -1048,9 +1019,6 @@ impl Arca {
                     .clicked()
                 {
                     self.ask_extract(ctx, true);
-                }
-                if ui.add_enabled(has, egui::Button::new(s.test)).clicked() {
-                    self.start_test(ctx);
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

@@ -100,12 +100,39 @@ jobs:
           fi
           cat "$ARCHIVO.sha256"
 
+      # Only on Windows: a real setup.exe, with its uninstaller in Installed
+      # apps. The zip above is just loose binaries and installs no menus.
+      - name: Instalador de Windows
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          set -eu
+          VERSION="${GITHUB_REF_NAME#v}"
+          cargo build --release --target ${{ matrix.target }} \
+            --manifest-path windows/arca-shell/Cargo.toml
+          mkdir -p windows/assets
+          # Inno Setup ships with the windows runner image, but not being able
+          # to build the installer is not something to discover in a release.
+          ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          if [ ! -f "$ISCC" ]; then
+            choco install innosetup -y --no-progress
+          fi
+          "$ISCC" \
+            //DVersion=$VERSION \
+            "//DBinDir=..\\target\\${{ matrix.target }}\\release" \
+            "//DShellDir=..\\target\\${{ matrix.target }}\\release" \
+            windows/arca.iss
+          ls -la dist
+          ARCHIVO=$(ls dist/arca-setup-*.exe)
+          sha256sum "$ARCHIVO" | sed 's#dist/##' >> "dist/$(basename "$ARCHIVO").sha256"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.nombre }}
           path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.exe
             dist/*.sha256
           retention-days: 7
 
@@ -133,7 +160,7 @@ jobs:
       - name: Reunir los ficheros y las sumas
         run: |
           mkdir -p publicar
-          find artefactos -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} publicar/ \;
+          find artefactos -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' \) -exec cp {} publicar/ \;
           cat artefactos/*/*.sha256 | sed 's#.*/##' > publicar/SHA256SUMS.txt
           ls -la publicar
           cat publicar/SHA256SUMS.txt
@@ -155,16 +182,23 @@ jobs:
           sha256sum -c SHA256SUMS.txt --ignore-missing
           ```
 
-          ## Sin firmar
+          ## Windows
 
-          Estos binarios no llevan firma de codigo. Windows mostrara un aviso de
-          SmartScreen y macOS uno de Gatekeeper; en macOS se levanta con
-          `xattr -d com.apple.quarantine arca`. Firmarlos exige un certificado de
-          pago y esta en la lista de pendientes.
+          Use the installer, `arca-setup-*.exe`. It puts Arca in Installed apps
+          with its own uninstaller, adds both Explorer context menus, the file
+          associations and the PATH entry. The .zip is just the loose binaries
+          and integrates with nothing.
 
-          La extension del menu contextual de Windows no se distribuye aqui:
-          necesita un paquete MSIX firmado. Se construye desde el repo con
-          `windows\construir.ps1`, que requiere el Modo de desarrollador.
+          ## Not signed
+
+          These binaries carry no code signature. Windows will show a
+          SmartScreen warning and macOS a Gatekeeper one; on macOS clear it
+          with `xattr -d com.apple.quarantine arca`. Signing needs a paid
+          certificate and is on the pending list.
+
+          The modern Windows 11 menu also needs Developer Mode, because it is
+          registered as an unsigned sparse MSIX package. Without it the classic
+          menu, under "Show more options", still works.
           FIN
           gh release create "$GITHUB_REF_NAME" \
             --title "Arca $GITHUB_REF_NAME" \

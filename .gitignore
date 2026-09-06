@@ -6,3 +6,4 @@ windows/salida/
 *.tar
 *.tar.gz
 *.bundle
+/dist
