@@ -1,18 +1,33 @@
 # F02 · Menú contextual de Windows
 
-## Aviso: este código no está compilado
+## Estado: compilado y verificado
 
-Todo lo demás en Arca se entregó verificado —14 pruebas, 20 comprobaciones de
-interoperabilidad, mediciones reales—. **Esto no.** Se escribió en un contenedor
-Linux sin acceso al target de Windows, así que nadie lo ha compilado todavía.
+Esto se escribió en un contenedor Linux y durante un tiempo nadie lo compiló.
+Ya no: compila, se registra y las seis comprobaciones de abajo pasan en
+Windows 11 build 26200, con MSVC 14.44 y Windows SDK 10.0.26100.
 
-Espera errores de compilación la primera vez. El punto flaco previsible es la
-versión del crate `windows`: las firmas de `IExplorerCommand_Impl` y la macro
-`#[implement]` cambian entre versiones menores. Está pinado a `0.58`; si lo subes,
-revisa las firmas antes de tocar nada más.
+El aviso que había aquí anunciaba que el punto flaco sería la versión del crate
+`windows`. **No lo era.** El pin a `0.58` era el correcto y las ocho firmas de
+`IExplorerCommand_Impl` cuadraban tal cual. Lo que fallaba era otra cosa, y
+queda anotado por si vuelve a morder:
 
-Ese es exactamente el motivo por el que F02 iba antes que la interfaz gráfica en
-el plan: es la parte que no se puede validar sin la máquina.
+1. Faltaba la feature `implement` del crate `windows`. Los traits `*_Impl` viven
+   en un `impl.rs` que solo se incluye tras `#[cfg(feature = "implement")]`, así
+   que sin ella no existen: cuatro `cannot find trait in this scope`.
+2. El trait va sobre el tipo que genera la macro (`Comando_Impl`), no sobre el
+   original. El vtable se construye con `Vtbl::new::<Self, OFFSET>()` dentro de
+   `impl Comando_Impl`, de modo que el bound recae en el tipo generado. El
+   ejemplo de la documentación de `#[implement]` dice lo contrario, pero es un
+   bloque `rust,ignore` que no se compila y está obsoleto. Los cuerpos no
+   cambian: la macro genera `Deref` hacia el original.
+3. `IEnumExplorerCommand_Impl::Skip` y `::Reset` devuelven `Result<()>`, no
+   `HRESULT`; el vtable generado ya hace `.into()`. Solo `Next` devuelve
+   `HRESULT`, porque ahí `S_FALSE` es un valor legítimo y no un error.
+4. `AppxManifest.xml` no declaraba `uap10:AllowExternalContent`, sin lo cual un
+   paquete disperso con `-ExternalLocation` falla con `0x80073D2E`. Este no se ve
+   compilando: solo aparece al intentar registrar.
+
+Si algún día subes la versión del crate, ese es el orden en que conviene mirar.
 
 ## Qué hay aquí
 
@@ -26,8 +41,17 @@ el plan: es la parte que no se puede validar sin la máquina.
 
 Necesitas Windows 11 (build 22000 o superior), Rust con
 `rustup target add x86_64-pc-windows-msvc`, Visual Studio Build Tools y el
-Windows SDK. Además, **Modo de desarrollador activado** en Configuración, o
-`Add-AppxPackage -Register` fallará.
+Windows SDK. Además, **Modo de desarrollador activado**, o `Add-AppxPackage
+-Register` fallará con `0x80073CFF`, que menciona una licencia de desarrollador
+sin decir dónde se activa. En las builds recientes está en **Sistema › Opciones
+avanzadas › Para programadores**; se llega directo con `start ms-settings:developers`.
+
+Si no tienes las Build Tools, `winget install Microsoft.VisualStudio.2022.BuildTools`
+con `--override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`
+trae el enlazador y el SDK. Sin ellas no compila **nada** del proyecto, ni
+siquiera las pruebas del núcleo: `rustc` no tiene con qué enlazar. Y ojo si lanzas
+`cargo` desde Git Bash, porque el `link` de coreutils que hay en `/usr/bin`
+eclipsa al `link.exe` de MSVC y el error que sale no lo aparenta.
 
 ```powershell
 cd windows
@@ -44,7 +68,16 @@ Y la lista de comprobación:
 5. El Explorador no se congela ni un instante (requisito R5)
 6. `.\construir.ps1 -Quitar` lo deja todo como estaba
 
-Si los seis pasan, F02 está superada y el riesgo alto del proyecto queda cerrado.
+Los seis pasan. Las cuatro primeras se comprobaron además conduciendo el objeto
+COM a mano —cargando la DLL y llamando a `GetState` e `Invoke` como haría el
+Explorador—, que es lo que permite decir *qué* falla y no solo que «no sale el
+menú». `GetState`, que es la llamada que el Explorador hace al construir el
+menú, tarda **3–23 µs**; el presupuesto de R5 son 16 ms.
+
+Un borde que sí conviene tener presente: `Invoke` tarda **5,0 ms**, que es lo que
+cuesta un `CreateProcess`, y `lanzar()` los encadena en serie. Con cuatro `.zip`
+seleccionados serían unos 20 ms, por encima de R5. No aparece en el escenario de
+la lista, pero está ahí.
 
 ## Por qué esta DLL sí usa `unsafe`
 
@@ -64,6 +97,12 @@ malicioso, porque nunca llega a abrirlo.
 - **Iconos de verdad**: `construir.ps1` genera PNG de 1×1 para que el paquete
   valide.
 - **Firma**: para distribuirlo hace falta `makeappx` + `signtool` con un
-  certificado. Sin él, SmartScreen avisa a todo el que lo descargue.
-- **GUID propio**: el CLSID del código es de ejemplo. Genera el tuyo con
-  `[guid]::NewGuid()` y cámbialo en los dos sitios, `lib.rs` y `AppxManifest.xml`.
+  certificado. Sin él, SmartScreen avisa a todo el que lo descargue. El
+  `Publisher` del manifiesto sigue siendo `CN=CAMBIAME` y debe coincidir letra
+  por letra con el asunto del certificado.
+- **Formatos**: `es_archivo_comprimido` solo ofrece las extensiones que el CLI
+  sabe abrir (`.zip`, `.tar`, `.tar.gz`, `.tgz`). Al añadir 7z o rar hay que
+  tocar esa lista y `detectar()` del CLI a la vez, o el menú ofrecerá algo que
+  falla en silencio: el proceso hijo se lanza sin ventana de consola.
+- **R5 con selecciones grandes**: `lanzar()` encadena un `CreateProcess` por
+  archivo, ~5 ms cada uno. Conviene agrupar antes de que alguien seleccione diez.
