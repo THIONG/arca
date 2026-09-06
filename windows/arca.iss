@@ -50,6 +50,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName={#AppName} {#Version}
 UninstallDisplayIcon={app}\arca-gui.exe
+SetupIconFile=..\brand\arca.ico
 ChangesEnvironment=yes
 ChangesAssociations=yes
 

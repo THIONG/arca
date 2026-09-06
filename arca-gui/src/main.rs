@@ -20,6 +20,7 @@ use std::time::Instant;
 
 const BUF: usize = 256 * 1024;
 const ROW_HEIGHT: f32 = 20.0;
+const ICON_PNG: &[u8] = include_bytes!("../../brand/arca-256.png");
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Format {
@@ -1462,11 +1463,18 @@ fn main() -> eframe::Result<()> {
     } else {
         [1000.0, 660.0]
     };
+    // The icon compiled into the executable covers the Explorer and the
+    // shortcut, but winit does not read it for the window itself, so the title
+    // bar and the taskbar keep the generic one unless it is set here too.
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size(size)
+        .with_min_inner_size([460.0, 240.0])
+        .with_title("Arca");
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(ICON_PNG) {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size(size)
-            .with_min_inner_size([460.0, 240.0])
-            .with_title("Arca"),
+        viewport,
         ..Default::default()
     };
 

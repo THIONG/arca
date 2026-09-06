@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Arca">
+  <title>Arca</title>
+  <defs>
+    <linearGradient id="fondo" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#05060A"/><stop offset="1" stop-color="#1B2A4A"/>
+    </linearGradient>
+    <mask id="cuerpo">
+      <rect x="10" y="27" width="44" height="23" rx="4" fill="#fff"/>
+      <path d="M24,34.8 h16 a1.8,1.8 0 0 1 1.7,2.4 l-1.9,5.2 a2.2,2.2 0 0 1 -2.1,1.5 h-11.4 a2.2,2.2 0 0 1 -2.1,-1.5 l-1.9,-5.2 a1.8,1.8 0 0 1 1.7,-2.4 z" fill="#000"/>
+    </mask>
+  </defs>
+  <rect width="64" height="64" rx="14.5" fill="url(#fondo)"/>
+  <rect x="10" y="14" width="44" height="10" rx="4" fill="#fff"/>
+  <rect x="10" y="27" width="44" height="23" rx="4" fill="#fff" mask="url(#cuerpo)"/>
+</svg>

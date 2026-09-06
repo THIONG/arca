@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Arca">
+  <title>Arca</title>
+  <g fill="currentColor" fill-rule="evenodd">
+    <rect x="10" y="14" width="44" height="10" rx="4"/>
+    <path d="M14,27 h36 a4,4 0 0 1 4,4 v15 a4,4 0 0 1 -4,4 h-36 a4,4 0 0 1 -4,-4 v-15 a4,4 0 0 1 4,-4 z M25.2,34.8 h13.6 a3.7,3.7 0 0 1 0,7.4 h-13.6 a3.7,3.7 0 0 1 0,-7.4 z"/>
+  </g>
+</svg>
