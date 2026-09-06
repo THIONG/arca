@@ -1,9 +1,3 @@
-//! ZIP: lector y escritor.
-//!
-//! El lector **no carga el archivo entero**. Lee la cola para localizar el
-//! directorio central y luego solo ese directorio, de modo que listar un ZIP
-//! de varios GB cuesta lo mismo que listar uno de 10 MB. Es el requisito R2.
-
 #![forbid(unsafe_code)]
 
 use arca_core::{limits, Codec, Cursor, Entry, Error, Level, Method, Result};
@@ -20,13 +14,10 @@ const SIG_LFH: u32 = 0x0403_4b50;
 const EOCD_MIN: usize = 22;
 const CD_FIJO: usize = 46;
 const LFH_FIJO: usize = 30;
-/// Campo Zip64 reservado en cada cabecera local: id + tamano + dos u64.
 const EXTRA_Z64: usize = 20;
 const MAX_COMENTARIO: usize = 65_535;
-/// Buffer de flujo. Grande a proposito: en modo rapido manda el disco (R4).
 const BUF_FLUJO: usize = 256 * 1024;
 
-/// Envoltorio de escritura que va calculando el CRC-32 de lo que pasa.
 struct CrcWriter<W: Write> {
     inner: W,
     hasher: crc32fast::Hasher,
@@ -54,23 +45,18 @@ impl<W: Write> Write for CrcWriter<W> {
     }
 }
 
-// ---------------------------------------------------------------- lectura
-
-/// Un ZIP abierto para lectura.
 pub struct ZipArchive<R: Read + Seek> {
     fuente: R,
     entradas: Vec<Entry>,
 }
 
 impl<R: Read + Seek> ZipArchive<R> {
-    /// Abre el archivo leyendo solo la cola y el directorio central.
     pub fn open(mut fuente: R) -> Result<Self> {
         let total = fuente.seek(SeekFrom::End(0))?;
         if total < EOCD_MIN as u64 {
             return Err(Error::Format("demasiado corto para ser un ZIP".into()));
         }
 
-        // 1. Buscar el EOCD en la cola (22 bytes + hasta 64 KB de comentario).
         let cola_len = (EOCD_MIN + MAX_COMENTARIO).min(total as usize);
         let cola_ini = total - cola_len as u64;
         fuente.seek(SeekFrom::Start(cola_ini))?;
@@ -89,7 +75,6 @@ impl<R: Read + Seek> ZipArchive<R> {
         let mut cd_tam = c.u32le("tamano del directorio")? as u64;
         let mut cd_off = c.u32le("desplazamiento del directorio")? as u64;
 
-        // 2. Si algo esta saturado a 0xFFFF/0xFFFFFFFF, hay Zip64 detras.
         if n_entradas == 0xFFFF || cd_tam == 0xFFFF_FFFF || cd_off == 0xFFFF_FFFF {
             if let Some(p) = buscar_hacia_atras(&cola[..pos_eocd], SIG_LOC64) {
                 let mut l = Cursor::en(&cola, p)?;
@@ -123,7 +108,6 @@ impl<R: Read + Seek> ZipArchive<R> {
             ));
         }
 
-        // 3. Leer solo el directorio central.
         fuente.seek(SeekFrom::Start(cd_off))?;
         let mut cd = vec![0u8; cd_tam as usize];
         fuente.read_exact(&mut cd)?;
@@ -132,7 +116,7 @@ impl<R: Read + Seek> ZipArchive<R> {
         let mut c = Cursor::new(&cd);
         for i in 0..n_entradas {
             if c.restantes() < CD_FIJO {
-                break; // directorio mas corto de lo declarado: paramos, no fallamos
+                break;
             }
             match leer_cabecera_central(&mut c) {
                 Ok(e) => entradas.push(e),
@@ -159,10 +143,6 @@ impl<R: Read + Seek> ZipArchive<R> {
         self.entradas.is_empty()
     }
 
-    /// Extrae la entrada `idx` escribiendo en `destino`, en flujo.
-    ///
-    /// No materializa la entrada en memoria: el pico de memoria no depende del
-    /// tamano del archivo (requisito R6). Verifica el CRC-32 al terminar.
     pub fn extract_to<W: Write>(&mut self, idx: usize, destino: W) -> Result<u64> {
         let e = self
             .entradas
@@ -170,8 +150,6 @@ impl<R: Read + Seek> ZipArchive<R> {
             .ok_or_else(|| Error::Format(format!("no existe la entrada {idx}")))?
             .clone();
 
-        // La cabecera local nos da el tamano real de nombre y extra, que puede
-        // diferir del que declara el directorio central.
         self.fuente.seek(SeekFrom::Start(e.offset))?;
         let mut lfh = [0u8; LFH_FIJO];
         self.fuente.read_exact(&mut lfh)?;
@@ -187,8 +165,6 @@ impl<R: Read + Seek> ZipArchive<R> {
         if flags & 1 != 0 {
             return Err(Error::Unsupported(format!("«{}» esta cifrada", e.name)));
         }
-        // Tras firma(4) + version(2) + flags(2) quedan metodo, hora, fecha,
-        // crc y los dos tamanos: 18 bytes hasta la longitud del nombre.
         c.saltar(18, "resto de la cabecera local")?;
         let n_len = c.u16le("longitud del nombre")? as u64;
         let x_len = c.u16le("longitud de extra")? as u64;
@@ -246,10 +222,6 @@ fn buscar_hacia_atras(buf: &[u8], firma: u32) -> Option<usize> {
     (0..=buf.len() - 4).rev().find(|&i| buf[i..i + 4] == f)
 }
 
-/// Mitad alta de CP437, la pagina de codigos que ZIP usa para los nombres
-/// cuando el bit 11 no esta puesto. La mitad baja coincide con ASCII, asi que
-/// solo hace falta desde 0x80. Va con escapes Unicode para que este fichero
-/// siga siendo ASCII puro, como el resto de `src/`.
 #[rustfmt::skip]
 const CP437_ALTO: [char; 128] = [
     '\u{00C7}', '\u{00FC}', '\u{00E9}', '\u{00E2}', '\u{00E4}', '\u{00E0}', '\u{00E5}', '\u{00E7}',
@@ -270,10 +242,6 @@ const CP437_ALTO: [char; 128] = [
     '\u{00B0}', '\u{2219}', '\u{00B7}', '\u{221A}', '\u{207F}', '\u{00B2}', '\u{25A0}', '\u{00A0}',
 ];
 
-/// Decodifica un nombre en CP437. Es infalible por construccion: los 256 bytes
-/// posibles tienen caracter asignado, asi que ninguna basura puede provocar un
-/// error ni un caracter de reemplazo. El indice cae siempre en 0..=127, porque
-/// la otra rama se queda con todo lo que es ASCII.
 fn de_cp437(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -302,7 +270,6 @@ fn leer_cabecera_central(c: &mut Cursor<'_>) -> Result<Entry> {
     let n_len = c.u16le("longitud del nombre")? as usize;
     let x_len = c.u16le("longitud de extra")? as usize;
     let k_len = c.u16le("longitud del comentario")? as usize;
-    // Disco de inicio (2) + atributos internos (2).
     c.saltar(4, "disco y atributos internos")?;
     let _ext_attr = c.u32le("atributos externos")?;
     let mut offset = c.u32le("desplazamiento local")? as u64;
@@ -318,8 +285,6 @@ fn leer_cabecera_central(c: &mut Cursor<'_>) -> Result<Entry> {
     let extra = c.bytes(x_len, "campo extra")?;
     c.saltar(k_len, "comentario")?;
 
-    // Zip64: los campos saturados a 0xFFFFFFFF viven en el campo extra 0x0001,
-    // y aparecen en orden fijo, solo los que estaban saturados.
     if sin_comp == 0xFFFF_FFFF || comp == 0xFFFF_FFFF || offset == 0xFFFF_FFFF {
         let mut x = Cursor::new(extra);
         while x.restantes() >= 4 {
@@ -356,9 +321,6 @@ fn leer_cabecera_central(c: &mut Cursor<'_>) -> Result<Entry> {
         }
     };
 
-    // El bit 11 indica nombre en UTF-8. Sin el, la especificacion manda CP437,
-    // que es lo que escriben el Explorador de Windows y las herramientas
-    // antiguas: ahi el byte 0x82 es una «e» acentuada, no UTF-8 invalido.
     let name = if flags & 0x800 != 0 {
         String::from_utf8_lossy(nombre_bytes).into_owned()
     } else {
@@ -378,8 +340,6 @@ fn leer_cabecera_central(c: &mut Cursor<'_>) -> Result<Entry> {
     })
 }
 
-// ---------------------------------------------------------------- escritura
-
 struct Registro {
     nombre: Vec<u8>,
     crc: u32,
@@ -392,7 +352,6 @@ struct Registro {
     dir: bool,
 }
 
-/// Escritor de ZIP en flujo.
 pub struct ZipWriter<W: Write + Seek> {
     salida: W,
     registros: Vec<Registro>,
@@ -404,7 +363,6 @@ impl<W: Write + Seek> ZipWriter<W> {
         ZipWriter { salida, registros: Vec::new(), pos: 0 }
     }
 
-    /// Anade una entrada comprimiendo sobre la marcha, en flujo.
     pub fn add<R: Read>(
         &mut self,
         nombre: &str,
@@ -458,8 +416,6 @@ impl<W: Write + Seek> ZipWriter<W> {
                         nivel.a_zstd(),
                     )
                     .map_err(Error::Io)?;
-                    // Multihilo interno de libzstd: reparte un fichero grande
-                    // entre nucleos sin que la capa de arriba intervenga.
                     let _ = enc.multithread(hilos_disponibles());
                     loop {
                         let n = datos.read(&mut buf)?;
@@ -486,10 +442,6 @@ impl<W: Write + Seek> ZipWriter<W> {
         )
     }
 
-    /// Anade una entrada ya comprimida.
-    ///
-    /// Es la puerta que usa el modo multihilo: los trabajadores comprimen en
-    /// paralelo y aqui solo se escribe, respetando el orden original.
     pub fn add_comprimido(
         &mut self,
         nombre: &str,
@@ -511,7 +463,6 @@ impl<W: Write + Seek> ZipWriter<W> {
         )
     }
 
-    /// Rellena los huecos de la cabecera local y registra la entrada.
     #[allow(clippy::too_many_arguments)]
     fn cerrar_entrada(
         &mut self,
@@ -557,19 +508,17 @@ impl<W: Write + Seek> ZipWriter<W> {
     fn escribir_lfh(&mut self, nombre: &[u8], metodo: u16, fecha: u16, hora: u16) -> Result<()> {
         let mut h = Vec::with_capacity(LFH_FIJO + nombre.len() + EXTRA_Z64);
         h.extend_from_slice(&SIG_LFH.to_le_bytes());
-        h.extend_from_slice(&45u16.to_le_bytes()); // version: Zip64
-        h.extend_from_slice(&(0x0800u16).to_le_bytes()); // bit 11: nombre en UTF-8
+        h.extend_from_slice(&45u16.to_le_bytes());
+        h.extend_from_slice(&(0x0800u16).to_le_bytes());
         h.extend_from_slice(&metodo.to_le_bytes());
         h.extend_from_slice(&hora.to_le_bytes());
         h.extend_from_slice(&fecha.to_le_bytes());
-        h.extend_from_slice(&0u32.to_le_bytes()); // crc: se rellena despues
-        h.extend_from_slice(&0u32.to_le_bytes()); // comprimido
-        h.extend_from_slice(&0u32.to_le_bytes()); // sin comprimir
+        h.extend_from_slice(&0u32.to_le_bytes());
+        h.extend_from_slice(&0u32.to_le_bytes());
+        h.extend_from_slice(&0u32.to_le_bytes());
         h.extend_from_slice(&(nombre.len() as u16).to_le_bytes());
         h.extend_from_slice(&(EXTRA_Z64 as u16).to_le_bytes());
         h.extend_from_slice(nombre);
-        // Campo Zip64 reservado, para poder rellenarlo sin mover nada si la
-        // entrada resulta pasar de 4 GB.
         h.extend_from_slice(&0x0001u16.to_le_bytes());
         h.extend_from_slice(&16u16.to_le_bytes());
         h.extend_from_slice(&0u64.to_le_bytes());
@@ -578,15 +527,11 @@ impl<W: Write + Seek> ZipWriter<W> {
         Ok(())
     }
 
-    /// Cierra el archivo escribiendo el directorio central.
     pub fn finish(mut self) -> Result<W> {
         let cd_off = self.pos;
         let mut cd_tam = 0u64;
 
         for r in &self.registros {
-            // El campo Zip64 lleva SOLO los valores saturados, en este orden:
-            // sin comprimir, comprimido, desplazamiento. Meter otros descoloca
-            // al lector.
             let sat_u = r.sin_comp >= 0xFFFF_FFFF;
             let sat_c = r.comp >= 0xFFFF_FFFF;
             let sat_o = r.offset >= 0xFFFF_FFFF;
@@ -611,7 +556,7 @@ impl<W: Write + Seek> ZipWriter<W> {
 
             let mut h = Vec::with_capacity(CD_FIJO + r.nombre.len() + extra.len());
             h.extend_from_slice(&SIG_CD.to_le_bytes());
-            h.extend_from_slice(&(0x031Eu16).to_le_bytes()); // hecho por: Unix, v3.0
+            h.extend_from_slice(&(0x031Eu16).to_le_bytes());
             h.extend_from_slice(&45u16.to_le_bytes());
             h.extend_from_slice(&(0x0800u16).to_le_bytes());
             h.extend_from_slice(&r.metodo.to_le_bytes());
@@ -622,9 +567,9 @@ impl<W: Write + Seek> ZipWriter<W> {
             h.extend_from_slice(&(r.sin_comp.min(0xFFFF_FFFF) as u32).to_le_bytes());
             h.extend_from_slice(&(r.nombre.len() as u16).to_le_bytes());
             h.extend_from_slice(&(extra.len() as u16).to_le_bytes());
-            h.extend_from_slice(&0u16.to_le_bytes()); // comentario
-            h.extend_from_slice(&0u16.to_le_bytes()); // disco
-            h.extend_from_slice(&0u16.to_le_bytes()); // atributos internos
+            h.extend_from_slice(&0u16.to_le_bytes());
+            h.extend_from_slice(&0u16.to_le_bytes());
+            h.extend_from_slice(&0u16.to_le_bytes());
             let modo: u32 = if r.dir { 0o040755 } else { 0o100644 };
             h.extend_from_slice(&((modo << 16) | if r.dir { 0x10 } else { 0 }).to_le_bytes());
             h.extend_from_slice(&(r.offset.min(0xFFFF_FFFF) as u32).to_le_bytes());
@@ -651,7 +596,6 @@ impl<W: Write + Seek> ZipWriter<W> {
             z.extend_from_slice(&n.to_le_bytes());
             z.extend_from_slice(&cd_tam.to_le_bytes());
             z.extend_from_slice(&cd_off.to_le_bytes());
-            // localizador
             z.extend_from_slice(&SIG_LOC64.to_le_bytes());
             z.extend_from_slice(&0u32.to_le_bytes());
             z.extend_from_slice(&z_off.to_le_bytes());
@@ -674,7 +618,6 @@ impl<W: Write + Seek> ZipWriter<W> {
     }
 }
 
-/// Cuenta cuantos bytes salen, para saber el tamano comprimido sin bufferizar.
 struct Contador<W: Write> {
     inner: W,
     escritos: u64,
@@ -718,9 +661,6 @@ fn hilos_disponibles() -> u32 {
     std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1)
 }
 
-/// Comprime un bloque en memoria y devuelve (datos, metodo, crc).
-///
-/// Es lo que ejecuta cada trabajador del modo multihilo.
 pub fn comprimir_bloque(datos: &[u8], codec: Codec, nivel: Level) -> Result<(Vec<u8>, Method, u32)> {
     let crc = arca_core::crc32(datos);
     match codec {
@@ -785,7 +725,6 @@ mod tests {
         let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
         w.add("a.txt", &b"contenido original"[..], Codec::Store, Level::Store, None).unwrap();
         let mut buf = w.finish().unwrap().into_inner();
-        // Alterar un byte de los datos, dejando el CRC como estaba.
         let p = LFH_FIJO + "a.txt".len() + EXTRA_Z64 + 3;
         buf[p] ^= 0xFF;
         let mut a = ZipArchive::open(IoCursor::new(buf)).unwrap();
@@ -806,7 +745,6 @@ mod tests {
 
     #[test]
     fn eocd_declarando_directorio_gigante() {
-        // EOCD valido que dice que el directorio central mide 4 GB.
         let mut b = Vec::new();
         b.extend_from_slice(&SIG_EOCD.to_le_bytes());
         b.extend_from_slice(&0u16.to_le_bytes());
@@ -832,42 +770,37 @@ mod tests {
         assert_eq!(a.entries()[499].name, "f0499.txt");
     }
 
-    /// Cabecera de directorio central minima, para probar el parseo de nombres
-    /// sin pasar por el escritor, que siempre pone el bit 11.
     fn cabecera_central(flags: u16, nombre: &[u8]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&SIG_CD.to_le_bytes());
-        b.extend_from_slice(&0x031Eu16.to_le_bytes()); // hecho por
-        b.extend_from_slice(&45u16.to_le_bytes()); // version necesaria
+        b.extend_from_slice(&0x031Eu16.to_le_bytes());
+        b.extend_from_slice(&45u16.to_le_bytes());
         b.extend_from_slice(&flags.to_le_bytes());
-        b.extend_from_slice(&0u16.to_le_bytes()); // metodo: store
-        b.extend_from_slice(&0u16.to_le_bytes()); // hora
-        b.extend_from_slice(&0u16.to_le_bytes()); // fecha
-        b.extend_from_slice(&0u32.to_le_bytes()); // crc
-        b.extend_from_slice(&0u32.to_le_bytes()); // comprimido
-        b.extend_from_slice(&0u32.to_le_bytes()); // sin comprimir
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
         b.extend_from_slice(&(nombre.len() as u16).to_le_bytes());
-        b.extend_from_slice(&0u16.to_le_bytes()); // extra
-        b.extend_from_slice(&0u16.to_le_bytes()); // comentario
-        b.extend_from_slice(&0u16.to_le_bytes()); // disco
-        b.extend_from_slice(&0u16.to_le_bytes()); // atributos internos
-        b.extend_from_slice(&0u32.to_le_bytes()); // atributos externos
-        b.extend_from_slice(&0u32.to_le_bytes()); // desplazamiento local
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
         b.extend_from_slice(nombre);
         b
     }
 
     #[test]
     fn nombre_sin_bit_utf8_se_lee_como_cp437() {
-        // 0x82 es «e» acentuada en CP437 y a la vez UTF-8 invalido: es el caso
-        // que distingue las dos ramas.
         let crudo = b"caf\x82.txt";
 
         let b = cabecera_central(0, crudo);
         let e = leer_cabecera_central(&mut Cursor::new(&b)).unwrap();
         assert_eq!(e.name, "caf\u{00E9}.txt");
 
-        // Con el bit 11 puesto, el mismo byte si es UTF-8 roto: reemplazo.
         let b = cabecera_central(0x800, crudo);
         let e = leer_cabecera_central(&mut Cursor::new(&b)).unwrap();
         assert_eq!(e.name, "caf\u{FFFD}.txt");
@@ -894,7 +827,6 @@ mod tests {
             for flags in [0u16, 0x800] {
                 let b = cabecera_central(flags, &nombre);
                 let _ = leer_cabecera_central(&mut Cursor::new(&b));
-                // Y la misma cabecera truncada por todos los puntos posibles.
                 for corte in 0..b.len() {
                     let _ = leer_cabecera_central(&mut Cursor::new(&b[..corte]));
                 }

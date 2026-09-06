@@ -1,8 +1,3 @@
-//! TAR (formato ustar POSIX).
-//!
-//! Cabeceras de 512 bytes con checksum. Sin compresion propia: un `.tar.gz`
-//! es este flujo pasado por gzip, y de eso se encarga la capa de arriba.
-
 #![forbid(unsafe_code)]
 
 use arca_core::{limits, Entry, Error, Method, Result};
@@ -10,7 +5,6 @@ use std::io::{self, Read, Write};
 
 const BLOQUE: usize = 512;
 
-/// Lee un entero en octal ASCII, tolerando espacios y nulos de relleno.
 fn octal(campo: &[u8], que: &str) -> Result<u64> {
     let s: Vec<u8> = campo
         .iter()
@@ -46,7 +40,6 @@ fn escribir_octal(destino: &mut [u8], valor: u64) {
 fn checksum(cab: &[u8; BLOQUE]) -> u32 {
     let mut s: u32 = 0;
     for (i, &b) in cab.iter().enumerate() {
-        // El propio campo de checksum se cuenta como espacios.
         s += if (148..156).contains(&i) { 32 } else { b as u32 };
     }
     s
@@ -57,14 +50,11 @@ fn cadena(campo: &[u8]) -> String {
     String::from_utf8_lossy(&campo[..fin]).into_owned()
 }
 
-/// Una entrada de TAR ya localizada dentro del flujo.
 pub struct TarEntry {
     pub entry: Entry,
-    /// Bytes de datos que siguen a la cabecera.
     pub datos: u64,
 }
 
-/// Lector secuencial de TAR.
 pub struct TarReader<R: Read> {
     fuente: R,
     pos: u64,
@@ -76,7 +66,6 @@ impl<R: Read> TarReader<R> {
         TarReader { fuente, pos: 0, terminado: false }
     }
 
-    /// Avanza a la siguiente entrada. Devuelve `None` al final del archivo.
     pub fn next_entry(&mut self) -> Result<Option<TarEntry>> {
         if self.terminado {
             return Ok(None);
@@ -92,7 +81,6 @@ impl<R: Read> TarReader<R> {
         }
         self.pos += BLOQUE as u64;
 
-        // Dos bloques a cero marcan el final.
         if cab.iter().all(|&b| b == 0) {
             self.terminado = true;
             return Ok(None);
@@ -141,7 +129,6 @@ impl<R: Read> TarReader<R> {
         Ok(Some(TarEntry { entry, datos: if is_dir { 0 } else { size } }))
     }
 
-    /// Copia los datos de la entrada actual y deja el flujo en la siguiente.
     pub fn copiar_datos<W: Write>(&mut self, e: &TarEntry, destino: &mut W) -> Result<u64> {
         let n = io::copy(&mut (&mut self.fuente).take(e.datos), destino)?;
         self.pos += n;
@@ -154,13 +141,11 @@ impl<R: Read> TarReader<R> {
         Ok(n)
     }
 
-    /// Descarta los datos de la entrada actual.
     pub fn saltar_datos(&mut self, e: &TarEntry) -> Result<()> {
         self.copiar_datos(e, &mut io::sink()).map(|_| ())
     }
 }
 
-/// Escritor de TAR.
 pub struct TarWriter<W: Write> {
     salida: W,
 }
@@ -193,8 +178,6 @@ impl<W: Write> TarWriter<W> {
         if !prefijo.is_empty() {
             cab[345..345 + prefijo.len()].copy_from_slice(prefijo.as_bytes());
         }
-        // El checksum se calcula con el campo lleno de espacios y se escribe
-        // como seis digitos octales, un nulo y un espacio.
         let suma = checksum(&cab);
         let s = format!("{suma:06o}");
         cab[148..154].copy_from_slice(s.as_bytes());
@@ -215,7 +198,6 @@ impl<W: Write> TarWriter<W> {
         Ok(())
     }
 
-    /// Cierra con los dos bloques nulos que exige el formato.
     pub fn finish(mut self) -> Result<W> {
         self.salida.write_all(&[0u8; BLOQUE * 2])?;
         self.salida.flush()?;
@@ -227,7 +209,6 @@ fn partir_nombre(nombre: &str) -> Result<(&str, &str)> {
     if nombre.len() <= 100 {
         return Ok(("", nombre));
     }
-    // ustar permite 155 bytes de prefijo + 100 de nombre, cortando por una barra.
     let corte = nombre[..nombre.len().min(156)]
         .rfind('/')
         .ok_or_else(|| Error::Limit(format!("nombre de {} bytes sin punto de corte", nombre.len())))?;
@@ -266,7 +247,7 @@ mod tests {
         let mut w = TarWriter::new(Vec::new());
         w.add("a.txt", 3, 0, 0o644, &b"abc"[..]).unwrap();
         let mut buf = w.finish().unwrap();
-        buf[10] ^= 0xFF; // altera el nombre sin recalcular el checksum
+        buf[10] ^= 0xFF;
         let mut r = TarReader::new(&buf[..]);
         assert!(r.next_entry().is_err());
     }

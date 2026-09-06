@@ -1,36 +1,19 @@
-//! Tipos comunes de Arca.
-//!
-//! Este crate y todos los parsers prohiben `unsafe` a nivel de crate
-//! (`#![forbid(unsafe_code)]` via Cargo lints). Es la garantia sobre la que
-//! se apoya el argumento de seguridad del proyecto.
-
 use std::fmt;
 use std::io;
 
-/// Limites de cordura. Un archivo malicioso puede declarar cualquier cifra en
-/// sus cabeceras; estos topes evitan que una cifra absurda se convierta en una
-/// reserva de memoria absurda.
 pub mod limits {
-    /// Longitud maxima de un nombre dentro del archivo.
     pub const MAX_NAME: usize = 4096;
-    /// Numero maximo de entradas que aceptamos listar.
     pub const MAX_ENTRIES: u64 = 10_000_000;
-    /// Tamano maximo de un bloque de campos extra.
     pub const MAX_EXTRA: usize = 65_535;
-    /// Ratio de expansion maximo antes de sospechar de una zip bomb.
     pub const MAX_RATIO: u64 = 1000;
 }
 
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
-    /// El archivo no tiene la forma que dice tener.
     Format(String),
-    /// Una cabecera declara algo que supera los limites de cordura.
     Limit(String),
-    /// CRC o checksum no coincide tras descomprimir.
     Integrity { name: String, esperado: u32, obtenido: u32 },
-    /// Formato o caracteristica reconocida pero no implementada todavia.
     Unsupported(String),
 }
 
@@ -66,12 +49,10 @@ impl From<io::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Metodo de compresion de una entrada.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Store,
     Deflate,
-    /// Zstandard. Codigo 93 en la especificacion ZIP.
     Zstd,
 }
 
@@ -84,7 +65,6 @@ impl Method {
         }
     }
 
-    /// Codigo tal como se guarda en las cabeceras ZIP.
     pub fn codigo(self) -> u16 {
         match self {
             Method::Store => 0,
@@ -94,7 +74,6 @@ impl Method {
     }
 }
 
-/// Nivel de compresion pedido por el usuario.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
     Store,
@@ -104,7 +83,6 @@ pub enum Level {
 }
 
 impl Level {
-    /// Nivel numerico para zlib-rs.
     pub fn a_flate2(self) -> u32 {
         match self {
             Level::Store => 0,
@@ -114,8 +92,6 @@ impl Level {
         }
     }
 
-    /// Nivel numerico para libzstd. El 3 es el punto de equilibrio que la
-    /// seccion 05 del diseno fija como valor por defecto.
     pub fn a_zstd(self) -> i32 {
         match self {
             Level::Store => 1,
@@ -126,8 +102,6 @@ impl Level {
     }
 }
 
-/// Que compresor usar. `Auto` deja que Arca elija: Zstandard cuando esta
-/// compilado, DEFLATE si no.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
     Store,
@@ -135,10 +109,6 @@ pub enum Codec {
     Zstd,
 }
 
-/// Una entrada listada, sin descomprimir nada.
-///
-/// Obtener esto para un archivo de varios GB debe costar milisegundos:
-/// es el requisito R2 del documento de diseno.
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
@@ -147,9 +117,7 @@ pub struct Entry {
     pub method: Method,
     pub crc32: u32,
     pub is_dir: bool,
-    /// Tiempo de modificacion en segundos Unix, si el formato lo trae.
     pub mtime: Option<i64>,
-    /// Desplazamiento de la cabecera local dentro del archivo.
     pub offset: u64,
 }
 
@@ -162,11 +130,6 @@ impl Entry {
     }
 }
 
-/// Lector de bytes con comprobacion de limites.
-///
-/// Todo el parseo de cabeceras pasa por aqui. Nunca indexa directamente un
-/// slice, de modo que una cabecera truncada produce un `Error::Format` y no
-/// un panic ni una lectura fuera de rango.
 pub struct Cursor<'a> {
     datos: &'a [u8],
     pos: usize,
@@ -236,14 +199,12 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// CRC-32 (IEEE), el que usan ZIP y gzip.
 pub fn crc32(datos: &[u8]) -> u32 {
     let mut h = crc32fast::Hasher::new();
     h.update(datos);
     h.finalize()
 }
 
-/// Convierte una fecha MS-DOS (la que guarda el ZIP) a segundos Unix.
 pub fn dos_a_unix(fecha: u16, hora: u16) -> Option<i64> {
     let anyo = 1980i64 + ((fecha >> 9) & 0x7f) as i64;
     let mes = ((fecha >> 5) & 0x0f) as i64;
@@ -254,7 +215,6 @@ pub fn dos_a_unix(fecha: u16, hora: u16) -> Option<i64> {
     if !(1..=12).contains(&mes) || !(1..=31).contains(&dia) || h > 23 || m > 59 || s > 59 {
         return None;
     }
-    // Dias desde la epoca, algoritmo de Howard Hinnant.
     let y = if mes <= 2 { anyo - 1 } else { anyo };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
@@ -265,7 +225,6 @@ pub fn dos_a_unix(fecha: u16, hora: u16) -> Option<i64> {
     Some(dias * 86_400 + h * 3600 + m * 60 + s)
 }
 
-/// Convierte segundos Unix a fecha y hora MS-DOS.
 pub fn unix_a_dos(ts: i64) -> (u16, u16) {
     let dias = ts.div_euclid(86_400);
     let resto = ts.rem_euclid(86_400);
@@ -287,10 +246,6 @@ pub fn unix_a_dos(ts: i64) -> (u16, u16) {
     (fecha, hora)
 }
 
-/// Rechaza nombres que se escapen del directorio de extraccion.
-///
-/// Cubre `../`, rutas absolutas y, en Windows, letras de unidad y separadores
-/// invertidos. Es la defensa contra Zip Slip.
 pub fn nombre_seguro(nombre: &str) -> Result<std::path::PathBuf> {
     if nombre.len() > limits::MAX_NAME {
         return Err(Error::Limit(format!("nombre de {} bytes", nombre.len())));
@@ -356,11 +311,9 @@ mod tests {
 
     #[test]
     fn fechas_dos_ida_y_vuelta() {
-        // 2024-03-15 10:30:00
         let ts = 1_710_498_600i64;
         let (f, h) = unix_a_dos(ts);
         let vuelta = dos_a_unix(f, h).unwrap();
-        // La resolucion DOS es de 2 segundos.
         assert!((vuelta - ts).abs() <= 2, "{vuelta} vs {ts}");
     }
 }

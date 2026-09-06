@@ -1,21 +1,3 @@
-//! Extensión del menú contextual del Explorador de Windows.
-//!
-//! # Aviso
-//!
-//! Este es el único crate de Arca que usa `unsafe`, y es inevitable: COM exige
-//! punteros crudos y convenciones de llamada de C. Está aislado a propósito.
-//! **Aquí no se parsea ningún archivo**: esta DLL solo recoge las rutas que el
-//! usuario ha seleccionado y lanza `arca.exe`. Todo el trabajo con datos de
-//! origen desconocido ocurre en el proceso hijo, en los crates que sí prohíben
-//! `unsafe`. Si esta extensión tuviera un fallo de memoria, no sería explotable
-//! con un archivo malicioso, porque nunca lo abre.
-//!
-//! # Cómo encaja en Windows
-//!
-//! Windows 11 usa `IExplorerCommand`, registrado mediante un paquete MSIX
-//! disperso. Windows 10 usa el mecanismo antiguo, `IContextMenu` con la DLL
-//! registrada en el registro; se añadirá en un segundo módulo.
-
 use std::ffi::c_void;
 use std::path::PathBuf;
 use windows::core::*;
@@ -23,11 +5,8 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::UI::Shell::*;
 
-/// CLSID de la extensión. Debe coincidir, letra por letra, con el que aparece
-/// en `AppxManifest.xml`. Genera el tuyo propio antes de publicar nada.
 const CLSID_ARCA: GUID = GUID::from_u128(0xe075ad96_f5bd_4bff_8c33_a29d05352efa);
 
-/// Acciones que ofrece el menú.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Accion {
     ExtraerAqui,
@@ -44,7 +23,6 @@ impl Accion {
         }
     }
 
-    /// ¿Tiene sentido esta acción para lo que hay seleccionado?
     fn aplica(self, rutas: &[PathBuf]) -> bool {
         match self {
             Accion::ComprimirZip => !rutas.is_empty(),
@@ -53,10 +31,6 @@ impl Accion {
     }
 }
 
-/// Solo las extensiones que `arca.exe` sabe abrir de verdad. Ofrecer «Extraer
-/// aquí» sobre un .7z o un .rar seria una trampa: se lanza sin ventana de
-/// consola, asi que el fallo del proceso hijo no lo veria nadie. Cuando se
-/// implementen esos formatos, se añaden aqui y en `detectar()` del CLI.
 fn es_archivo_comprimido(p: &std::path::Path) -> bool {
     let n = p.to_string_lossy().to_ascii_lowercase();
     [".zip", ".tar", ".tar.gz", ".tgz"]
@@ -64,12 +38,10 @@ fn es_archivo_comprimido(p: &std::path::Path) -> bool {
         .any(|e| n.ends_with(e))
 }
 
-/// Copia una cadena al montón de COM, que es quien la liberará.
 fn a_pwstr(s: PCWSTR) -> Result<PWSTR> {
     unsafe { SHStrDupW(s) }
 }
 
-/// Extrae las rutas seleccionadas del array que entrega el Explorador.
 fn rutas_de(items: Option<&IShellItemArray>) -> Vec<PathBuf> {
     let Some(items) = items else {
         return Vec::new();
@@ -85,15 +57,12 @@ fn rutas_de(items: Option<&IShellItemArray>) -> Vec<PathBuf> {
             if let Ok(s) = nombre.to_string() {
                 v.push(PathBuf::from(s));
             }
-            // GetDisplayName reserva con CoTaskMemAlloc y nos cede la
-            // propiedad: si no liberamos, el Explorador acumula fugas.
             CoTaskMemFree(Some(nombre.0 as *const c_void));
         }
     }
     v
 }
 
-/// Ruta a `arca.exe`, buscado junto a esta DLL.
 fn ruta_del_binario() -> Result<PathBuf> {
     use windows::Win32::System::LibraryLoader::*;
     let mut buf = [0u16; 32_768];
@@ -113,8 +82,6 @@ fn ruta_del_binario() -> Result<PathBuf> {
     }
 }
 
-/// Lanza `arca.exe` sin ventana de consola y sin esperar a que termine:
-/// el Explorador no puede quedarse bloqueado (requisito R5).
 fn lanzar(accion: Accion, rutas: &[PathBuf]) -> Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -166,8 +133,6 @@ fn lanzar(accion: Accion, rutas: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------- comandos
-
 #[implement(IExplorerCommand)]
 struct Comando(Accion);
 
@@ -177,7 +142,6 @@ impl IExplorerCommand_Impl for Comando_Impl {
     }
 
     fn GetIcon(&self, _items: Option<&IShellItemArray>) -> Result<PWSTR> {
-        // El icono sale de arca.exe; el índice 0 es el principal.
         let exe = ruta_del_binario()?;
         let s: Vec<u16> = format!("{},0", exe.display())
             .encode_utf16()
@@ -187,8 +151,6 @@ impl IExplorerCommand_Impl for Comando_Impl {
     }
 
     fn GetToolTip(&self, _items: Option<&IShellItemArray>) -> Result<PWSTR> {
-        // Devolver E_NOTIMPL es lo correcto: le dice al Explorador que use
-        // el título, en vez de mostrar un tooltip vacío.
         Err(E_NOTIMPL.into())
     }
 
@@ -201,8 +163,6 @@ impl IExplorerCommand_Impl for Comando_Impl {
         Ok(if self.0.aplica(&rutas) {
             ECS_ENABLED.0 as u32
         } else {
-            // Oculto, no deshabilitado: un menú lleno de opciones en gris
-            // es peor que un menú corto.
             ECS_HIDDEN.0 as u32
         })
     }
@@ -224,7 +184,6 @@ impl IExplorerCommand_Impl for Comando_Impl {
     }
 }
 
-/// Entrada raíz: un submenú «Arca» que agrupa las tres acciones.
 #[implement(IExplorerCommand)]
 struct Raiz;
 
@@ -260,7 +219,6 @@ impl IExplorerCommand_Impl for Raiz_Impl {
     }
 
     fn Invoke(&self, _items: Option<&IShellItemArray>, _ctx: Option<&IBindCtx>) -> Result<()> {
-        // Una entrada con submenú no se invoca directamente.
         Ok(())
     }
 
@@ -278,7 +236,6 @@ impl IExplorerCommand_Impl for Raiz_Impl {
     }
 }
 
-/// Enumerador de subcomandos. COM no acepta un `Vec`, quiere un `IEnum*`.
 #[implement(IEnumExplorerCommand)]
 struct Enumerador {
     items: Vec<IExplorerCommand>,
@@ -317,9 +274,6 @@ impl IEnumExplorerCommand_Impl for Enumerador_Impl {
         }
     }
 
-    // En `windows` 0.58 estas dos devuelven Result<()>, no HRESULT: el vtable
-    // generado ya hace `.into()` sobre lo que retornan. Solo Next devuelve
-    // HRESULT, porque ahi S_FALSE es un valor legitimo y no un error.
     fn Skip(&self, cuantos: u32) -> Result<()> {
         self.pos.set((self.pos.get() + cuantos as usize).min(self.items.len()));
         Ok(())
@@ -336,8 +290,6 @@ impl IEnumExplorerCommand_Impl for Enumerador_Impl {
         Ok(copia.into())
     }
 }
-
-// ------------------------------------------------------------ fábrica COM
 
 #[implement(IClassFactory)]
 struct Fabrica;
@@ -367,9 +319,6 @@ impl IClassFactory_Impl for Fabrica_Impl {
     }
 }
 
-// -------------------------------------------------------- exportaciones DLL
-
-/// Punto de entrada que llama el Explorador para construir el objeto.
 #[no_mangle]
 pub extern "system" fn DllGetClassObject(
     clsid: *const GUID,
@@ -389,8 +338,6 @@ pub extern "system" fn DllGetClassObject(
     }
 }
 
-/// Devolvemos S_FALSE siempre: es más seguro que el Explorador mantenga la DLL
-/// cargada que arriesgarse a descargarla con objetos vivos.
 #[no_mangle]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
     S_FALSE

@@ -1,9 +1,3 @@
-//! Arca: interfaz de linea de comandos.
-//!
-//! Objetivo de arranque: por debajo de 15 ms en frio (requisito R1). Por eso
-//! no hay runtime asincrono, ni inicializacion perezosa de nada global, ni
-//! lectura de configuracion en el arranque.
-
 use arca_core::{Codec, Error, Level, Result};
 use arca_tar::{TarReader, TarWriter};
 use arca_zip::{comprimir_bloque, ZipArchive, ZipWriter};
@@ -14,13 +8,8 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Buffers grandes: en modo rapido el disco es el cuello de botella (R4).
 const BUF: usize = 256 * 1024;
 
-/// Un fichero ya comprimido en memoria, esperando a escribirse en orden:
-/// indice dentro del lote, bytes comprimidos, metodo aplicado y CRC del
-/// original. Los hilos lo producen en desorden; el indice restaura la
-/// secuencia antes de escribir.
 type Bloque = (usize, Vec<u8>, arca_core::Method, u32);
 
 #[derive(Parser)]
@@ -37,51 +26,37 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Orden {
-    /// Crea un archivo comprimido
     #[command(visible_alias = "c")]
     Create {
-        /// Archivo de salida (.zip, .tar, .tar.gz)
         salida: PathBuf,
-        /// Ficheros o directorios a incluir
         #[arg(required = true)]
         entradas: Vec<PathBuf>,
-        /// Nivel de compresion
         #[arg(short, long, value_enum, default_value_t = Nivel::Normal)]
         nivel: Nivel,
-        /// Compresor. «auto» usa deflate en .zip por compatibilidad
         #[arg(short, long, value_enum, default_value_t = Compresor::Auto)]
         codec: Compresor,
-        /// Hilos a usar. 0 = todos los nucleos
         #[arg(short = 'j', long, default_value_t = 0)]
         hilos: usize,
     },
-    /// Lista el contenido sin descomprimirlo
     #[command(visible_alias = "l")]
     List {
         archivo: PathBuf,
-        /// Muestra el tiempo empleado
         #[arg(short, long)]
         tiempo: bool,
     },
-    /// Extrae el contenido
     #[command(visible_alias = "x")]
     Extract {
         archivo: PathBuf,
-        /// Directorio de destino
         #[arg(short = 'o', long, default_value = ".")]
         destino: PathBuf,
     },
-    /// Comprueba la integridad sin escribir nada en disco
     #[command(visible_alias = "t")]
     Test { archivo: PathBuf },
-    /// Mide los requisitos de rendimiento R1 y R2
     Bench { archivo: PathBuf },
 }
 
-/// Compresor elegido en la linea de comandos.
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Compresor {
-    /// Deflate en .zip (lo lee todo el mundo), zstd donde se pueda
     Auto,
     Store,
     Deflate,
@@ -150,9 +125,6 @@ fn ejecutar(cli: Cli) -> Result<()> {
     }
 }
 
-// ------------------------------------------------------------------ crear
-
-/// Recorre un directorio devolviendo (ruta en disco, nombre dentro del archivo).
 fn recolectar(entradas: &[PathBuf]) -> Result<Vec<(PathBuf, String)>> {
     let mut v = Vec::new();
     for e in entradas {
@@ -175,8 +147,6 @@ fn recorrer(p: &Path, base: &Path, salida: &mut Vec<(PathBuf, String)>) -> Resul
     } else if meta.is_file() {
         salida.push((p.to_path_buf(), nombre));
     }
-    // Los enlaces simbolicos se omiten deliberadamente: seguirlos es la via
-    // clasica para que un archivo escriba fuera del destino.
     Ok(())
 }
 
@@ -188,8 +158,6 @@ fn mtime_de(m: &fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// Tope de datos en vuelo por lote. Acota el pico de memoria (R6): con este
-/// limite, comprimir 100 GB gasta lo mismo que comprimir 100 MB.
 const EN_VUELO_POR_HILO: u64 = 32 * 1024 * 1024;
 
 fn resolver_hilos(pedidos: usize) -> usize {
@@ -204,8 +172,6 @@ fn resolver_codec(c: Compresor, formato: Formato) -> Codec {
         Compresor::Store => Codec::Store,
         Compresor::Deflate => Codec::Deflate,
         Compresor::Zstd => Codec::Zstd,
-        // En .zip, «auto» es deflate: el zip existe para que lo abra
-        // cualquiera, y el metodo 93 (zstd) todavia no lo lee unzip.
         Compresor::Auto => match formato {
             Formato::Zip => Codec::Deflate,
             _ => Codec::Deflate,
@@ -213,8 +179,6 @@ fn resolver_codec(c: Compresor, formato: Formato) -> Codec {
     }
 }
 
-/// Agrupa ficheros en lotes que quepan en el presupuesto de memoria.
-/// Un fichero mas grande que el lote entero va solo, por la via en flujo.
 fn lotes(ficheros: &[(PathBuf, String, u64, i64)], tope: u64) -> Vec<Vec<usize>> {
     let mut v = Vec::new();
     let mut actual: Vec<usize> = Vec::new();
@@ -256,7 +220,6 @@ fn crear(
         return Err(Error::Format("no hay ficheros que anadir".into()));
     }
 
-    // Anotar tamano y fecha una sola vez: evita un stat por fichero en cada fase.
     let mut ficheros: Vec<(PathBuf, String, u64, i64)> = Vec::with_capacity(brutos.len());
     let mut total = 0u64;
     for (ruta, nombre) in brutos {
@@ -278,13 +241,11 @@ fn crear(
 
             for lote in lotes(&ficheros, tope) {
                 if lote.len() == 1 && ficheros[lote[0]].2 > tope {
-                    // Fichero grande: en flujo, sin cargarlo en memoria.
                     let (ruta, nombre, _, mt) = &ficheros[lote[0]];
                     let entrada = BufReader::with_capacity(BUF, File::open(ruta)?);
                     w.add(nombre, entrada, codec, nivel, Some(*mt))?;
                     continue;
                 }
-                // Lote pequeno: se comprime en paralelo y se escribe en orden.
                 let hechos: Vec<Result<Bloque>> = pool.install(|| {
                     lote.par_iter()
                         .map(|&i| {
@@ -344,8 +305,6 @@ fn crear(
     Ok(())
 }
 
-// ----------------------------------------------------------------- listar
-
 fn listar(archivo: &Path, tiempo: bool) -> Result<()> {
     let t0 = Instant::now();
     let formato = detectar(archivo)?;
@@ -396,8 +355,6 @@ fn listar(archivo: &Path, tiempo: bool) -> Result<()> {
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------- extraer
 
 fn extraer(archivo: &Path, destino: &Path) -> Result<()> {
     let formato = detectar(archivo)?;
@@ -459,8 +416,6 @@ fn extraer(archivo: &Path, destino: &Path) -> Result<()> {
     Ok(())
 }
 
-// ------------------------------------------------------------------ test
-
 fn probar(archivo: &Path) -> Result<()> {
     let formato = detectar(archivo)?;
     let t0 = Instant::now();
@@ -506,12 +461,9 @@ fn probar(archivo: &Path) -> Result<()> {
     Ok(())
 }
 
-// ----------------------------------------------------------------- bench
-
 fn bench(archivo: &Path) -> Result<()> {
     println!("Requisitos de rendimiento (documento de diseno, seccion 05)\n");
 
-    // R2: listar sin descomprimir.
     let mut mejor = f64::MAX;
     let mut entradas = 0usize;
     for _ in 0..5 {
@@ -556,4 +508,3 @@ fn humano(b: u64) -> String {
         format!("{v:.1} {}", U[i])
     }
 }
-
