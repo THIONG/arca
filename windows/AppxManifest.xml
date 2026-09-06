@@ -34,6 +34,11 @@
     <DisplayName>Arca</DisplayName>
     <PublisherDisplayName>Proyecto Arca</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
+    <!-- Imprescindible para un paquete disperso: sin esto, Add-AppxPackage
+         -ExternalLocation falla con 0x80073D2E, que es justamente lo que hace
+         construir.ps1. Es lo que autoriza a que el .exe y la .dll vivan fuera
+         del paquete, en la carpeta de instalacion normal. -->
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
   </Properties>
 
   <Dependencies>
@@ -71,11 +76,11 @@
           <desktop4:FileExplorerContextMenus>
             <desktop5:ItemType Type="*">
               <desktop5:Verb Id="Arca"
-                             Clsid="7F3A2B10-9C44-4D7E-A1F5-6E2B8C0D1234" />
+                             Clsid="E075AD96-F5BD-4BFF-8C33-A29D05352EFA" />
             </desktop5:ItemType>
             <desktop5:ItemType Type="Directory">
               <desktop5:Verb Id="Arca"
-                             Clsid="7F3A2B10-9C44-4D7E-A1F5-6E2B8C0D1234" />
+                             Clsid="E075AD96-F5BD-4BFF-8C33-A29D05352EFA" />
             </desktop5:ItemType>
           </desktop4:FileExplorerContextMenus>
         </desktop4:Extension>
@@ -84,7 +89,7 @@
         <com:Extension Category="windows.comServer">
           <com:ComServer>
             <com:SurrogateServer DisplayName="Arca Shell">
-              <com:Class Id="7F3A2B10-9C44-4D7E-A1F5-6E2B8C0D1234"
+              <com:Class Id="E075AD96-F5BD-4BFF-8C33-A29D05352EFA"
                          Path="arca_shell.dll"
                          ThreadingModel="STA" />
             </com:SurrogateServer>

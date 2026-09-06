@@ -14,6 +14,10 @@ crate-type = ["cdylib"]
 # cambian entre versiones menores de este crate. Si subes la versión, revisa
 # las firmas de IExplorerCommand_Impl antes de nada.
 windows = { version = "0.58", features = [
+    # Sin esto, los traits IExplorerCommand_Impl y compania no existen: viven en
+    # un impl.rs que el crate incluye tras #[cfg(feature = "implement")]. Es lo
+    # que hace falta para implementar interfaces COM, no solo para llamarlas.
+    "implement",
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",

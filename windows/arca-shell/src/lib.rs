@@ -21,12 +21,11 @@ use std::path::PathBuf;
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
-use windows::Win32::UI::Shell::Common::*;
 use windows::Win32::UI::Shell::*;
 
 /// CLSID de la extensión. Debe coincidir, letra por letra, con el que aparece
 /// en `AppxManifest.xml`. Genera el tuyo propio antes de publicar nada.
-const CLSID_ARCA: GUID = GUID::from_u128(0x7f3a2b10_9c44_4d7e_a1f5_6e2b8c0d1234);
+const CLSID_ARCA: GUID = GUID::from_u128(0xe075ad96_f5bd_4bff_8c33_a29d05352efa);
 
 /// Acciones que ofrece el menú.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,15 +44,6 @@ impl Accion {
         }
     }
 
-    /// Nombre estable para scripts y automatización.
-    fn canonico(self) -> PCWSTR {
-        match self {
-            Accion::ExtraerAqui => w!("Arca.ExtraerAqui"),
-            Accion::ExtraerACarpeta => w!("Arca.ExtraerACarpeta"),
-            Accion::ComprimirZip => w!("Arca.ComprimirZip"),
-        }
-    }
-
     /// ¿Tiene sentido esta acción para lo que hay seleccionado?
     fn aplica(self, rutas: &[PathBuf]) -> bool {
         match self {
@@ -63,9 +53,13 @@ impl Accion {
     }
 }
 
+/// Solo las extensiones que `arca.exe` sabe abrir de verdad. Ofrecer «Extraer
+/// aquí» sobre un .7z o un .rar seria una trampa: se lanza sin ventana de
+/// consola, asi que el fallo del proceso hijo no lo veria nadie. Cuando se
+/// implementen esos formatos, se añaden aqui y en `detectar()` del CLI.
 fn es_archivo_comprimido(p: &std::path::Path) -> bool {
     let n = p.to_string_lossy().to_ascii_lowercase();
-    [".zip", ".tar", ".tar.gz", ".tgz", ".7z", ".rar"]
+    [".zip", ".tar", ".tar.gz", ".tgz"]
         .iter()
         .any(|e| n.ends_with(e))
 }
@@ -177,7 +171,7 @@ fn lanzar(accion: Accion, rutas: &[PathBuf]) -> Result<()> {
 #[implement(IExplorerCommand)]
 struct Comando(Accion);
 
-impl IExplorerCommand_Impl for Comando {
+impl IExplorerCommand_Impl for Comando_Impl {
     fn GetTitle(&self, _items: Option<&IShellItemArray>) -> Result<PWSTR> {
         a_pwstr(self.0.titulo())
     }
@@ -234,7 +228,7 @@ impl IExplorerCommand_Impl for Comando {
 #[implement(IExplorerCommand)]
 struct Raiz;
 
-impl IExplorerCommand_Impl for Raiz {
+impl IExplorerCommand_Impl for Raiz_Impl {
     fn GetTitle(&self, _items: Option<&IShellItemArray>) -> Result<PWSTR> {
         a_pwstr(w!("Arca"))
     }
@@ -297,7 +291,7 @@ impl Enumerador {
     }
 }
 
-impl IEnumExplorerCommand_Impl for Enumerador {
+impl IEnumExplorerCommand_Impl for Enumerador_Impl {
     fn Next(
         &self,
         pedidos: u32,
@@ -323,14 +317,17 @@ impl IEnumExplorerCommand_Impl for Enumerador {
         }
     }
 
-    fn Skip(&self, cuantos: u32) -> HRESULT {
+    // En `windows` 0.58 estas dos devuelven Result<()>, no HRESULT: el vtable
+    // generado ya hace `.into()` sobre lo que retornan. Solo Next devuelve
+    // HRESULT, porque ahi S_FALSE es un valor legitimo y no un error.
+    fn Skip(&self, cuantos: u32) -> Result<()> {
         self.pos.set((self.pos.get() + cuantos as usize).min(self.items.len()));
-        S_OK
+        Ok(())
     }
 
-    fn Reset(&self) -> HRESULT {
+    fn Reset(&self) -> Result<()> {
         self.pos.set(0);
-        S_OK
+        Ok(())
     }
 
     fn Clone(&self) -> Result<IEnumExplorerCommand> {
@@ -345,7 +342,7 @@ impl IEnumExplorerCommand_Impl for Enumerador {
 #[implement(IClassFactory)]
 struct Fabrica;
 
-impl IClassFactory_Impl for Fabrica {
+impl IClassFactory_Impl for Fabrica_Impl {
     fn CreateInstance(
         &self,
         exterior: Option<&IUnknown>,
