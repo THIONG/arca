@@ -55,6 +55,9 @@ enum Cmd {
         archive: PathBuf,
         #[arg(short = 'o', long, default_value = ".", help = "Destination directory")]
         dest: PathBuf,
+        #[arg(long, value_enum, default_value_t = OnConflict::Overwrite,
+              help = "What to do when the file is already in the destination")]
+        on_conflict: OnConflict,
     },
     #[command(visible_alias = "t", about = "Check integrity without writing to disk")]
     Test {
@@ -75,6 +78,16 @@ enum CodecArg {
     Store,
     Deflate,
     Zstd,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum OnConflict {
+    #[value(help = "Replace the file that is already there")]
+    Overwrite,
+    #[value(help = "Leave the file that is already there and move on")]
+    Skip,
+    #[value(help = "Write it next to the other one as name (1).ext")]
+    Rename,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -137,7 +150,11 @@ fn run(cli: Cli) -> Result<()> {
             threads,
         } => create(&out, &inputs, level.into(), codec, threads),
         Cmd::List { archive, time } => list(&archive, time),
-        Cmd::Extract { archive, dest } => extract(&archive, &dest),
+        Cmd::Extract {
+            archive,
+            dest,
+            on_conflict,
+        } => extract(&archive, &dest, on_conflict),
         Cmd::Test { archive } => test_archive(&archive),
         Cmd::Bench { archive } => bench(&archive),
     }
@@ -374,7 +391,31 @@ fn list(archive: &Path, time: bool) -> Result<()> {
     Ok(())
 }
 
-fn extract(archive: &Path, dest: &Path) -> Result<()> {
+fn free_name(path: &Path) -> PathBuf {
+    let dir = path.parent().map(PathBuf::from).unwrap_or_default();
+    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = path.extension().map(|s| format!(".{}", s.to_string_lossy())).unwrap_or_default();
+    for n in 1..10_000u32 {
+        let candidate = dir.join(format!("{stem} ({n}){ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path.to_path_buf()
+}
+
+fn resolve_conflict(path: PathBuf, policy: OnConflict) -> Option<PathBuf> {
+    if !path.exists() {
+        return Some(path);
+    }
+    match policy {
+        OnConflict::Overwrite => Some(path),
+        OnConflict::Skip => None,
+        OnConflict::Rename => Some(free_name(&path)),
+    }
+}
+
+fn extract(archive: &Path, dest: &Path, policy: OnConflict) -> Result<()> {
     let format_kind = detect(archive)?;
     fs::create_dir_all(dest)?;
     let t0 = Instant::now();
@@ -395,6 +436,9 @@ fn extract(archive: &Path, dest: &Path) -> Result<()> {
                 if let Some(p) = path.parent() {
                     fs::create_dir_all(p)?;
                 }
+                let Some(path) = resolve_conflict(path, policy) else {
+                    continue;
+                };
                 let f = BufWriter::with_capacity(BUF, File::create(&path)?);
                 bytes += a.extract_to(i, f)?;
                 n += 1;
@@ -418,6 +462,10 @@ fn extract(archive: &Path, dest: &Path) -> Result<()> {
                 if let Some(p) = path.parent() {
                     fs::create_dir_all(p)?;
                 }
+                let Some(path) = resolve_conflict(path, policy) else {
+                    r.skip_data(&e)?;
+                    continue;
+                };
                 let mut w = BufWriter::with_capacity(BUF, File::create(&path)?);
                 bytes += r.copy_data(&e, &mut w)?;
                 w.flush()?;

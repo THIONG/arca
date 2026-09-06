@@ -95,6 +95,15 @@ pub struct Strings {
     pub up: &'static str,
     pub defaults_title: &'static str,
     pub items_word: &'static str,
+    pub conflict_title: &'static str,
+    pub conflict_text: &'static str,
+    pub already_there: &'static str,
+    pub yes: &'static str,
+    pub yes_all: &'static str,
+    pub no: &'static str,
+    pub no_all: &'static str,
+    pub rename: &'static str,
+    pub rename_all: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -156,6 +165,15 @@ const EN: Strings = Strings {
     up: "Up",
     defaults_title: "Defaults for new archives",
     items_word: "items",
+    conflict_title: "File already exists",
+    conflict_text: "What do you want to do with it?",
+    already_there: "Already in the destination:",
+    yes: "Replace",
+    yes_all: "Replace all",
+    no: "Skip",
+    no_all: "Skip all",
+    rename: "Keep both",
+    rename_all: "Keep both, always",
 };
 
 const ES: Strings = Strings {
@@ -217,6 +235,15 @@ const ES: Strings = Strings {
     up: "Subir",
     defaults_title: "Valores por defecto para archivos nuevos",
     items_word: "elementos",
+    conflict_title: "El fichero ya existe",
+    conflict_text: "¿Qué quieres hacer con él?",
+    already_there: "Ya está en el destino:",
+    yes: "Reemplazar",
+    yes_all: "Reemplazar todos",
+    no: "Omitir",
+    no_all: "Omitir todos",
+    rename: "Conservar los dos",
+    rename_all: "Conservar los dos, siempre",
 };
 
 pub fn strings(l: Lang) -> &'static Strings {

@@ -195,7 +195,73 @@ fn list_entries(archive: &Path) -> arca_core::Result<Vec<Entry>> {
     }
 }
 
-fn dest_path(dest: &Path, name: &str, is_dir: bool) -> arca_core::Result<Option<PathBuf>> {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Answer {
+    Replace,
+    ReplaceAll,
+    Skip,
+    SkipAll,
+    Rename,
+    RenameAll,
+    Cancel,
+}
+
+// The worker asks the window and blocks until it answers. The "all" answers
+// stick, so the question is asked once and not per file.
+fn conflict_asker<'a>(
+    tx: &'a Sender<Message>,
+    ctx: &'a egui::Context,
+    replies: &'a std::sync::mpsc::Receiver<Answer>,
+) -> impl Fn(&Path) -> Answer + 'a {
+    let sticky = std::cell::Cell::new(None::<Answer>);
+    move |path: &Path| {
+        if let Some(a) = sticky.get() {
+            return a;
+        }
+        if tx
+            .send(Message::Conflict(path.display().to_string()))
+            .is_err()
+        {
+            return Answer::Cancel;
+        }
+        ctx.request_repaint();
+        let answer = replies.recv().unwrap_or(Answer::Cancel);
+        if matches!(
+            answer,
+            Answer::ReplaceAll | Answer::SkipAll | Answer::RenameAll | Answer::Cancel
+        ) {
+            sticky.set(Some(answer));
+        }
+        answer
+    }
+}
+
+fn free_name(path: &Path) -> PathBuf {
+    let dir = path.parent().map(PathBuf::from).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|s| format!(".{}", s.to_string_lossy()))
+        .unwrap_or_default();
+    for n in 1..10_000u32 {
+        let candidate = dir.join(format!("{stem} ({n}){ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path.to_path_buf()
+}
+
+// Returns None when the entry must be skipped, and Err on cancel.
+fn dest_path(
+    dest: &Path,
+    name: &str,
+    is_dir: bool,
+    ask: &dyn Fn(&Path) -> Answer,
+) -> arca_core::Result<Option<PathBuf>> {
     let path = dest.join(arca_core::safe_name(name)?);
     if is_dir {
         fs::create_dir_all(&path)?;
@@ -204,7 +270,15 @@ fn dest_path(dest: &Path, name: &str, is_dir: bool) -> arca_core::Result<Option<
     if let Some(p) = path.parent() {
         fs::create_dir_all(p)?;
     }
-    Ok(Some(path))
+    if !path.exists() {
+        return Ok(Some(path));
+    }
+    match ask(&path) {
+        Answer::Replace | Answer::ReplaceAll => Ok(Some(path)),
+        Answer::Skip | Answer::SkipAll => Ok(None),
+        Answer::Rename | Answer::RenameAll => Ok(Some(free_name(&path))),
+        Answer::Cancel => Err(arca_core::Error::Format("cancelled".into())),
+    }
 }
 
 fn extract(
@@ -212,6 +286,7 @@ fn extract(
     dest: &Path,
     wanted: &[bool],
     notify: &dyn Fn(usize, usize, &str),
+    ask: &dyn Fn(&Path) -> Answer,
 ) -> arca_core::Result<u64> {
     let Some(format) = detect(archive) else {
         return Err(arca_core::Error::Unsupported("unknown format".into()));
@@ -229,7 +304,7 @@ fn extract(
                 if !wanted.is_empty() && !wanted.get(i).copied().unwrap_or(true) {
                     continue;
                 }
-                if let Some(path) = dest_path(dest, &e.name, e.is_dir)? {
+                if let Some(path) = dest_path(dest, &e.name, e.is_dir, ask)? {
                     let f = BufWriter::with_capacity(BUF, File::create(&path)?);
                     bytes += a.extract_to(i, f)?;
                 }
@@ -247,7 +322,7 @@ fn extract(
                     i += 1;
                     continue;
                 }
-                match dest_path(dest, &e.entry.name, e.entry.is_dir)? {
+                match dest_path(dest, &e.entry.name, e.entry.is_dir, ask)? {
                     Some(path) => {
                         let mut w = BufWriter::with_capacity(BUF, File::create(&path)?);
                         bytes += r.copy_data(&e, &mut w)?;
@@ -478,6 +553,7 @@ fn run_job_blocking(
     job: Job,
     s: &'static Strings,
     notify: &dyn Fn(usize, usize, &str),
+    ask: &dyn Fn(&Path) -> Answer,
 ) -> std::result::Result<String, String> {
     match job {
         Job::Extract { archives, dest } => {
@@ -495,7 +571,7 @@ fn run_job_blocking(
                     Destination::Beside => base,
                     Destination::Subfolder => base.join(archive_stem(a)),
                 };
-                total += extract(a, &target, &[], notify).map_err(|e| e.to_string())?;
+                total += extract(a, &target, &[], notify, ask).map_err(|e| e.to_string())?;
                 last = target;
             }
             Ok(fill(
@@ -565,6 +641,7 @@ enum SortColumn {
 
 enum Message {
     Listing(PathBuf, Vec<Entry>),
+    Conflict(String),
     Progress(usize, usize, String),
     Done(String),
     Failed(String),
@@ -602,6 +679,8 @@ struct Arca {
     title: String,
     current_dir: String,
     show_settings: bool,
+    conflict: Option<String>,
+    replies: Option<Sender<Answer>>,
 }
 
 impl Arca {
@@ -632,6 +711,8 @@ impl Arca {
             title: String::new(),
             current_dir: String::new(),
             show_settings: false,
+            conflict: None,
+            replies: None,
         }
     }
 
@@ -770,13 +851,16 @@ impl Arca {
         };
         self.close_when_done = !matches!(job, Job::Test(_));
 
+        let (reply_tx, reply_rx) = channel::<Answer>();
+        self.replies = Some(reply_tx);
         let ctx2 = ctx.clone();
         self.spawn(ctx, 0, move |tx| {
             let notify = |i: usize, n: usize, name: &str| {
                 let _ = tx.send(Message::Progress(i, n, name.to_string()));
                 ctx2.request_repaint();
             };
-            let outcome = run_job_blocking(job, s, &notify);
+            let ask = conflict_asker(tx, &ctx2, &reply_rx);
+            let outcome = run_job_blocking(job, s, &notify, &ask);
             let _ = tx.send(match outcome {
                 Ok(text) => Message::Done(text),
                 Err(text) => Message::Failed(text),
@@ -801,6 +885,9 @@ impl Arca {
                         self.current_dir = String::new();
                         self.busy = false;
                         close = true;
+                    }
+                    Message::Conflict(path) => {
+                        self.conflict = Some(path);
                     }
                     Message::Progress(done, total, name) => {
                         self.done_count = done;
@@ -965,13 +1052,16 @@ impl Arca {
         };
         let total = wanted.iter().filter(|b| **b).count();
         self.close_when_done = false;
+        let (reply_tx, reply_rx) = channel::<Answer>();
+        self.replies = Some(reply_tx);
         let ctx2 = ctx.clone();
         self.spawn(ctx, total, move |tx| {
             let notify = |i: usize, n: usize, name: &str| {
                 let _ = tx.send(Message::Progress(i, n, name.to_string()));
                 ctx2.request_repaint();
             };
-            let _ = tx.send(match extract(&archive, &dest, &wanted, &notify) {
+            let ask = conflict_asker(tx, &ctx2, &reply_rx);
+            let _ = tx.send(match extract(&archive, &dest, &wanted, &notify, &ask) {
                 Ok(bytes) => Message::Done(fill(
                     s.extracted_to,
                     &[("size", &human(bytes)), ("dest", &dest.display().to_string())],
@@ -979,6 +1069,61 @@ impl Arca {
                 Err(e) => Message::Failed(e.to_string()),
             });
         });
+    }
+
+    fn conflict_window(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.conflict.clone() else {
+            return;
+        };
+        let s = self.s();
+        let mut chosen: Option<Answer> = None;
+        egui::Window::new(s.conflict_title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(s.already_there);
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(&path).monospace().strong());
+                ui.add_space(6.0);
+                ui.label(s.conflict_text);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button(s.yes).clicked() {
+                        chosen = Some(Answer::Replace);
+                    }
+                    if ui.button(s.yes_all).clicked() {
+                        chosen = Some(Answer::ReplaceAll);
+                    }
+                    if ui.button(s.no).clicked() {
+                        chosen = Some(Answer::Skip);
+                    }
+                    if ui.button(s.no_all).clicked() {
+                        chosen = Some(Answer::SkipAll);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button(s.rename).clicked() {
+                        chosen = Some(Answer::Rename);
+                    }
+                    if ui.button(s.rename_all).clicked() {
+                        chosen = Some(Answer::RenameAll);
+                    }
+                    ui.separator();
+                    if ui.button(s.cancel).clicked() {
+                        chosen = Some(Answer::Cancel);
+                    }
+                });
+                ui.add_space(4.0);
+            });
+        if let Some(a) = chosen {
+            if let Some(tx) = &self.replies {
+                let _ = tx.send(a);
+            }
+            self.conflict = None;
+        }
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1389,6 +1534,7 @@ impl eframe::App for Arca {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     self.running_view(ui, &ctx2);
                 });
+                self.conflict_window(&ctx2);
             }
             View::Add => {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -1400,6 +1546,7 @@ impl eframe::App for Arca {
                     self.toolbar(ui, &ctx2);
                 });
                 self.settings_window(&ctx2);
+                self.conflict_window(&ctx2);
                 egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
                     ui.add_space(5.0);
                     if self.busy {
