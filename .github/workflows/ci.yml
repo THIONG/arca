@@ -27,6 +27,16 @@ jobs:
       - name: Interoperabilidad verificada por hash
         run: bash interop.sh
 
+      # El instalador se escribio en Windows: esto es lo unico que comprueba
+      # que de verdad funciona en Linux, ida y vuelta.
+      - name: Instalador, ida y vuelta
+        run: |
+          ./instalar.sh
+          test -x "$HOME/.local/bin/arca"
+          "$HOME/.local/bin/arca" --version
+          ./instalar.sh --quitar
+          test ! -e "$HOME/.local/bin/arca"
+
   windows:
     name: Compilar en Windows
     runs-on: windows-latest
@@ -48,3 +58,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - run: cargo test --workspace
+      - name: Instalador, ida y vuelta
+        run: |
+          ./instalar.sh
+          test -x "$HOME/.local/bin/arca"
+          "$HOME/.local/bin/arca" --version
+          ./instalar.sh --quitar
+          test ! -e "$HOME/.local/bin/arca"

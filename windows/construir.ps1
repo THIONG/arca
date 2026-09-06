@@ -1,4 +1,4 @@
-# Construye Arca para Windows y registra el menú contextual.
+﻿# Construye Arca para Windows y registra el menú contextual.
 #
 # Requisitos:
 #   - Rust con el target x86_64-pc-windows-msvc
@@ -55,14 +55,28 @@ if ($Quitar) {
 }
 
 # --- 1. Binarios ------------------------------------------------------------
+# cargo escribe su progreso en stderr aunque todo vaya bien, y con
+# ErrorActionPreference = Stop eso revienta el script en cuanto alguien captura
+# su salida. El codigo de salida es lo unico que indica un fallo de verdad.
+function Ejecutar($programa, $argumentos) {
+    $anterior = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $programa @argumentos
+    $codigo = $LASTEXITCODE
+    $ErrorActionPreference = $anterior
+    if ($codigo -ne 0) {
+        throw "$programa $($argumentos -join ' ') fallo con codigo $codigo"
+    }
+}
+
 Write-Host "==> Compilando arca.exe" -ForegroundColor Cyan
 Push-Location $Raiz
-cargo build --release --target x86_64-pc-windows-msvc
+Ejecutar "cargo" @("build","--release","--target","x86_64-pc-windows-msvc")
 Pop-Location
 
 Write-Host "==> Compilando arca_shell.dll" -ForegroundColor Cyan
 Push-Location (Join-Path $PSScriptRoot "arca-shell")
-cargo build --release --target x86_64-pc-windows-msvc
+Ejecutar "cargo" @("build","--release","--target","x86_64-pc-windows-msvc")
 Pop-Location
 
 # --- 2. Carpeta del paquete -------------------------------------------------
