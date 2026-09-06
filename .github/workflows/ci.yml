@@ -19,6 +19,12 @@ jobs:
           components: clippy, rustfmt
       - name: Herramientas de referencia
         run: sudo apt-get update && sudo apt-get install -y zip unzip p7zip-full zstd
+
+      # La interfaz grafica entra en el workspace, asi que este job la compila.
+      # eframe necesita estas cabeceras en Linux; en Windows y macOS no hace
+      # falta nada porque el sistema ya las trae.
+      - name: Dependencias de la interfaz grafica
+        run: sudo apt-get install -y libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev libgl1-mesa-dev libxcursor-dev libxinerama-dev
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - name: Compilar sin códecs de C (Rust puro)

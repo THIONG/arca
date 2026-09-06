@@ -1,0 +1,29 @@
+[package]
+name = "arca-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Interfaz grafica de Arca"
+
+[[bin]]
+name = "arca-gui"
+path = "src/main.rs"
+
+[dependencies]
+arca-core.workspace = true
+arca-zip.workspace = true
+arca-tar.workspace = true
+
+# egui en Rust puro. Se descarta wgpu a proposito: glow arranca antes y no
+# arrastra el tiempo de ejecucion de Vulkan/DX12, que para listar un zip no
+# aporta nada. Nada de esto necesita bibliotecas del sistema en ejecucion.
+eframe = { version = "0.29", default-features = false, features = [
+    "glow",
+    "default_fonts",
+] }
+
+# Dialogos de fichero nativos. Es lo unico que toca la plataforma.
+rfd = "0.15"
+flate2.workspace = true
