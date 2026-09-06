@@ -8,6 +8,14 @@ authors.workspace = true
 description = "Lector y escritor ZIP en safe Rust, con DEFLATE sobre zlib-rs"
 
 [dependencies]
+# Cifrado AES-256 de WinZip. Todo RustCrypto, safe Rust puro: es la pieza mas
+# delicada del proyecto y no va a ser la que traiga un fallo de memoria.
+aes = "0.8"
+ctr = "0.9"
+hmac = "0.12"
+sha1 = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+getrandom = "0.2"
 arca-core.workspace = true
 flate2.workspace = true
 crc32fast.workspace = true

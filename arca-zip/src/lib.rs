@@ -1,5 +1,7 @@
 ﻿#![forbid(unsafe_code)]
 
+pub mod aes;
+
 use arca_core::{limits, Codec, Cursor, Entry, Error, Level, Method, Result};
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
