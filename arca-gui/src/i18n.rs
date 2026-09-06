@@ -92,6 +92,10 @@ pub struct Strings {
     pub errors_found: &'static str,
     pub unknown_format: &'static str,
     pub nothing_to_do: &'static str,
+    pub settings: &'static str,
+    pub up: &'static str,
+    pub defaults_title: &'static str,
+    pub items_word: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -150,6 +154,10 @@ const EN: Strings = Strings {
     errors_found: "{good} good, {bad} with errors",
     unknown_format: "unrecognized archive format",
     nothing_to_do: "nothing to do",
+    settings: "Settings",
+    up: "Up",
+    defaults_title: "Defaults for new archives",
+    items_word: "items",
 };
 
 const ES: Strings = Strings {
@@ -208,6 +216,10 @@ const ES: Strings = Strings {
     errors_found: "{good} correctas, {bad} con errores",
     unknown_format: "formato de archivo no reconocido",
     nothing_to_do: "nada que hacer",
+    settings: "Ajustes",
+    up: "Subir",
+    defaults_title: "Valores por defecto para archivos nuevos",
+    items_word: "elementos",
 };
 
 pub fn strings(l: Lang) -> &'static Strings {

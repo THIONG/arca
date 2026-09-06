@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod i18n;
+mod tree;
 
 use arca_core::{Codec, Entry, Level};
 use arca_tar::{TarReader, TarWriter};
@@ -10,6 +11,7 @@ use eframe::egui;
 use egui::ThemePreference;
 use egui_extras::{Column, TableBuilder};
 use i18n::{strings, Lang, Strings};
+use tree::{children_of, draw_icon, entries_under, kind_of, parent_of, Row};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -54,6 +56,14 @@ fn detect(p: &Path) -> Option<Format> {
         Some(Format::Tar)
     } else {
         None
+    }
+}
+
+fn saved_of(r: &Row) -> f64 {
+    if r.size == 0 {
+        0.0
+    } else {
+        1.0 - r.packed as f64 / r.size as f64
     }
 }
 
@@ -589,6 +599,8 @@ struct Arca {
     output_name: String,
     close_when_done: bool,
     title: String,
+    current_dir: String,
+    show_settings: bool,
 }
 
 impl Arca {
@@ -617,6 +629,8 @@ impl Arca {
             output_name: String::new(),
             close_when_done: false,
             title: String::new(),
+            current_dir: String::new(),
+            show_settings: false,
         }
     }
 
@@ -664,23 +678,45 @@ impl Arca {
         )
     }
 
-    fn visible_rows(&self) -> Vec<usize> {
-        let f = self.filter.to_lowercase();
-        let mut v: Vec<usize> = (0..self.entries.len())
-            .filter(|&i| f.is_empty() || self.entries[i].name.to_lowercase().contains(&f))
-            .collect();
+    fn visible_rows(&self) -> Vec<Row> {
+        let filter = self.filter.trim().to_lowercase();
+        let mut rows = if filter.is_empty() {
+            children_of(&self.entries, &self.current_dir)
+        } else {
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !e.is_dir && e.name.to_lowercase().contains(&filter))
+                .map(|(i, e)| Row {
+                    label: e.name.replace('\\', "/"),
+                    path: e.name.replace('\\', "/"),
+                    kind: kind_of(&e.name, false),
+                    is_dir: false,
+                    entry: Some(i),
+                    size: e.size,
+                    packed: e.compressed_size,
+                    method: e.method.name(),
+                    count: 0,
+                })
+                .collect()
+        };
+
         let (col, asc) = self.order;
-        v.sort_by(|&a, &b| {
-            let x = &self.entries[a];
-            let y = &self.entries[b];
+        rows.sort_by(|x, y| {
+            if x.is_dir != y.is_dir {
+                return if x.is_dir {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+            }
             let o = match col {
-                SortColumn::Name => x.name.to_lowercase().cmp(&y.name.to_lowercase()),
+                SortColumn::Name => x.label.to_lowercase().cmp(&y.label.to_lowercase()),
                 SortColumn::Size => x.size.cmp(&y.size),
-                SortColumn::Packed => x.compressed_size.cmp(&y.compressed_size),
-                SortColumn::Method => x.method.name().cmp(y.method.name()),
-                SortColumn::Saved => x
-                    .ratio()
-                    .partial_cmp(&y.ratio())
+                SortColumn::Packed => x.packed.cmp(&y.packed),
+                SortColumn::Method => x.method.cmp(y.method),
+                SortColumn::Saved => saved_of(x)
+                    .partial_cmp(&saved_of(y))
                     .unwrap_or(std::cmp::Ordering::Equal),
             };
             if asc {
@@ -689,7 +725,7 @@ impl Arca {
                 o.reverse()
             }
         });
-        v
+        rows
     }
 
     fn spawn<F>(&mut self, ctx: &egui::Context, total: usize, work: F)
@@ -761,6 +797,7 @@ impl Arca {
                             self.format = f;
                         }
                         self.archive = Some(path);
+                        self.current_dir = String::new();
                         self.busy = false;
                         close = true;
                     }
@@ -1026,13 +1063,56 @@ impl Arca {
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(!self.busy, |ui| {
-                ui.checkbox(&mut self.into_subfolder, s.into_subfolder);
-                ui.add_space(12.0);
-                self.settings_row(ui, ctx);
+            let at_root = self.current_dir.is_empty();
+            if ui
+                .add_enabled(!at_root, egui::Button::new(format!("  {}  ", s.up)))
+                .clicked()
+            {
+                self.current_dir = parent_of(&self.current_dir);
+            }
+            ui.separator();
+            let here = if self.current_dir.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", self.current_dir)
+            };
+            ui.label(egui::RichText::new(here).monospace());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(s.settings).clicked() {
+                    self.show_settings = true;
+                }
             });
         });
         ui.add_space(6.0);
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let s = self.s();
+        let mut open = true;
+        egui::Window::new(s.settings)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    self.settings_row(ui, ctx);
+                });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.strong(s.defaults_title);
+                ui.add_space(6.0);
+                self.format_row(ui);
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.into_subfolder, s.into_subfolder);
+                ui.add_space(8.0);
+            });
+        self.show_settings = open;
     }
 
     fn add_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1129,19 +1209,40 @@ impl Arca {
         }
     }
 
+    fn set_checked(&mut self, row: &Row, value: bool) {
+        match row.entry {
+            Some(i) => self.checked[i] = value,
+            None => {
+                for i in entries_under(&self.entries, &row.path) {
+                    self.checked[i] = value;
+                }
+            }
+        }
+    }
+
+    fn is_checked(&self, row: &Row) -> bool {
+        match row.entry {
+            Some(i) => self.checked[i],
+            None => {
+                let under = entries_under(&self.entries, &row.path);
+                !under.is_empty() && under.iter().all(|&i| self.checked[i])
+            }
+        }
+    }
+
     fn table(&mut self, ui: &mut egui::Ui) {
         let s = self.s();
         let visible = self.visible_rows();
 
         ui.horizontal(|ui| {
             if ui.small_button(s.check_all).clicked() {
-                for i in &visible {
-                    self.checked[*i] = true;
+                for r in &visible {
+                    self.set_checked(r, true);
                 }
             }
             if ui.small_button(s.uncheck_all).clicked() {
-                for i in &visible {
-                    self.checked[*i] = false;
+                for r in &visible {
+                    self.set_checked(r, false);
                 }
             }
             ui.separator();
@@ -1157,6 +1258,8 @@ impl Arca {
         ui.add_space(4.0);
 
         let mut requested: Option<SortColumn> = None;
+        let mut toggle: Option<(usize, bool)> = None;
+        let mut enter: Option<String> = None;
         let order = self.order;
         let hint = s.sort_hint;
         let head = |ui: &mut egui::Ui, text: &str, col: SortColumn| -> bool {
@@ -1180,12 +1283,14 @@ impl Arca {
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::exact(26.0))
+            .column(Column::exact(22.0))
             .column(Column::initial(90.0).at_least(70.0))
             .column(Column::initial(90.0).at_least(70.0))
             .column(Column::initial(80.0).at_least(60.0))
             .column(Column::initial(60.0).at_least(50.0))
             .column(Column::remainder().at_least(120.0))
             .header(22.0, |mut h| {
+                h.col(|_| {});
                 h.col(|_| {});
                 h.col(|ui| {
                     if head(ui, s.col_size, SortColumn::Size) {
@@ -1215,35 +1320,66 @@ impl Arca {
             })
             .body(|body| {
                 body.rows(ROW_HEIGHT, visible.len(), |mut row| {
-                    let i = visible[row.index()];
-                    let e = self.entries[i].clone();
+                    let idx = row.index();
+                    let r = &visible[idx];
+                    let mut flag = self.is_checked(r);
                     row.col(|ui| {
-                        ui.checkbox(&mut self.checked[i], "");
+                        if ui.checkbox(&mut flag, "").changed() {
+                            toggle = Some((idx, flag));
+                        }
                     });
                     row.col(|ui| {
-                        ui.monospace(human(e.size));
+                        draw_icon(ui, r.kind);
                     });
                     row.col(|ui| {
-                        ui.monospace(human(e.compressed_size));
+                        ui.monospace(human(r.size));
                     });
                     row.col(|ui| {
-                        ui.label(e.method.name());
+                        ui.monospace(human(r.packed));
                     });
                     row.col(|ui| {
-                        let pct = e.ratio() * 100.0;
+                        if r.is_dir {
+                            ui.weak(format!("{} {}", r.count, s.items_word));
+                        } else {
+                            ui.label(r.method);
+                        }
+                    });
+                    row.col(|ui| {
+                        let pct = saved_of(r) * 100.0;
                         let shown = if pct.abs() < 0.5 { 0.0 } else { pct };
                         ui.monospace(format!("{shown:.0}%"));
                     });
                     row.col(|ui| {
-                        if e.is_dir {
-                            ui.weak(&e.name);
+                        let text = if r.is_dir {
+                            egui::RichText::new(&r.label).strong()
                         } else {
-                            ui.label(&e.name);
+                            egui::RichText::new(&r.label)
+                        };
+                        let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+                        if r.is_dir && resp.double_clicked() {
+                            enter = Some(r.path.clone());
                         }
                     });
                 });
             });
 
+        if let Some((index, value)) = toggle {
+            let target = &visible[index];
+            let path = target.path.clone();
+            let entry = target.entry;
+            match entry {
+                Some(i) => self.checked[i] = value,
+                None => {
+                    for i in entries_under(&self.entries, &path) {
+                        self.checked[i] = value;
+                    }
+                }
+            }
+        }
+        if let Some(path) = enter {
+            self.current_dir = path;
+            self.filter.clear();
+        }
         if let Some(c) = requested {
             if self.order.0 == c {
                 self.order.1 = !self.order.1;
@@ -1294,6 +1430,7 @@ impl eframe::App for Arca {
                 egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
                     self.toolbar(ui, &ctx2);
                 });
+                self.settings_window(&ctx2);
                 egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
                     ui.add_space(5.0);
                     if self.busy {
