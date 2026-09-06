@@ -1,0 +1,23 @@
+[package]
+name = "arca-zip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Lector y escritor ZIP en safe Rust, con DEFLATE sobre zlib-rs"
+
+[dependencies]
+arca-core.workspace = true
+flate2.workspace = true
+crc32fast.workspace = true
+# Zstandard: bindings a libzstd. Es el unico codigo C del crate y entra solo
+# con la bandera codecs-native (seccion 03 del diseno).
+zstd = { workspace = true, optional = true }
+
+[features]
+default = ["codecs-native"]
+codecs-native = ["dep:zstd"]
+
+[lints.rust]
+unsafe_code = "forbid"

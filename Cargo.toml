@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["arca-core", "arca-zip", "arca-tar", "arca-cli"]
+# Solo compila en Windows: se queda fuera del workspace para que
+# `cargo build` siga funcionando en Linux y macOS.
+exclude = ["windows/arca-shell"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+authors = ["Proyecto Arca"]
+
+[workspace.dependencies]
+arca-core = { version = "0.1", path = "arca-core" }
+arca-zip  = { version = "0.1", path = "arca-zip" }
+arca-tar  = { version = "0.1", path = "arca-tar" }
+# DEFLATE: zlib-rs, la implementacion en Rust mas rapida medida (ver diseno S02)
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+crc32fast = "1"
+# Zstandard: bindings a libzstd, con su multihilo interno activado.
+zstd = { version = "0.13", features = ["zstdmt"] }
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+
+# Perfil agresivo: requisito R1 (arranque) y R3/R4 (rendimiento)
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+inherits = "release"
+panic = "unwind"

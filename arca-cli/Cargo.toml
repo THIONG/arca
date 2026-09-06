@@ -1,0 +1,20 @@
+[package]
+name = "arca-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Arca: archivador rapido y seguro"
+
+[[bin]]
+name = "arca"
+path = "src/main.rs"
+
+[dependencies]
+arca-core.workspace = true
+arca-zip.workspace = true
+arca-tar.workspace = true
+flate2.workspace = true
+clap.workspace = true
+rayon.workspace = true

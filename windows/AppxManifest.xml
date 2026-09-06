@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Paquete MSIX disperso (sparse package).
+
+  «Disperso» significa que la aplicación se instala como un programa normal en
+  la carpeta que tú elijas, y este paquete solo aporta la identidad que Windows
+   11 exige para registrar una entrada en el menú contextual. Es lo que hace
+  NanaZip y es la única vía admitida en Windows 11 sin escribir en el registro.
+
+  Dos cosas que hay que cambiar antes de usarlo:
+    1. El CLSID de com:Class y de desktop5:ItemType debe coincidir, letra por
+       letra, con CLSID_ARCA en src/lib.rs.
+    2. El Publisher debe coincidir exactamente con el asunto del certificado
+       con el que firmes. Si no coinciden, la instalación falla con un error
+       que no explica el motivo.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
+  IgnorableNamespaces="uap uap10 rescap com desktop4 desktop5">
+
+  <Identity
+    Name="Arca.Archivador"
+    Publisher="CN=CAMBIAME"
+    Version="0.1.0.0"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Arca</DisplayName>
+    <PublisherDisplayName>Proyecto Arca</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <!-- 10.0.22000.0 es Windows 11: IExplorerCommand en el menú moderno
+         necesita esa versión como mínimo. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0"
+                        MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="es-ES" />
+    <Resource Language="en-US" />
+  </Resources>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+
+  <Applications>
+    <Application Id="Arca"
+                 Executable="arca.exe"
+                 uap10:TrustLevel="mediumIL"
+                 uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements
+        DisplayName="Arca"
+        Description="Archivador rápido y seguro"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        BackgroundColor="transparent"
+        AppListEntry="none" />
+
+      <Extensions>
+        <!-- La entrada del menú contextual de Windows 11 -->
+        <desktop4:Extension Category="windows.fileExplorerContextMenus">
+          <desktop4:FileExplorerContextMenus>
+            <desktop5:ItemType Type="*">
+              <desktop5:Verb Id="Arca"
+                             Clsid="7F3A2B10-9C44-4D7E-A1F5-6E2B8C0D1234" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type="Directory">
+              <desktop5:Verb Id="Arca"
+                             Clsid="7F3A2B10-9C44-4D7E-A1F5-6E2B8C0D1234" />
+            </desktop5:ItemType>
+          </desktop4:FileExplorerContextMenus>
+        </desktop4:Extension>
+
+        <!-- El servidor COM que implementa esa entrada -->
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="Arca Shell">
+              <com:Class Id="7F3A2B10-9C44-4D7E-A1F5-6E2B8C0D1234"
+                         Path="arca_shell.dll"
+                         ThreadingModel="STA" />
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>

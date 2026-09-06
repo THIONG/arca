@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prueba:
+    name: Pruebas e interoperabilidad
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Herramientas de referencia
+        run: sudo apt-get update && sudo apt-get install -y zip unzip p7zip-full zstd
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: Compilar sin códecs de C (Rust puro)
+        run: cargo build --release --no-default-features
+      - run: cargo build --release
+      - name: Interoperabilidad verificada por hash
+        run: bash interop.sh
+
+  windows:
+    name: Compilar en Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cargo test --workspace
+      - name: Extensión de shell
+        working-directory: windows/arca-shell
+        run: cargo build --release
+        continue-on-error: true
+
+  macos:
+    name: Compilar en macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cargo test --workspace

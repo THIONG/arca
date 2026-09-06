@@ -1,0 +1,8 @@
+/target
+**/target
+Cargo.lock
+windows/salida/
+*.zip
+*.tar
+*.tar.gz
+*.bundle

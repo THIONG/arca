@@ -1,0 +1,31 @@
+[package]
+name = "arca-shell"
+version = "0.1.0"
+edition = "2021"
+description = "Extensión del menú contextual del Explorador de Windows para Arca"
+license = "Apache-2.0"
+
+[lib]
+# La DLL que carga el Explorador.
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pinado a propósito: la API de `#[implement]` y las firmas de los traits
+# cambian entre versiones menores de este crate. Si subes la versión, revisa
+# las firmas de IExplorerCommand_Impl antes de nada.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.58"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
