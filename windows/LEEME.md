@@ -33,9 +33,43 @@ Si algún día subes la versión del crate, ese es el orden en que conviene mira
 
 | Fichero | Qué es |
 |---|---|
-| `arca-shell/src/lib.rs` | La DLL: `IExplorerCommand` con submenú de tres acciones |
+| `arca-shell/src/lib.rs` | La DLL: `IExplorerCommand` y `IContextMenu`, con submenú de tres acciones |
 | `AppxManifest.xml` | Paquete MSIX disperso que da identidad a la extensión |
-| `construir.ps1` | Compila, empaqueta y registra en modo desarrollo |
+| `construir.ps1` | Compila, empaqueta, registra los dos menús |
+
+## Dos menús, dos interfaces, dos CLSID
+
+Windows 11 tiene dos menús contextuales y **no comparten mecanismo**:
+
+- El **moderno**, el que sale al hacer clic derecho, usa `IExplorerCommand` y se
+  registra declarándolo en el `AppxManifest.xml` del paquete MSIX.
+- El **clásico**, el de «Mostrar más opciones» —y el único que existe en
+  Windows 10—, usa `IContextMenu` + `IShellExtInit` y **no se puede declarar en
+  el manifiesto**: va por registro. `construir.ps1` escribe las claves en
+  `HKCU\Software\Classes`, que no necesita permisos de administrador.
+
+Son dos objetos COM distintos, con su propio CLSID, en la misma DLL.
+`DllGetClassObject` reparte según cuál le pidan.
+
+### La trampa de `QueryContextMenu`
+
+El contrato clásico de `IContextMenu::QueryContextMenu` es devolver el número de
+elementos añadidos codificado en el HRESULT, con `MAKE_HRESULT(SEVERITY_SUCCESS,
+0, n)`. Pero en `windows` 0.58 el trait declara `-> Result<()>`, y el vtable
+generado convierte `Ok(())` en `HRESULT(0)`, que significaría «no he añadido
+nada» y dejaría el menú roto.
+
+La salida es que `From<Result<T>> for HRESULT` devuelve el código del `Err` tal
+cual, y `nonzero_hresult` solo sustituye el cero. Así que la forma de devolver
+«he puesto tres entradas» es:
+
+```rust
+Err(Error::from(HRESULT(3)))
+```
+
+Parece un error y no lo es: `HRESULT(3)` tiene el bit de severidad a cero, o sea
+éxito. Se ve raro; el código no lleva comentarios por convención del proyecto, y
+por eso queda explicado aquí.
 
 ## Cómo se prueba
 
@@ -68,16 +102,22 @@ Y la lista de comprobación:
 5. El Explorador no se congela ni un instante (requisito R5)
 6. `.\construir.ps1 -Quitar` lo deja todo como estaba
 
+Y las del menú clásico, que es una implementación aparte:
+
+7. «Mostrar más opciones» sobre un `.zip` → **Arca** con las tres
+8. «Mostrar más opciones» sobre un `.txt` → **Arca** solo con «Comprimir»
+9. `-Quitar` borra también las claves de `HKCU\Software\Classes`
+
 Los seis pasan. Las cuatro primeras se comprobaron además conduciendo el objeto
 COM a mano —cargando la DLL y llamando a `GetState` e `Invoke` como haría el
 Explorador—, que es lo que permite decir *qué* falla y no solo que «no sale el
 menú». `GetState`, que es la llamada que el Explorador hace al construir el
 menú, tarda **3–23 µs**; el presupuesto de R5 son 16 ms.
 
-Un borde que sí conviene tener presente: `Invoke` tarda **5,0 ms**, que es lo que
-cuesta un `CreateProcess`, y `lanzar()` los encadena en serie. Con cuatro `.zip`
-seleccionados serían unos 20 ms, por encima de R5. No aparece en el escenario de
-la lista, pero está ahí.
+`Invoke` tardaba **5,0 ms**, que es lo que cuesta un `CreateProcess`, y
+`lanzar()` los encadenaba en serie: con cuatro `.zip` seleccionados eran unos
+20 ms, por encima de R5. Ahora `lanzar()` deja el trabajo en un hilo aparte y
+devuelve en **68 µs**, sin depender de cuántos ficheros haya seleccionados.
 
 ## Por qué esta DLL sí usa `unsafe`
 
@@ -92,10 +132,14 @@ malicioso, porque nunca llega a abrirlo.
 
 ## Lo que falta
 
-- **Windows 10** usa el mecanismo antiguo, `IContextMenu` registrado en el
-  registro. Son dos implementaciones distintas y hay que escribir las dos.
+- **Windows 10 sin probar**: el `IContextMenu` que necesita ya está escrito y
+  funciona en el menú clásico de Windows 11, que es el mismo mecanismo. Pero
+  nadie lo ha ejecutado en un Windows 10 de verdad.
 - **Iconos de verdad**: `construir.ps1` genera PNG de 1×1 para que el paquete
-  valide.
+  valide. El menú clásico tampoco pone icono en sus entradas; haría falta
+  `MENUITEMINFOW` con un bitmap.
+- **`GetCommandString` devuelve `E_NOTIMPL`**: el Explorador se queda sin texto
+  de ayuda en la barra de estado para las entradas del menú clásico.
 - **Firma**: para distribuirlo hace falta `makeappx` + `signtool` con un
   certificado. Sin él, SmartScreen avisa a todo el que lo descargue. El
   `Publisher` del manifiesto sigue siendo `CN=CAMBIAME` y debe coincidir letra

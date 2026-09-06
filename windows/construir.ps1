@@ -15,9 +15,42 @@ $Raiz    = Split-Path -Parent $PSScriptRoot
 $Destino = Join-Path $PSScriptRoot "salida"
 $Paquete = "Arca.Archivador"
 
+# El menú moderno de Windows 11 sale del paquete MSIX. El clásico —el de
+# «Mostrar más opciones», y el único que hay en Windows 10— es IContextMenu y
+# no se puede declarar en el manifiesto: va por registro. Se escribe en HKCU
+# para no necesitar permisos de administrador.
+#
+# Este CLSID es el del manejador clásico y debe coincidir con
+# CLSID_ARCA_CLASICO en src/lib.rs. Es distinto del de IExplorerCommand a
+# propósito: son dos objetos con interfaces distintas.
+$ClsidClasico = "{B528A7F3-C889-4C98-B052-5D7F7F778E14}"
+$TiposMenu    = @("*", "Directory")
+
+# Se usa la API de .NET en vez de New-Item porque una de las claves se llama
+# «*» y el proveedor de registro de PowerShell la trataría como comodín.
+function Registrar-MenuClasico($dll) {
+    $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Software\Classes\CLSID\$ClsidClasico\InprocServer32")
+    $k.SetValue("", $dll)
+    $k.SetValue("ThreadingModel", "Apartment")
+    $k.Close()
+    foreach ($t in $TiposMenu) {
+        $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Software\Classes\$t\shellex\ContextMenuHandlers\Arca")
+        $k.SetValue("", $ClsidClasico)
+        $k.Close()
+    }
+}
+
+function Desregistrar-MenuClasico {
+    foreach ($t in $TiposMenu) {
+        [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree("Software\Classes\$t\shellex\ContextMenuHandlers\Arca", $false)
+    }
+    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree("Software\Classes\CLSID\$ClsidClasico", $false)
+}
+
 if ($Quitar) {
     Get-AppxPackage $Paquete | Remove-AppxPackage
-    Write-Host "Desregistrado. Reinicia el Explorador para que desaparezca del menú."
+    Desregistrar-MenuClasico
+    Write-Host "Desregistrado, menú moderno y clásico. Reinicia el Explorador."
     exit 0
 }
 
@@ -56,8 +89,11 @@ foreach ($n in @("StoreLogo.png","Square150x150Logo.png","Square44x44Logo.png"))
 # Add-AppxPackage -Register no necesita firma, pero exige tener activado el
 # Modo de desarrollador en Configuración. Para distribuir de verdad hay que
 # empaquetar con makeappx y firmar con signtool.
-Write-Host "==> Registrando el paquete" -ForegroundColor Cyan
+Write-Host "==> Registrando el paquete (menú moderno)" -ForegroundColor Cyan
 Add-AppxPackage -Register "$Destino\AppxManifest.xml" -ExternalLocation $Destino
+
+Write-Host "==> Registrando el menú clásico" -ForegroundColor Cyan
+Registrar-MenuClasico "$Destino\arca_shell.dll"
 
 Write-Host ""
 Write-Host "Listo. Reinicia el Explorador para que cargue la extensión:" -ForegroundColor Green

@@ -3,9 +3,16 @@ use std::path::PathBuf;
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
+use windows::Win32::System::Ole::{ReleaseStgMedium, CF_HDROP};
+use windows::Win32::System::Registry::HKEY;
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::*;
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreatePopupMenu, InsertMenuW, HMENU, MF_BYPOSITION, MF_POPUP, MF_STRING,
+};
 
 const CLSID_ARCA: GUID = GUID::from_u128(0xe075ad96_f5bd_4bff_8c33_a29d05352efa);
+const CLSID_ARCA_CLASICO: GUID = GUID::from_u128(0xb528a7f3_c889_4c98_b052_5d7f7f778e14);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Accion {
@@ -83,6 +90,14 @@ fn ruta_del_binario() -> Result<PathBuf> {
 }
 
 fn lanzar(accion: Accion, rutas: &[PathBuf]) -> Result<()> {
+    let copia: Vec<PathBuf> = rutas.to_vec();
+    std::thread::spawn(move || {
+        let _ = ejecutar(accion, &copia);
+    });
+    Ok(())
+}
+
+fn ejecutar(accion: Accion, rutas: &[PathBuf]) -> Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -291,8 +306,141 @@ impl IEnumExplorerCommand_Impl for Enumerador_Impl {
     }
 }
 
+fn acciones_aplicables(rutas: &[PathBuf]) -> Vec<Accion> {
+    [
+        Accion::ExtraerAqui,
+        Accion::ExtraerACarpeta,
+        Accion::ComprimirZip,
+    ]
+    .into_iter()
+    .filter(|a| a.aplica(rutas))
+    .collect()
+}
+
+#[implement(IShellExtInit, IContextMenu)]
+struct MenuClasico {
+    rutas: std::cell::RefCell<Vec<PathBuf>>,
+}
+
+impl MenuClasico {
+    fn new() -> Self {
+        MenuClasico {
+            rutas: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl IShellExtInit_Impl for MenuClasico_Impl {
+    fn Initialize(
+        &self,
+        _carpeta: *const ITEMIDLIST,
+        datos: Option<&IDataObject>,
+        _clave: HKEY,
+    ) -> Result<()> {
+        let Some(datos) = datos else {
+            return Err(E_INVALIDARG.into());
+        };
+        let formato = FORMATETC {
+            cfFormat: CF_HDROP.0,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        };
+        unsafe {
+            let mut medio = datos.GetData(&formato)?;
+            let arrastre = HDROP(medio.u.hGlobal.0);
+            let cuantos = DragQueryFileW(arrastre, u32::MAX, None);
+            let mut v = Vec::with_capacity(cuantos as usize);
+            for i in 0..cuantos {
+                let largo = DragQueryFileW(arrastre, i, None) as usize;
+                if largo == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u16; largo + 1];
+                let escritos = DragQueryFileW(arrastre, i, Some(&mut buf)) as usize;
+                if escritos > 0 && escritos <= buf.len() {
+                    v.push(PathBuf::from(String::from_utf16_lossy(&buf[..escritos])));
+                }
+            }
+            ReleaseStgMedium(&mut medio);
+            *self.rutas.borrow_mut() = v;
+        }
+        Ok(())
+    }
+}
+
+impl IContextMenu_Impl for MenuClasico_Impl {
+    fn QueryContextMenu(
+        &self,
+        menu: HMENU,
+        posicion: u32,
+        id_primero: u32,
+        id_ultimo: u32,
+        banderas: u32,
+    ) -> Result<()> {
+        if banderas & CMF_DEFAULTONLY != 0 {
+            return Ok(());
+        }
+        let rutas = self.rutas.borrow();
+        let acciones = acciones_aplicables(&rutas);
+        if acciones.is_empty() {
+            return Ok(());
+        }
+        if id_primero.saturating_add(acciones.len() as u32) > id_ultimo {
+            return Ok(());
+        }
+        unsafe {
+            let submenu = CreatePopupMenu()?;
+            for (i, a) in acciones.iter().enumerate() {
+                AppendMenuW(
+                    submenu,
+                    MF_STRING,
+                    (id_primero + i as u32) as usize,
+                    a.titulo(),
+                )?;
+            }
+            InsertMenuW(
+                menu,
+                posicion,
+                MF_BYPOSITION | MF_POPUP,
+                submenu.0 as usize,
+                w!("Arca"),
+            )?;
+        }
+        Err(Error::from(HRESULT(acciones.len() as i32)))
+    }
+
+    fn InvokeCommand(&self, info: *const CMINVOKECOMMANDINFO) -> Result<()> {
+        if info.is_null() {
+            return Err(E_INVALIDARG.into());
+        }
+        let verbo = unsafe { (*info).lpVerb.0 } as usize;
+        if verbo >> 16 != 0 {
+            return Err(E_INVALIDARG.into());
+        }
+        let rutas = self.rutas.borrow();
+        let acciones = acciones_aplicables(&rutas);
+        let Some(accion) = acciones.get(verbo & 0xFFFF) else {
+            return Err(E_INVALIDARG.into());
+        };
+        lanzar(*accion, &rutas)
+    }
+
+    fn GetCommandString(
+        &self,
+        _id: usize,
+        _tipo: u32,
+        _reservado: *const u32,
+        _nombre: PSTR,
+        _maximo: u32,
+    ) -> Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+}
+
 #[implement(IClassFactory)]
-struct Fabrica;
+struct Fabrica(bool);
 
 impl IClassFactory_Impl for Fabrica_Impl {
     fn CreateInstance(
@@ -309,8 +457,13 @@ impl IClassFactory_Impl for Fabrica_Impl {
         }
         unsafe {
             *objeto = std::ptr::null_mut();
-            let raiz: IExplorerCommand = Raiz.into();
-            raiz.query(iid, objeto).ok()
+            if self.0 {
+                let clasico: IUnknown = MenuClasico::new().into();
+                clasico.query(iid, objeto).ok()
+            } else {
+                let raiz: IExplorerCommand = Raiz.into();
+                raiz.query(iid, objeto).ok()
+            }
         }
     }
 
@@ -330,10 +483,12 @@ pub extern "system" fn DllGetClassObject(
     }
     unsafe {
         *objeto = std::ptr::null_mut();
-        if *clsid != CLSID_ARCA {
-            return CLASS_E_CLASSNOTAVAILABLE;
-        }
-        let fabrica: IClassFactory = Fabrica.into();
+        let clasico = match *clsid {
+            c if c == CLSID_ARCA => false,
+            c if c == CLSID_ARCA_CLASICO => true,
+            _ => return CLASS_E_CLASSNOTAVAILABLE,
+        };
+        let fabrica: IClassFactory = Fabrica(clasico).into();
         fabrica.query(iid, objeto)
     }
 }
