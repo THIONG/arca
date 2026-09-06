@@ -10,53 +10,67 @@ use std::time::Instant;
 
 const BUF: usize = 256 * 1024;
 
-type Bloque = (usize, Vec<u8>, arca_core::Method, u32);
+type Block = (usize, Vec<u8>, arca_core::Method, u32);
 
 #[derive(Parser)]
 #[command(
     name = "arca",
     version,
-    about = "Archivador rapido y seguro",
-    long_about = "Arca comprime y extrae archivos. Los parsers estan escritos en safe Rust:\nun archivo malformado produce un error, nunca corrupcion de memoria."
+    about = "Fast, safe archiver",
+    long_about = "Arca compresses and extracts archives. The container parsers are written in\nsafe Rust: a malformed file produces an error, never memory corruption."
 )]
 struct Cli {
     #[command(subcommand)]
-    orden: Orden,
+    command: Cmd,
 }
 
 #[derive(Subcommand)]
-enum Orden {
-    #[command(visible_alias = "c")]
+enum Cmd {
+    #[command(visible_alias = "c", about = "Create an archive")]
     Create {
-        salida: PathBuf,
-        #[arg(required = true)]
-        entradas: Vec<PathBuf>,
-        #[arg(short, long, value_enum, default_value_t = Nivel::Normal)]
-        nivel: Nivel,
-        #[arg(short, long, value_enum, default_value_t = Compresor::Auto)]
-        codec: Compresor,
-        #[arg(short = 'j', long, default_value_t = 0)]
-        hilos: usize,
+        #[arg(help = "Output archive (.zip, .tar, .tar.gz)")]
+        out: PathBuf,
+        #[arg(required = true, help = "Files or directories to include")]
+        inputs: Vec<PathBuf>,
+        #[arg(short, long, value_enum, default_value_t = LevelArg::Normal,
+              help = "Compression level")]
+        level: LevelArg,
+        #[arg(short, long, value_enum, default_value_t = CodecArg::Auto,
+              help = "Compressor. 'auto' uses deflate in .zip for compatibility")]
+        codec: CodecArg,
+        #[arg(short = 'j', long, default_value_t = 0,
+              help = "Threads to use. 0 means every core")]
+        threads: usize,
     },
-    #[command(visible_alias = "l")]
+    #[command(visible_alias = "l", about = "List the contents without extracting them")]
     List {
-        archivo: PathBuf,
-        #[arg(short, long)]
-        tiempo: bool,
+        #[arg(help = "Archive to read")]
+        archive: PathBuf,
+        #[arg(short, long, help = "Report how long it took")]
+        time: bool,
     },
-    #[command(visible_alias = "x")]
+    #[command(visible_alias = "x", about = "Extract the contents")]
     Extract {
-        archivo: PathBuf,
-        #[arg(short = 'o', long, default_value = ".")]
-        destino: PathBuf,
+        #[arg(help = "Archive to extract")]
+        archive: PathBuf,
+        #[arg(short = 'o', long, default_value = ".", help = "Destination directory")]
+        dest: PathBuf,
     },
-    #[command(visible_alias = "t")]
-    Test { archivo: PathBuf },
-    Bench { archivo: PathBuf },
+    #[command(visible_alias = "t", about = "Check integrity without writing to disk")]
+    Test {
+        #[arg(help = "Archive to check")]
+        archive: PathBuf,
+    },
+    #[command(about = "Measure the R1 and R2 performance requirements")]
+    Bench {
+        #[arg(help = "Archive to measure against")]
+        archive: PathBuf,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
-enum Compresor {
+enum CodecArg {
+    #[value(help = "Deflate in .zip so anything can read it, zstd where possible")]
     Auto,
     Store,
     Deflate,
@@ -64,42 +78,42 @@ enum Compresor {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
-enum Nivel {
+enum LevelArg {
     Store,
     Fast,
     Normal,
     Best,
 }
 
-impl From<Nivel> for Level {
-    fn from(n: Nivel) -> Level {
+impl From<LevelArg> for Level {
+    fn from(n: LevelArg) -> Level {
         match n {
-            Nivel::Store => Level::Store,
-            Nivel::Fast => Level::Fast,
-            Nivel::Normal => Level::Normal,
-            Nivel::Best => Level::Best,
+            LevelArg::Store => Level::Store,
+            LevelArg::Fast => Level::Fast,
+            LevelArg::Normal => Level::Normal,
+            LevelArg::Best => Level::Best,
         }
     }
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
-enum Formato {
+enum Format {
     Zip,
     Tar,
     TarGz,
 }
 
-fn detectar(p: &Path) -> Result<Formato> {
+fn detect(p: &Path) -> Result<Format> {
     let n = p.to_string_lossy().to_ascii_lowercase();
     if n.ends_with(".zip") {
-        Ok(Formato::Zip)
+        Ok(Format::Zip)
     } else if n.ends_with(".tar.gz") || n.ends_with(".tgz") {
-        Ok(Formato::TarGz)
+        Ok(Format::TarGz)
     } else if n.ends_with(".tar") {
-        Ok(Formato::Tar)
+        Ok(Format::Tar)
     } else {
         Err(Error::Unsupported(format!(
-            "no reconozco la extension de «{}» (se admiten .zip, .tar, .tar.gz)",
+            "unrecognized extension in '{}' (.zip, .tar and .tar.gz are supported)",
             p.display()
         )))
     }
@@ -107,50 +121,54 @@ fn detectar(p: &Path) -> Result<Formato> {
 
 fn main() {
     let cli = Cli::parse();
-    if let Err(e) = ejecutar(cli) {
+    if let Err(e) = run(cli) {
         eprintln!("arca: {e}");
         std::process::exit(1);
     }
 }
 
-fn ejecutar(cli: Cli) -> Result<()> {
-    match cli.orden {
-        Orden::Create { salida, entradas, nivel, codec, hilos } => {
-            crear(&salida, &entradas, nivel.into(), codec, hilos)
-        }
-        Orden::List { archivo, tiempo } => listar(&archivo, tiempo),
-        Orden::Extract { archivo, destino } => extraer(&archivo, &destino),
-        Orden::Test { archivo } => probar(&archivo),
-        Orden::Bench { archivo } => bench(&archivo),
+fn run(cli: Cli) -> Result<()> {
+    match cli.command {
+        Cmd::Create {
+            out,
+            inputs,
+            level,
+            codec,
+            threads,
+        } => create(&out, &inputs, level.into(), codec, threads),
+        Cmd::List { archive, time } => list(&archive, time),
+        Cmd::Extract { archive, dest } => extract(&archive, &dest),
+        Cmd::Test { archive } => test_archive(&archive),
+        Cmd::Bench { archive } => bench(&archive),
     }
 }
 
-fn recolectar(entradas: &[PathBuf]) -> Result<Vec<(PathBuf, String)>> {
+fn collect_files(inputs: &[PathBuf]) -> Result<Vec<(PathBuf, String)>> {
     let mut v = Vec::new();
-    for e in entradas {
+    for e in inputs {
         let base = e.parent().unwrap_or(Path::new(""));
-        recorrer(e, base, &mut v)?;
+        walk(e, base, &mut v)?;
     }
     Ok(v)
 }
 
-fn recorrer(p: &Path, base: &Path, salida: &mut Vec<(PathBuf, String)>) -> Result<()> {
+fn walk(p: &Path, base: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<()> {
     let meta = fs::symlink_metadata(p)?;
     let rel = p.strip_prefix(base).unwrap_or(p);
-    let nombre = rel.to_string_lossy().replace('\\', "/");
+    let name = rel.to_string_lossy().replace('\\', "/");
     if meta.is_dir() {
-        let mut hijos: Vec<_> = fs::read_dir(p)?.collect::<io::Result<Vec<_>>>()?;
-        hijos.sort_by_key(|d| d.file_name());
-        for h in hijos {
-            recorrer(&h.path(), base, salida)?;
+        let mut children: Vec<_> = fs::read_dir(p)?.collect::<io::Result<Vec<_>>>()?;
+        children.sort_by_key(|d| d.file_name());
+        for h in children {
+            walk(&h.path(), base, out)?;
         }
     } else if meta.is_file() {
-        salida.push((p.to_path_buf(), nombre));
+        out.push((p.to_path_buf(), name));
     }
     Ok(())
 }
 
-fn mtime_de(m: &fs::Metadata) -> i64 {
+fn mtime_of(m: &fs::Metadata) -> i64 {
     m.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -158,125 +176,125 @@ fn mtime_de(m: &fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-const EN_VUELO_POR_HILO: u64 = 32 * 1024 * 1024;
+const IN_FLIGHT_PER_THREAD: u64 = 32 * 1024 * 1024;
 
-fn resolver_hilos(pedidos: usize) -> usize {
-    if pedidos > 0 {
-        return pedidos;
+fn resolve_threads(requested: usize) -> usize {
+    if requested > 0 {
+        return requested;
     }
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
-fn resolver_codec(c: Compresor, formato: Formato) -> Codec {
+fn resolve_codec(c: CodecArg, format_kind: Format) -> Codec {
     match c {
-        Compresor::Store => Codec::Store,
-        Compresor::Deflate => Codec::Deflate,
-        Compresor::Zstd => Codec::Zstd,
-        Compresor::Auto => match formato {
-            Formato::Zip => Codec::Deflate,
+        CodecArg::Store => Codec::Store,
+        CodecArg::Deflate => Codec::Deflate,
+        CodecArg::Zstd => Codec::Zstd,
+        CodecArg::Auto => match format_kind {
+            Format::Zip => Codec::Deflate,
             _ => Codec::Deflate,
         },
     }
 }
 
-fn lotes(ficheros: &[(PathBuf, String, u64, i64)], tope: u64) -> Vec<Vec<usize>> {
+fn batches(files: &[(PathBuf, String, u64, i64)], cap: u64) -> Vec<Vec<usize>> {
     let mut v = Vec::new();
-    let mut actual: Vec<usize> = Vec::new();
-    let mut suma = 0u64;
-    for (i, f) in ficheros.iter().enumerate() {
-        if f.2 > tope {
-            if !actual.is_empty() {
-                v.push(std::mem::take(&mut actual));
-                suma = 0;
+    let mut current: Vec<usize> = Vec::new();
+    let mut sum = 0u64;
+    for (i, f) in files.iter().enumerate() {
+        if f.2 > cap {
+            if !current.is_empty() {
+                v.push(std::mem::take(&mut current));
+                sum = 0;
             }
             v.push(vec![i]);
             continue;
         }
-        if suma + f.2 > tope && !actual.is_empty() {
-            v.push(std::mem::take(&mut actual));
-            suma = 0;
+        if sum + f.2 > cap && !current.is_empty() {
+            v.push(std::mem::take(&mut current));
+            sum = 0;
         }
-        actual.push(i);
-        suma += f.2;
+        current.push(i);
+        sum += f.2;
     }
-    if !actual.is_empty() {
-        v.push(actual);
+    if !current.is_empty() {
+        v.push(current);
     }
     v
 }
 
-fn crear(
-    salida: &Path,
-    entradas: &[PathBuf],
-    nivel: Level,
-    compresor: Compresor,
-    hilos_pedidos: usize,
+fn create(
+    out: &Path,
+    inputs: &[PathBuf],
+    level: Level,
+    codec_arg: CodecArg,
+    requested_threads: usize,
 ) -> Result<()> {
-    let formato = detectar(salida)?;
-    let codec = resolver_codec(compresor, formato);
-    let hilos = resolver_hilos(hilos_pedidos);
-    let brutos = recolectar(entradas)?;
-    if brutos.is_empty() {
-        return Err(Error::Format("no hay ficheros que anadir".into()));
+    let format_kind = detect(out)?;
+    let codec = resolve_codec(codec_arg, format_kind);
+    let threads = resolve_threads(requested_threads);
+    let raw_list = collect_files(inputs)?;
+    if raw_list.is_empty() {
+        return Err(Error::Format("there is nothing to add".into()));
     }
 
-    let mut ficheros: Vec<(PathBuf, String, u64, i64)> = Vec::with_capacity(brutos.len());
+    let mut files: Vec<(PathBuf, String, u64, i64)> = Vec::with_capacity(raw_list.len());
     let mut total = 0u64;
-    for (ruta, nombre) in brutos {
-        let m = fs::metadata(&ruta)?;
+    for (path, name) in raw_list {
+        let m = fs::metadata(&path)?;
         total += m.len();
-        ficheros.push((ruta, nombre, m.len(), mtime_de(&m)));
+        files.push((path, name, m.len(), mtime_of(&m)));
     }
 
     let t0 = Instant::now();
-    match formato {
-        Formato::Zip => {
-            let f = File::create(salida)?;
+    match format_kind {
+        Format::Zip => {
+            let f = File::create(out)?;
             let mut w = ZipWriter::new(BufWriter::with_capacity(BUF, f));
-            let tope = EN_VUELO_POR_HILO * hilos as u64;
+            let cap = IN_FLIGHT_PER_THREAD * threads as u64;
             let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(hilos)
+                .num_threads(threads)
                 .build()
-                .map_err(|e| Error::Format(format!("no se pudo crear el pool de hilos: {e}")))?;
+                .map_err(|e| Error::Format(format!("could not create the thread pool: {e}")))?;
 
-            for lote in lotes(&ficheros, tope) {
-                if lote.len() == 1 && ficheros[lote[0]].2 > tope {
-                    let (ruta, nombre, _, mt) = &ficheros[lote[0]];
-                    let entrada = BufReader::with_capacity(BUF, File::open(ruta)?);
-                    w.add(nombre, entrada, codec, nivel, Some(*mt))?;
+            for batch in batches(&files, cap) {
+                if batch.len() == 1 && files[batch[0]].2 > cap {
+                    let (path, name, _, mt) = &files[batch[0]];
+                    let entrada = BufReader::with_capacity(BUF, File::open(path)?);
+                    w.add(name, entrada, codec, level, Some(*mt))?;
                     continue;
                 }
-                let hechos: Vec<Result<Bloque>> = pool.install(|| {
-                    lote.par_iter()
+                let produced: Vec<Result<Block>> = pool.install(|| {
+                    batch.par_iter()
                         .map(|&i| {
-                            let datos = fs::read(&ficheros[i].0)?;
-                            let (c, m, crc) = compress_block(&datos, codec, nivel)?;
+                            let data = fs::read(&files[i].0)?;
+                            let (c, m, crc) = compress_block(&data, codec, level)?;
                             Ok((i, c, m, crc))
                         })
                         .collect()
                 });
-                for h in hechos {
+                for h in produced {
                     let (i, c, m, crc) = h?;
-                    let (_, nombre, tam, mt) = &ficheros[i];
-                    w.add_compressed(nombre, &c, crc, *tam, m, Some(*mt))?;
+                    let (_, name, size, mt) = &files[i];
+                    w.add_compressed(name, &c, crc, *size, m, Some(*mt))?;
                 }
             }
             w.finish()?;
         }
-        Formato::Tar | Formato::TarGz => {
-            let f = BufWriter::with_capacity(BUF, File::create(salida)?);
-            let destino: Box<dyn Write> = if formato == Formato::TarGz {
+        Format::Tar | Format::TarGz => {
+            let f = BufWriter::with_capacity(BUF, File::create(out)?);
+            let dest: Box<dyn Write> = if format_kind == Format::TarGz {
                 Box::new(flate2::write::GzEncoder::new(
                     f,
-                    flate2::Compression::new(nivel.to_flate2()),
+                    flate2::Compression::new(level.to_flate2()),
                 ))
             } else {
                 Box::new(f)
             };
-            let mut w = TarWriter::new(destino);
-            for (ruta, nombre, tam, mt) in &ficheros {
-                let entrada = BufReader::with_capacity(BUF, File::open(ruta)?);
-                w.add(nombre, *tam, *mt, 0o644, entrada)?;
+            let mut w = TarWriter::new(dest);
+            for (path, name, size, mt) in &files {
+                let entrada = BufReader::with_capacity(BUF, File::open(path)?);
+                w.add(name, *size, *mt, 0o644, entrada)?;
             }
             let mut d = w.finish()?;
             d.flush()?;
@@ -284,40 +302,40 @@ fn crear(
     }
 
     let dt = t0.elapsed();
-    let final_tam = fs::metadata(salida)?.len();
-    let ratio = if total > 0 { 100.0 * (1.0 - final_tam as f64 / total as f64) } else { 0.0 };
+    let final_size = fs::metadata(out)?.len();
+    let ratio = if total > 0 { 100.0 * (1.0 - final_size as f64 / total as f64) } else { 0.0 };
     let mbs = if dt.as_secs_f64() > 0.0 {
         total as f64 / 1_048_576.0 / dt.as_secs_f64()
     } else {
         0.0
     };
     println!(
-        "{}: {} ficheros, {} -> {} ({:.1} % menos) en {:.3} s · {:.0} MB/s · {} hilos",
-        salida.display(),
-        ficheros.len(),
-        humano(total),
-        humano(final_tam),
+        "{}: {} files, {} -> {} ({:.1}% smaller) in {:.3} s · {:.0} MB/s · {} threads",
+        out.display(),
+        files.len(),
+        human(total),
+        human(final_size),
         ratio,
         dt.as_secs_f64(),
         mbs,
-        hilos
+        threads
     );
     Ok(())
 }
 
-fn listar(archivo: &Path, tiempo: bool) -> Result<()> {
+fn list(archive: &Path, time: bool) -> Result<()> {
     let t0 = Instant::now();
-    let formato = detectar(archivo)?;
+    let format_kind = detect(archive)?;
     let mut n = 0u64;
     let mut bytes = 0u64;
 
-    let mut salida = BufWriter::new(io::stdout().lock());
-    match formato {
-        Formato::Zip => {
-            let a = ZipArchive::open(File::open(archivo)?)?;
+    let mut out = BufWriter::new(io::stdout().lock());
+    match format_kind {
+        Format::Zip => {
+            let a = ZipArchive::open(File::open(archive)?)?;
             for e in a.entries() {
                 writeln!(
-                    salida,
+                    out,
                     "{:>12}  {:>7}  {:>5.1}%  {}",
                     e.size,
                     e.method.name(),
@@ -328,79 +346,79 @@ fn listar(archivo: &Path, tiempo: bool) -> Result<()> {
                 bytes += e.size;
             }
         }
-        Formato::Tar | Formato::TarGz => {
-            let f = BufReader::with_capacity(BUF, File::open(archivo)?);
-            let fuente: Box<dyn Read> = if formato == Formato::TarGz {
+        Format::Tar | Format::TarGz => {
+            let f = BufReader::with_capacity(BUF, File::open(archive)?);
+            let source: Box<dyn Read> = if format_kind == Format::TarGz {
                 Box::new(flate2::read::GzDecoder::new(f))
             } else {
                 Box::new(f)
             };
-            let mut r = TarReader::new(fuente);
+            let mut r = TarReader::new(source);
             while let Some(e) = r.next_entry()? {
-                writeln!(salida, "{:>12}  {:>7}  {:>5}   {}", e.entry.size, "store", "", e.entry.name)?;
+                writeln!(out, "{:>12}  {:>7}  {:>5}   {}", e.entry.size, "store", "", e.entry.name)?;
                 n += 1;
                 bytes += e.entry.size;
                 r.skip_data(&e)?;
             }
         }
     }
-    salida.flush()?;
+    out.flush()?;
 
-    if tiempo {
+    if time {
         eprintln!(
-            "{n} entradas, {} sin comprimir, listado en {:.1} ms",
-            humano(bytes),
+            "{n} entries, {} uncompressed, listed in {:.1} ms",
+            human(bytes),
             t0.elapsed().as_secs_f64() * 1000.0
         );
     }
     Ok(())
 }
 
-fn extraer(archivo: &Path, destino: &Path) -> Result<()> {
-    let formato = detectar(archivo)?;
-    fs::create_dir_all(destino)?;
+fn extract(archive: &Path, dest: &Path) -> Result<()> {
+    let format_kind = detect(archive)?;
+    fs::create_dir_all(dest)?;
     let t0 = Instant::now();
     let mut n = 0u64;
     let mut bytes = 0u64;
 
-    match formato {
-        Formato::Zip => {
-            let mut a = ZipArchive::open(File::open(archivo)?)?;
+    match format_kind {
+        Format::Zip => {
+            let mut a = ZipArchive::open(File::open(archive)?)?;
             let total = a.len();
             for i in 0..total {
                 let e = a.entries()[i].clone();
                 if e.is_dir {
-                    fs::create_dir_all(destino.join(arca_core::safe_name(&e.name)?))?;
+                    fs::create_dir_all(dest.join(arca_core::safe_name(&e.name)?))?;
                     continue;
                 }
-                let ruta = destino.join(arca_core::safe_name(&e.name)?);
-                if let Some(p) = ruta.parent() {
+                let path = dest.join(arca_core::safe_name(&e.name)?);
+                if let Some(p) = path.parent() {
                     fs::create_dir_all(p)?;
                 }
-                let f = BufWriter::with_capacity(BUF, File::create(&ruta)?);
+                let f = BufWriter::with_capacity(BUF, File::create(&path)?);
                 bytes += a.extract_to(i, f)?;
                 n += 1;
             }
         }
-        Formato::Tar | Formato::TarGz => {
-            let f = BufReader::with_capacity(BUF, File::open(archivo)?);
-            let fuente: Box<dyn Read> = if formato == Formato::TarGz {
+        Format::Tar | Format::TarGz => {
+            let f = BufReader::with_capacity(BUF, File::open(archive)?);
+            let source: Box<dyn Read> = if format_kind == Format::TarGz {
                 Box::new(flate2::read::GzDecoder::new(f))
             } else {
                 Box::new(f)
             };
-            let mut r = TarReader::new(fuente);
+            let mut r = TarReader::new(source);
             while let Some(e) = r.next_entry()? {
-                let ruta = destino.join(arca_core::safe_name(&e.entry.name)?);
+                let path = dest.join(arca_core::safe_name(&e.entry.name)?);
                 if e.entry.is_dir {
-                    fs::create_dir_all(&ruta)?;
+                    fs::create_dir_all(&path)?;
                     r.skip_data(&e)?;
                     continue;
                 }
-                if let Some(p) = ruta.parent() {
+                if let Some(p) = path.parent() {
                     fs::create_dir_all(p)?;
                 }
-                let mut w = BufWriter::with_capacity(BUF, File::create(&ruta)?);
+                let mut w = BufWriter::with_capacity(BUF, File::create(&path)?);
                 bytes += r.copy_data(&e, &mut w)?;
                 w.flush()?;
                 n += 1;
@@ -409,44 +427,44 @@ fn extraer(archivo: &Path, destino: &Path) -> Result<()> {
     }
 
     println!(
-        "{n} ficheros, {} escritos en {:.3} s",
-        humano(bytes),
+        "{n} files, {} written in {:.3} s",
+        human(bytes),
         t0.elapsed().as_secs_f64()
     );
     Ok(())
 }
 
-fn probar(archivo: &Path) -> Result<()> {
-    let formato = detectar(archivo)?;
+fn test_archive(archive: &Path) -> Result<()> {
+    let format_kind = detect(archive)?;
     let t0 = Instant::now();
     let mut n = 0u64;
-    let mut fallos = 0u64;
+    let mut failures = 0u64;
 
-    match formato {
-        Formato::Zip => {
-            let mut a = ZipArchive::open(File::open(archivo)?)?;
+    match format_kind {
+        Format::Zip => {
+            let mut a = ZipArchive::open(File::open(archive)?)?;
             for i in 0..a.len() {
                 if a.entries()[i].is_dir {
                     continue;
                 }
-                let nombre = a.entries()[i].name.clone();
+                let name = a.entries()[i].name.clone();
                 match a.extract_to(i, io::sink()) {
                     Ok(_) => n += 1,
                     Err(e) => {
-                        eprintln!("  FALLO  {nombre}: {e}");
-                        fallos += 1;
+                        eprintln!("  FALLO  {name}: {e}");
+                        failures += 1;
                     }
                 }
             }
         }
-        Formato::Tar | Formato::TarGz => {
-            let f = BufReader::with_capacity(BUF, File::open(archivo)?);
-            let fuente: Box<dyn Read> = if formato == Formato::TarGz {
+        Format::Tar | Format::TarGz => {
+            let f = BufReader::with_capacity(BUF, File::open(archive)?);
+            let source: Box<dyn Read> = if format_kind == Format::TarGz {
                 Box::new(flate2::read::GzDecoder::new(f))
             } else {
                 Box::new(f)
             };
-            let mut r = TarReader::new(fuente);
+            let mut r = TarReader::new(source);
             while let Some(e) = r.next_entry()? {
                 r.skip_data(&e)?;
                 n += 1;
@@ -454,47 +472,47 @@ fn probar(archivo: &Path) -> Result<()> {
         }
     }
 
-    if fallos > 0 {
-        return Err(Error::Format(format!("{fallos} entradas corruptas de {}", n + fallos)));
+    if failures > 0 {
+        return Err(Error::Format(format!("{failures} corrupt entries out of {}", n + failures)));
     }
-    println!("{n} entradas verificadas, sin errores ({:.3} s)", t0.elapsed().as_secs_f64());
+    println!("{n} entries verified, no errors ({:.3} s)", t0.elapsed().as_secs_f64());
     Ok(())
 }
 
-fn bench(archivo: &Path) -> Result<()> {
-    println!("Requisitos de rendimiento (documento de diseno, seccion 05)\n");
+fn bench(archive: &Path) -> Result<()> {
+    println!("Performance requirements (design document, section 05)\n");
 
-    let mut mejor = f64::MAX;
-    let mut entradas = 0usize;
+    let mut best_of = f64::MAX;
+    let mut inputs = 0usize;
     for _ in 0..5 {
         let t = Instant::now();
-        let a = ZipArchive::open(File::open(archivo)?)?;
-        entradas = a.len();
+        let a = ZipArchive::open(File::open(archive)?)?;
+        inputs = a.len();
         let d = t.elapsed().as_secs_f64() * 1000.0;
-        if d < mejor {
-            mejor = d;
+        if d < best_of {
+            best_of = d;
         }
     }
-    let tam = fs::metadata(archivo)?.len();
-    let r2 = mejor < 200.0;
-    println!("  R2  listar sin descomprimir");
-    println!("      {} entradas de un archivo de {}", entradas, humano(tam));
-    println!("      {:.1} ms   objetivo < 200 ms   {}", mejor, si_no(r2));
+    let size = fs::metadata(archive)?.len();
+    let r2 = best_of < 200.0;
+    println!("  R2  list without extracting");
+    println!("      {} entries in a {} archive", inputs, human(size));
+    println!("      {:.1} ms   target < 200 ms   {}", best_of, pass_fail(r2));
     println!();
-    println!("  R1  arranque en frio: se mide desde fuera, con hyperfine");
+    println!("  R1  cold start: measured from outside, with hyperfine");
     println!("      hyperfine --warmup 20 'arca --version'");
     Ok(())
 }
 
-fn si_no(ok: bool) -> &'static str {
+fn pass_fail(ok: bool) -> &'static str {
     if ok {
-        "CUMPLE"
+        "PASS"
     } else {
-        "NO CUMPLE"
+        "FAIL"
     }
 }
 
-fn humano(b: u64) -> String {
+fn human(b: u64) -> String {
     const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = b as f64;
     let mut i = 0;
