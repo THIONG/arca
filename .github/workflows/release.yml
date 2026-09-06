@@ -24,15 +24,24 @@ jobs:
           - nombre: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            nativo: true
           - nombre: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
+            nativo: true
+          # El binario Intel se compila cruzado desde el runner ARM. Con
+          # `macos-13`, el ultimo Intel que queda, un trabajo se pasaba 40
+          # minutos esperando runner: GitHub lo esta retirando y hay cola.
+          # El precio es que aqui no se puede comprobar que arranque, porque
+          # el runner ARM no ejecuta un binario x86_64.
           - nombre: macos-x86_64
-            os: macos-13
+            os: macos-latest
             target: x86_64-apple-darwin
+            nativo: false
           - nombre: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
+            nativo: true
     steps:
       - uses: actions/checkout@v4
 
@@ -49,6 +58,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Comprobar que el binario arranca
+        if: matrix.nativo
         shell: bash
         run: |
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
