@@ -1,6 +1,14 @@
 #!/bin/bash
 # Criterio de aceptacion F01: interoperabilidad verificada por hash.
-ARCA=/home/claude/arca/target/release/arca
+# Se resuelve desde la ubicacion del script, no desde una ruta absoluta: la que
+# habia antes era la del contenedor donde se escribio esto y no existe ni en CI
+# ni en un clon normal. Se puede forzar otra con ARCA=... bash interop.sh
+RAIZ=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ARCA=${ARCA:-$RAIZ/target/release/arca}
+if [ ! -x "$ARCA" ]; then
+  echo "no encuentro el binario en $ARCA (compila con: cargo build --release)" >&2
+  exit 1
+fi
 W=/tmp/interop; rm -rf $W; mkdir -p $W/src $W/out; cd $W
 OK=0; KO=0
 ok(){ printf "  \033[32mOK\033[0m   %s\n" "$1"; OK=$((OK+1)); }

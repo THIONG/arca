@@ -17,6 +17,12 @@ use std::time::Instant;
 /// Buffers grandes: en modo rapido el disco es el cuello de botella (R4).
 const BUF: usize = 256 * 1024;
 
+/// Un fichero ya comprimido en memoria, esperando a escribirse en orden:
+/// indice dentro del lote, bytes comprimidos, metodo aplicado y CRC del
+/// original. Los hilos lo producen en desorden; el indice restaura la
+/// secuencia antes de escribir.
+type Bloque = (usize, Vec<u8>, arca_core::Method, u32);
+
 #[derive(Parser)]
 #[command(
     name = "arca",
@@ -279,7 +285,7 @@ fn crear(
                     continue;
                 }
                 // Lote pequeno: se comprime en paralelo y se escribe en orden.
-                let hechos: Vec<Result<(usize, Vec<u8>, arca_core::Method, u32)>> = pool.install(|| {
+                let hechos: Vec<Result<Bloque>> = pool.install(|| {
                     lote.par_iter()
                         .map(|&i| {
                             let datos = fs::read(&ficheros[i].0)?;

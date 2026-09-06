@@ -32,6 +32,7 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# Cargo ya fuerza unwind en los perfiles de test y bench, asi que poner
+# `panic` aqui no hacia nada salvo un aviso en cada compilacion.
 [profile.bench]
 inherits = "release"
-panic = "unwind"

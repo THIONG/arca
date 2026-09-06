@@ -246,6 +246,47 @@ fn buscar_hacia_atras(buf: &[u8], firma: u32) -> Option<usize> {
     (0..=buf.len() - 4).rev().find(|&i| buf[i..i + 4] == f)
 }
 
+/// Mitad alta de CP437, la pagina de codigos que ZIP usa para los nombres
+/// cuando el bit 11 no esta puesto. La mitad baja coincide con ASCII, asi que
+/// solo hace falta desde 0x80. Va con escapes Unicode para que este fichero
+/// siga siendo ASCII puro, como el resto de `src/`.
+#[rustfmt::skip]
+const CP437_ALTO: [char; 128] = [
+    '\u{00C7}', '\u{00FC}', '\u{00E9}', '\u{00E2}', '\u{00E4}', '\u{00E0}', '\u{00E5}', '\u{00E7}',
+    '\u{00EA}', '\u{00EB}', '\u{00E8}', '\u{00EF}', '\u{00EE}', '\u{00EC}', '\u{00C4}', '\u{00C5}',
+    '\u{00C9}', '\u{00E6}', '\u{00C6}', '\u{00F4}', '\u{00F6}', '\u{00F2}', '\u{00FB}', '\u{00F9}',
+    '\u{00FF}', '\u{00D6}', '\u{00DC}', '\u{00A2}', '\u{00A3}', '\u{00A5}', '\u{20A7}', '\u{0192}',
+    '\u{00E1}', '\u{00ED}', '\u{00F3}', '\u{00FA}', '\u{00F1}', '\u{00D1}', '\u{00AA}', '\u{00BA}',
+    '\u{00BF}', '\u{2310}', '\u{00AC}', '\u{00BD}', '\u{00BC}', '\u{00A1}', '\u{00AB}', '\u{00BB}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}',
+    '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255D}', '\u{255C}', '\u{255B}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252C}', '\u{251C}', '\u{2500}', '\u{253C}', '\u{255E}', '\u{255F}',
+    '\u{255A}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256C}', '\u{2567}',
+    '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256B}',
+    '\u{256A}', '\u{2518}', '\u{250C}', '\u{2588}', '\u{2584}', '\u{258C}', '\u{2590}', '\u{2580}',
+    '\u{03B1}', '\u{00DF}', '\u{0393}', '\u{03C0}', '\u{03A3}', '\u{03C3}', '\u{00B5}', '\u{03C4}',
+    '\u{03A6}', '\u{0398}', '\u{03A9}', '\u{03B4}', '\u{221E}', '\u{03C6}', '\u{03B5}', '\u{2229}',
+    '\u{2261}', '\u{00B1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{00F7}', '\u{2248}',
+    '\u{00B0}', '\u{2219}', '\u{00B7}', '\u{221A}', '\u{207F}', '\u{00B2}', '\u{25A0}', '\u{00A0}',
+];
+
+/// Decodifica un nombre en CP437. Es infalible por construccion: los 256 bytes
+/// posibles tienen caracter asignado, asi que ninguna basura puede provocar un
+/// error ni un caracter de reemplazo. El indice cae siempre en 0..=127, porque
+/// la otra rama se queda con todo lo que es ASCII.
+fn de_cp437(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| {
+            if b.is_ascii() {
+                b as char
+            } else {
+                CP437_ALTO[usize::from(b) - 0x80]
+            }
+        })
+        .collect()
+}
+
 fn leer_cabecera_central(c: &mut Cursor<'_>) -> Result<Entry> {
     if c.u32le("firma del directorio")? != SIG_CD {
         return Err(Error::Format("firma de entrada invalida".into()));
@@ -315,12 +356,13 @@ fn leer_cabecera_central(c: &mut Cursor<'_>) -> Result<Entry> {
         }
     };
 
-    // El bit 11 indica nombre en UTF-8. Sin el, deberia ser CP437; aceptamos
-    // UTF-8 con reemplazo para no rechazar archivos por el nombre.
+    // El bit 11 indica nombre en UTF-8. Sin el, la especificacion manda CP437,
+    // que es lo que escriben el Explorador de Windows y las herramientas
+    // antiguas: ahi el byte 0x82 es una «e» acentuada, no UTF-8 invalido.
     let name = if flags & 0x800 != 0 {
         String::from_utf8_lossy(nombre_bytes).into_owned()
     } else {
-        String::from_utf8_lossy(nombre_bytes).into_owned()
+        de_cp437(nombre_bytes)
     };
     let is_dir = name.ends_with('/') || name.ends_with('\\');
 
@@ -788,5 +830,75 @@ mod tests {
         let a = ZipArchive::open(IoCursor::new(buf)).unwrap();
         assert_eq!(a.len(), 500);
         assert_eq!(a.entries()[499].name, "f0499.txt");
+    }
+
+    /// Cabecera de directorio central minima, para probar el parseo de nombres
+    /// sin pasar por el escritor, que siempre pone el bit 11.
+    fn cabecera_central(flags: u16, nombre: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&SIG_CD.to_le_bytes());
+        b.extend_from_slice(&0x031Eu16.to_le_bytes()); // hecho por
+        b.extend_from_slice(&45u16.to_le_bytes()); // version necesaria
+        b.extend_from_slice(&flags.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes()); // metodo: store
+        b.extend_from_slice(&0u16.to_le_bytes()); // hora
+        b.extend_from_slice(&0u16.to_le_bytes()); // fecha
+        b.extend_from_slice(&0u32.to_le_bytes()); // crc
+        b.extend_from_slice(&0u32.to_le_bytes()); // comprimido
+        b.extend_from_slice(&0u32.to_le_bytes()); // sin comprimir
+        b.extend_from_slice(&(nombre.len() as u16).to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes()); // extra
+        b.extend_from_slice(&0u16.to_le_bytes()); // comentario
+        b.extend_from_slice(&0u16.to_le_bytes()); // disco
+        b.extend_from_slice(&0u16.to_le_bytes()); // atributos internos
+        b.extend_from_slice(&0u32.to_le_bytes()); // atributos externos
+        b.extend_from_slice(&0u32.to_le_bytes()); // desplazamiento local
+        b.extend_from_slice(nombre);
+        b
+    }
+
+    #[test]
+    fn nombre_sin_bit_utf8_se_lee_como_cp437() {
+        // 0x82 es «e» acentuada en CP437 y a la vez UTF-8 invalido: es el caso
+        // que distingue las dos ramas.
+        let crudo = b"caf\x82.txt";
+
+        let b = cabecera_central(0, crudo);
+        let e = leer_cabecera_central(&mut Cursor::new(&b)).unwrap();
+        assert_eq!(e.name, "caf\u{00E9}.txt");
+
+        // Con el bit 11 puesto, el mismo byte si es UTF-8 roto: reemplazo.
+        let b = cabecera_central(0x800, crudo);
+        let e = leer_cabecera_central(&mut Cursor::new(&b)).unwrap();
+        assert_eq!(e.name, "caf\u{FFFD}.txt");
+    }
+
+    #[test]
+    fn cp437_traga_los_256_bytes_sin_perder_nada() {
+        let todos: Vec<u8> = (0..=255u8).collect();
+        let s = de_cp437(&todos);
+        assert_eq!(s.chars().count(), 256, "cada byte debe dar un caracter");
+        assert!(
+            !s.contains('\u{FFFD}'),
+            "CP437 no tiene huecos: no deberia salir ningun reemplazo"
+        );
+    }
+
+    #[test]
+    fn cabecera_central_con_nombre_basura_no_hace_panic() {
+        for semilla in 0u32..200 {
+            let n = (semilla as usize % 40) + 1;
+            let nombre: Vec<u8> = (0..n)
+                .map(|i| ((semilla.wrapping_mul(2_654_435_761) >> (i % 24)) & 0xFF) as u8)
+                .collect();
+            for flags in [0u16, 0x800] {
+                let b = cabecera_central(flags, &nombre);
+                let _ = leer_cabecera_central(&mut Cursor::new(&b));
+                // Y la misma cabecera truncada por todos los puntos posibles.
+                for corte in 0..b.len() {
+                    let _ = leer_cabecera_central(&mut Cursor::new(&b[..corte]));
+                }
+            }
+        }
     }
 }
