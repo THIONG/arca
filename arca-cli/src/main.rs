@@ -1,6 +1,6 @@
 use arca_core::{Codec, Error, Level, Result};
 use arca_tar::{TarReader, TarWriter};
-use arca_zip::{comprimir_bloque, ZipArchive, ZipWriter};
+use arca_zip::{compress_block, ZipArchive, ZipWriter};
 use rayon::prelude::*;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::fs::{self, File};
@@ -250,7 +250,7 @@ fn crear(
                     lote.par_iter()
                         .map(|&i| {
                             let datos = fs::read(&ficheros[i].0)?;
-                            let (c, m, crc) = comprimir_bloque(&datos, codec, nivel)?;
+                            let (c, m, crc) = compress_block(&datos, codec, nivel)?;
                             Ok((i, c, m, crc))
                         })
                         .collect()
@@ -258,7 +258,7 @@ fn crear(
                 for h in hechos {
                     let (i, c, m, crc) = h?;
                     let (_, nombre, tam, mt) = &ficheros[i];
-                    w.add_comprimido(nombre, &c, crc, *tam, m, Some(*mt))?;
+                    w.add_compressed(nombre, &c, crc, *tam, m, Some(*mt))?;
                 }
             }
             w.finish()?;
