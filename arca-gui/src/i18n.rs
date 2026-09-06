@@ -1,0 +1,218 @@
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lang {
+    En,
+    Es,
+}
+
+impl Lang {
+    pub const ALL: [Lang; 2] = [Lang::En, Lang::Es];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Lang::En => "en",
+            Lang::Es => "es",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Lang::En => "English",
+            Lang::Es => "Español",
+        }
+    }
+
+    pub fn from_code(s: &str) -> Option<Lang> {
+        match s.get(..2)?.to_ascii_lowercase().as_str() {
+            "en" => Some(Lang::En),
+            "es" => Some(Lang::Es),
+            _ => None,
+        }
+    }
+
+    pub fn from_system() -> Lang {
+        sys_locale::get_locale()
+            .and_then(|l| Lang::from_code(&l))
+            .unwrap_or(Lang::En)
+    }
+}
+
+pub struct Strings {
+    pub open: &'static str,
+    pub compress: &'static str,
+    pub extract_all: &'static str,
+    pub extract_selected: &'static str,
+    pub test: &'static str,
+    pub filter_hint: &'static str,
+    pub format: &'static str,
+    pub compressor: &'static str,
+    pub level: &'static str,
+    pub into_subfolder: &'static str,
+    pub check_all: &'static str,
+    pub uncheck_all: &'static str,
+    pub col_size: &'static str,
+    pub col_packed: &'static str,
+    pub col_method: &'static str,
+    pub col_saved: &'static str,
+    pub col_name: &'static str,
+    pub sort_hint: &'static str,
+    pub drop_here: &'static str,
+    pub language: &'static str,
+    pub theme: &'static str,
+    pub theme_system: &'static str,
+    pub theme_light: &'static str,
+    pub theme_dark: &'static str,
+    pub level_none: &'static str,
+    pub level_fast: &'static str,
+    pub level_normal: &'static str,
+    pub level_best: &'static str,
+    pub codec_store: &'static str,
+    pub codec_deflate: &'static str,
+    pub codec_zstd: &'static str,
+    pub visible_of: &'static str,
+    pub checked: &'static str,
+    pub files_word: &'static str,
+    pub uncompressed_word: &'static str,
+    pub in_archive: &'static str,
+    pub saved_word: &'static str,
+    pub one_entry: &'static str,
+    pub entries_word: &'static str,
+    pub start: &'static str,
+    pub cancel: &'static str,
+    pub close: &'static str,
+    pub output_name: &'static str,
+    pub add_to_archive: &'static str,
+    pub extracting: &'static str,
+    pub compressing: &'static str,
+    pub testing: &'static str,
+    pub done: &'static str,
+    pub failed: &'static str,
+    pub extracted_to: &'static str,
+    pub created: &'static str,
+    pub verified_ok: &'static str,
+    pub errors_found: &'static str,
+    pub unknown_format: &'static str,
+    pub nothing_to_do: &'static str,
+}
+
+const EN: Strings = Strings {
+    open: "Open…",
+    compress: "Compress…",
+    extract_all: "Extract all",
+    extract_selected: "Extract selection",
+    test: "Test",
+    filter_hint: "filter by name",
+    format: "Format:",
+    compressor: "Compressor:",
+    level: "Level:",
+    into_subfolder: "Extract into a subfolder",
+    check_all: "Check all",
+    uncheck_all: "Uncheck all",
+    col_size: "Size",
+    col_packed: "Packed",
+    col_method: "Method",
+    col_saved: "Saved",
+    col_name: "Name",
+    sort_hint: "Sort by this column",
+    drop_here: "Drop a .zip, .tar or .tar.gz here",
+    language: "Language:",
+    theme: "Theme:",
+    theme_system: "System",
+    theme_light: "Light",
+    theme_dark: "Dark",
+    level_none: "None",
+    level_fast: "Fast",
+    level_normal: "Normal",
+    level_best: "Maximum",
+    codec_store: "Stored",
+    codec_deflate: "Deflate",
+    codec_zstd: "Zstandard",
+    visible_of: "visible of",
+    checked: "checked",
+    files_word: "files",
+    uncompressed_word: "uncompressed",
+    in_archive: "in the archive",
+    saved_word: "saved",
+    one_entry: "entry",
+    entries_word: "entries",
+    start: "Start",
+    cancel: "Cancel",
+    close: "Close",
+    output_name: "Archive name:",
+    add_to_archive: "Add to archive",
+    extracting: "Extracting",
+    compressing: "Compressing",
+    testing: "Testing",
+    done: "Done",
+    failed: "Failed",
+    extracted_to: "Extracted {size} into {dest}",
+    created: "Created {name}: {from} to {to} ({pct} saved)",
+    verified_ok: "{n} entries verified, no errors",
+    errors_found: "{good} good, {bad} with errors",
+    unknown_format: "unrecognized archive format",
+    nothing_to_do: "nothing to do",
+};
+
+const ES: Strings = Strings {
+    open: "Abrir…",
+    compress: "Comprimir…",
+    extract_all: "Extraer todo",
+    extract_selected: "Extraer selección",
+    test: "Comprobar",
+    filter_hint: "filtrar por nombre",
+    format: "Formato:",
+    compressor: "Compresor:",
+    level: "Nivel:",
+    into_subfolder: "Extraer en una subcarpeta",
+    check_all: "Marcar todo",
+    uncheck_all: "Desmarcar todo",
+    col_size: "Tamaño",
+    col_packed: "Comprimido",
+    col_method: "Método",
+    col_saved: "Ahorro",
+    col_name: "Nombre",
+    sort_hint: "Ordenar por esta columna",
+    drop_here: "Arrastra aquí un .zip, .tar o .tar.gz",
+    language: "Idioma:",
+    theme: "Tema:",
+    theme_system: "Sistema",
+    theme_light: "Claro",
+    theme_dark: "Oscuro",
+    level_none: "Ninguno",
+    level_fast: "Rápido",
+    level_normal: "Normal",
+    level_best: "Máximo",
+    codec_store: "Sin comprimir",
+    codec_deflate: "Deflate",
+    codec_zstd: "Zstandard",
+    visible_of: "visibles de",
+    checked: "marcadas",
+    files_word: "ficheros",
+    uncompressed_word: "sin comprimir",
+    in_archive: "en el archivo",
+    saved_word: "ahorrado",
+    one_entry: "entrada",
+    entries_word: "entradas",
+    start: "Empezar",
+    cancel: "Cancelar",
+    close: "Cerrar",
+    output_name: "Nombre del archivo:",
+    add_to_archive: "Añadir al archivo",
+    extracting: "Extrayendo",
+    compressing: "Comprimiendo",
+    testing: "Comprobando",
+    done: "Hecho",
+    failed: "Ha fallado",
+    extracted_to: "Extraído {size} en {dest}",
+    created: "Creado {name}: {from} a {to} ({pct} ahorrado)",
+    verified_ok: "{n} entradas verificadas, sin errores",
+    errors_found: "{good} correctas, {bad} con errores",
+    unknown_format: "formato de archivo no reconocido",
+    nothing_to_do: "nada que hacer",
+};
+
+pub fn strings(l: Lang) -> &'static Strings {
+    match l {
+        Lang::En => &EN,
+        Lang::Es => &ES,
+    }
+}
