@@ -63,8 +63,10 @@ jobs:
         run: |
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             BIN="target/${{ matrix.target }}/release/arca.exe"
+            test -f "target/${{ matrix.target }}/release/arca-gui.exe"
           else
             BIN="target/${{ matrix.target }}/release/arca"
+            test -f "target/${{ matrix.target }}/release/arca-gui"
           fi
           "$BIN" --version
           "$BIN" --help > /dev/null
@@ -77,8 +79,10 @@ jobs:
           mkdir -p "dist/$NOMBRE"
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp "target/${{ matrix.target }}/release/arca.exe" "dist/$NOMBRE/"
+            cp "target/${{ matrix.target }}/release/arca-gui.exe" "dist/$NOMBRE/"
           else
             cp "target/${{ matrix.target }}/release/arca" "dist/$NOMBRE/"
+            cp "target/${{ matrix.target }}/release/arca-gui" "dist/$NOMBRE/"
           fi
           cp README.md LICENSE "dist/$NOMBRE/"
           cd dist

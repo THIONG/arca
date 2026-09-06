@@ -38,10 +38,10 @@ jobs:
       - name: Instalador, ida y vuelta
         run: |
           ./instalar.sh
-          test -x "$HOME/.local/bin/arca"
+          test -x "$HOME/.local/bin/arca" && test -x "$HOME/.local/bin/arca-gui"
           "$HOME/.local/bin/arca" --version
-          ./instalar.sh --quitar
-          test ! -e "$HOME/.local/bin/arca"
+          ./instalar.sh --uninstall
+          test ! -e "$HOME/.local/bin/arca" && test ! -e "$HOME/.local/bin/arca-gui"
 
   windows:
     name: Compilar en Windows
@@ -67,7 +67,7 @@ jobs:
       - name: Instalador, ida y vuelta
         run: |
           ./instalar.sh
-          test -x "$HOME/.local/bin/arca"
+          test -x "$HOME/.local/bin/arca" && test -x "$HOME/.local/bin/arca-gui"
           "$HOME/.local/bin/arca" --version
-          ./instalar.sh --quitar
-          test ! -e "$HOME/.local/bin/arca"
+          ./instalar.sh --uninstall
+          test ! -e "$HOME/.local/bin/arca" && test ! -e "$HOME/.local/bin/arca-gui"

@@ -1,93 +1,100 @@
 #!/bin/bash
-# Instala Arca para el usuario actual en Linux y macOS.
+# Installs Arca for the current user on Linux and macOS.
 #
-# Sin sudo por defecto: el binario va a ~/.local/bin, que es lo que dice la
-# especificacion de directorios de freedesktop y lo que macOS respeta igual.
-# Con --sistema se instala en /usr/local/bin, y eso si pide privilegios.
+# No sudo by default: the binaries go to ~/.local/bin, which is what the
+# freedesktop directory specification says and what macOS honours just the
+# same. With --system they go to /usr/local/bin, and that does need
+# privileges.
 #
-# Aqui no hay extension del gestor de archivos. En Windows existe porque el
-# menu contextual es una DLL COM; el equivalente en GNOME o en Finder es otra
-# implementacion distinta y todavia no esta escrita.
+# There is no file manager integration here yet. On Windows it exists because
+# the context menu is a COM DLL; the equivalent in Dolphin, Thunar, Nemo,
+# Nautilus or Finder is a different mechanism in each case.
 #
-# Uso:  ./instalar.sh              instala en ~/.local/bin
-#       ./instalar.sh --sistema    instala en /usr/local/bin
-#       ./instalar.sh --quitar     desinstala
+# Usage:  ./instalar.sh             install into ~/.local/bin
+#         ./instalar.sh --system    install into /usr/local/bin
+#         ./instalar.sh --uninstall remove it
 
 set -euo pipefail
 
-RAIZ=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PREFIJO="$HOME/.local"
-QUITAR=0
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PREFIX="$HOME/.local"
+UNINSTALL=0
 
 for arg in "$@"; do
   case "$arg" in
-    --sistema) PREFIJO="/usr/local" ;;
-    --quitar)  QUITAR=1 ;;
-    --ayuda|-h) sed -n '2,14p' "$0"; exit 0 ;;
-    *) echo "opcion desconocida: $arg" >&2; exit 1 ;;
+    --system)    PREFIX="/usr/local" ;;
+    --uninstall) UNINSTALL=1 ;;
+    --help|-h)   sed -n '2,15p' "$0"; exit 0 ;;
+    *) echo "unknown option: $arg" >&2; exit 1 ;;
   esac
 done
 
-BIN="$PREFIJO/bin/arca"
-COMPLETADO_BASH="$PREFIJO/share/bash-completion/completions/arca"
-COMPLETADO_FISH="$PREFIJO/share/fish/vendor_completions.d/arca.fish"
-COMPLETADO_ZSH="$PREFIJO/share/zsh/site-functions/_arca"
-MANUAL="$PREFIJO/share/man/man1/arca.1"
+BIN="$PREFIX/bin/arca"
+BIN_GUI="$PREFIX/bin/arca-gui"
+COMPLETION_BASH="$PREFIX/share/bash-completion/completions/arca"
+COMPLETION_FISH="$PREFIX/share/fish/vendor_completions.d/arca.fish"
+COMPLETION_ZSH="$PREFIX/share/zsh/site-functions/_arca"
+MANPAGE="$PREFIX/share/man/man1/arca.1"
 
-# Escribir en /usr/local casi siempre necesita permisos; en ~/.local nunca.
+# Writing into /usr/local almost always needs permissions; ~/.local never does.
 SUDO=""
-if [ "$PREFIJO" = "/usr/local" ] && [ ! -w "/usr/local/bin" ]; then
+if [ "$PREFIX" = "/usr/local" ] && [ ! -w "/usr/local/bin" ]; then
   SUDO="sudo"
 fi
 
-if [ "$QUITAR" -eq 1 ]; then
-  echo "==> Desinstalando Arca de $PREFIJO"
-  for f in "$BIN" "$COMPLETADO_BASH" "$COMPLETADO_FISH" "$COMPLETADO_ZSH" "$MANUAL"; do
+if [ "$UNINSTALL" -eq 1 ]; then
+  echo "==> Removing Arca from $PREFIX"
+  for f in "$BIN" "$BIN_GUI" "$COMPLETION_BASH" "$COMPLETION_FISH" "$COMPLETION_ZSH" "$MANPAGE"; do
     if [ -e "$f" ]; then
       $SUDO rm -f "$f"
-      echo "    borrado $f"
+      echo "    removed $f"
     fi
   done
   echo
-  echo "Listo. Si anadiste $PREFIJO/bin al PATH a mano, quitalo tu."
+  echo "Done. If you added $PREFIX/bin to your PATH by hand, remove it yourself."
   exit 0
 fi
 
 if ! command -v cargo > /dev/null; then
-  echo "no encuentro cargo; instala Rust desde https://rustup.rs" >&2
+  echo "cargo not found; install Rust from https://rustup.rs" >&2
   exit 1
 fi
 
-echo "==> Compilando"
-cargo build --release --manifest-path "$RAIZ/Cargo.toml"
+echo "==> Building"
+cargo build --release --manifest-path "$ROOT/Cargo.toml"
 
-ORIGEN="$RAIZ/target/release/arca"
-if [ ! -x "$ORIGEN" ]; then
-  echo "no encuentro el binario en $ORIGEN" >&2
-  exit 1
-fi
+SRC="$ROOT/target/release/arca"
+SRC_GUI="$ROOT/target/release/arca-gui"
+for f in "$SRC" "$SRC_GUI"; do
+  if [ ! -x "$f" ]; then
+    echo "binary not found at $f" >&2
+    exit 1
+  fi
+done
 
-echo "==> Instalando en $PREFIJO/bin"
-$SUDO install -d "$PREFIJO/bin"
-$SUDO install -m 755 "$ORIGEN" "$BIN"
+echo "==> Installing into $PREFIX/bin"
+$SUDO install -d "$PREFIX/bin"
+$SUDO install -m 755 "$SRC" "$BIN"
+$SUDO install -m 755 "$SRC_GUI" "$BIN_GUI"
 echo "    $BIN"
+echo "    $BIN_GUI"
 
-# clap sabe generar los completados, pero el CLI todavia no expone el
-# subcomando que los emite. Cuando lo haga, se rellenan aqui.
+# clap can generate shell completions, but the CLI does not expose the
+# subcommand that emits them yet. When it does, they get written here.
 
 echo
 "$BIN" --version
 echo
 
 case ":$PATH:" in
-  *":$PREFIJO/bin:"*)
-    echo "Listo. $PREFIJO/bin ya esta en tu PATH."
+  *":$PREFIX/bin:"*)
+    echo "Done. $PREFIX/bin is already on your PATH."
     ;;
   *)
-    echo "Listo, pero $PREFIJO/bin NO esta en tu PATH. Anadelo a tu shell:"
+    echo "Done, but $PREFIX/bin is NOT on your PATH. Add it to your shell:"
     echo
-    echo "    echo 'export PATH=\"$PREFIJO/bin:\$PATH\"' >> ~/.bashrc"
+    echo "    echo 'export PATH=\"$PREFIX/bin:\$PATH\"' >> ~/.bashrc"
     echo
-    echo "y abre una terminal nueva."
+    echo "and open a new terminal."
     ;;
 esac
