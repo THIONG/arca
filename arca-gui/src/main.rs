@@ -110,7 +110,7 @@ fn listar(archivo: &Path) -> arca_core::Result<Vec<Entry>> {
             let mut v = Vec::new();
             while let Some(e) = r.next_entry()? {
                 v.push(e.entry.clone());
-                r.saltar_datos(&e)?;
+                r.skip_data(&e)?;
             }
             Ok(v)
         }
@@ -118,7 +118,7 @@ fn listar(archivo: &Path) -> arca_core::Result<Vec<Entry>> {
 }
 
 fn ruta_destino(destino: &Path, nombre: &str, es_dir: bool) -> arca_core::Result<Option<PathBuf>> {
-    let ruta = destino.join(arca_core::nombre_seguro(nombre)?);
+    let ruta = destino.join(arca_core::safe_name(nombre)?);
     if es_dir {
         fs::create_dir_all(&ruta)?;
         return Ok(None);
@@ -165,17 +165,17 @@ fn extraer(
             while let Some(e) = r.next_entry()? {
                 avisar(i, total);
                 if !quiere.get(i).copied().unwrap_or(true) {
-                    r.saltar_datos(&e)?;
+                    r.skip_data(&e)?;
                     i += 1;
                     continue;
                 }
                 match ruta_destino(destino, &e.entry.name, e.entry.is_dir)? {
                     Some(ruta) => {
                         let mut w = BufWriter::with_capacity(BUF, File::create(&ruta)?);
-                        bytes += r.copiar_datos(&e, &mut w)?;
+                        bytes += r.copy_data(&e, &mut w)?;
                         w.flush()?;
                     }
-                    None => r.saltar_datos(&e)?,
+                    None => r.skip_data(&e)?,
                 }
                 i += 1;
             }
@@ -215,9 +215,9 @@ fn probar(archivo: &Path, avisar: &dyn Fn(usize, usize)) -> arca_core::Result<(u
             while let Some(e) = r.next_entry()? {
                 avisar(i, i + 1);
                 if e.entry.is_dir {
-                    r.saltar_datos(&e)?;
+                    r.skip_data(&e)?;
                 } else {
-                    match r.copiar_datos(&e, &mut std::io::sink()) {
+                    match r.copy_data(&e, &mut std::io::sink()) {
                         Ok(_) => bien += 1,
                         Err(err) => malas.push(format!("{}: {err}", e.entry.name)),
                     }
@@ -283,7 +283,7 @@ fn comprimir(
             let destino: Box<dyn Write> = if formato == Formato::TarGz {
                 Box::new(flate2::write::GzEncoder::new(
                     bruto,
-                    flate2::Compression::new(nivel.a_flate2()),
+                    flate2::Compression::new(nivel.to_flate2()),
                 ))
             } else {
                 Box::new(bruto)
@@ -391,7 +391,7 @@ impl Arca {
                 Columna::Nombre => x.name.to_lowercase().cmp(&y.name.to_lowercase()),
                 Columna::Tamano => x.size.cmp(&y.size),
                 Columna::Comprimido => x.compressed_size.cmp(&y.compressed_size),
-                Columna::Metodo => x.method.nombre().cmp(y.method.nombre()),
+                Columna::Metodo => x.method.name().cmp(y.method.name()),
                 Columna::Ratio => x
                     .ratio()
                     .partial_cmp(&y.ratio())
@@ -762,7 +762,7 @@ impl Arca {
                         ui.monospace(humano(e.compressed_size));
                     });
                     fila.col(|ui| {
-                        ui.label(e.method.nombre());
+                        ui.label(e.method.name());
                     });
                     fila.col(|ui| {
                         let pct = e.ratio() * 100.0;

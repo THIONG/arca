@@ -268,7 +268,7 @@ fn crear(
             let destino: Box<dyn Write> = if formato == Formato::TarGz {
                 Box::new(flate2::write::GzEncoder::new(
                     f,
-                    flate2::Compression::new(nivel.a_flate2()),
+                    flate2::Compression::new(nivel.to_flate2()),
                 ))
             } else {
                 Box::new(f)
@@ -320,7 +320,7 @@ fn listar(archivo: &Path, tiempo: bool) -> Result<()> {
                     salida,
                     "{:>12}  {:>7}  {:>5.1}%  {}",
                     e.size,
-                    e.method.nombre(),
+                    e.method.name(),
                     e.ratio() * 100.0,
                     e.name
                 )?;
@@ -340,7 +340,7 @@ fn listar(archivo: &Path, tiempo: bool) -> Result<()> {
                 writeln!(salida, "{:>12}  {:>7}  {:>5}   {}", e.entry.size, "store", "", e.entry.name)?;
                 n += 1;
                 bytes += e.entry.size;
-                r.saltar_datos(&e)?;
+                r.skip_data(&e)?;
             }
         }
     }
@@ -370,10 +370,10 @@ fn extraer(archivo: &Path, destino: &Path) -> Result<()> {
             for i in 0..total {
                 let e = a.entries()[i].clone();
                 if e.is_dir {
-                    fs::create_dir_all(destino.join(arca_core::nombre_seguro(&e.name)?))?;
+                    fs::create_dir_all(destino.join(arca_core::safe_name(&e.name)?))?;
                     continue;
                 }
-                let ruta = destino.join(arca_core::nombre_seguro(&e.name)?);
+                let ruta = destino.join(arca_core::safe_name(&e.name)?);
                 if let Some(p) = ruta.parent() {
                     fs::create_dir_all(p)?;
                 }
@@ -391,17 +391,17 @@ fn extraer(archivo: &Path, destino: &Path) -> Result<()> {
             };
             let mut r = TarReader::new(fuente);
             while let Some(e) = r.next_entry()? {
-                let ruta = destino.join(arca_core::nombre_seguro(&e.entry.name)?);
+                let ruta = destino.join(arca_core::safe_name(&e.entry.name)?);
                 if e.entry.is_dir {
                     fs::create_dir_all(&ruta)?;
-                    r.saltar_datos(&e)?;
+                    r.skip_data(&e)?;
                     continue;
                 }
                 if let Some(p) = ruta.parent() {
                     fs::create_dir_all(p)?;
                 }
                 let mut w = BufWriter::with_capacity(BUF, File::create(&ruta)?);
-                bytes += r.copiar_datos(&e, &mut w)?;
+                bytes += r.copy_data(&e, &mut w)?;
                 w.flush()?;
                 n += 1;
             }
@@ -448,7 +448,7 @@ fn probar(archivo: &Path) -> Result<()> {
             };
             let mut r = TarReader::new(fuente);
             while let Some(e) = r.next_entry()? {
-                r.saltar_datos(&e)?;
+                r.skip_data(&e)?;
                 n += 1;
             }
         }

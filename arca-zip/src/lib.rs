@@ -67,9 +67,9 @@ impl<R: Read + Seek> ZipArchive<R> {
             Error::Format("no se encontro el fin del directorio central (¿es un ZIP?)".into())
         })?;
 
-        let mut c = Cursor::en(&cola, pos_eocd)?;
-        c.saltar(4, "firma EOCD")?;
-        c.saltar(4, "numeros de disco")?;
+        let mut c = Cursor::at(&cola, pos_eocd)?;
+        c.skip(4, "firma EOCD")?;
+        c.skip(4, "numeros de disco")?;
         let _ent_disco = c.u16le("entradas en disco")?;
         let mut n_entradas = c.u16le("entradas totales")? as u64;
         let mut cd_tam = c.u32le("tamano del directorio")? as u64;
@@ -77,9 +77,9 @@ impl<R: Read + Seek> ZipArchive<R> {
 
         if n_entradas == 0xFFFF || cd_tam == 0xFFFF_FFFF || cd_off == 0xFFFF_FFFF {
             if let Some(p) = buscar_hacia_atras(&cola[..pos_eocd], SIG_LOC64) {
-                let mut l = Cursor::en(&cola, p)?;
-                l.saltar(4, "firma del localizador Zip64")?;
-                l.saltar(4, "disco del EOCD64")?;
+                let mut l = Cursor::at(&cola, p)?;
+                l.skip(4, "firma del localizador Zip64")?;
+                l.skip(4, "disco del EOCD64")?;
                 let off64 = l.u64le("desplazamiento del EOCD64")?;
                 if off64 >= total {
                     return Err(Error::Format("el localizador Zip64 apunta fuera del archivo".into()));
@@ -91,8 +91,8 @@ impl<R: Read + Seek> ZipArchive<R> {
                 if z.u32le("firma EOCD64")? != SIG_EOCD64 {
                     return Err(Error::Format("firma Zip64 invalida".into()));
                 }
-                z.saltar(20, "cabecera del EOCD64")?;
-                z.saltar(8, "entradas en disco")?;
+                z.skip(20, "cabecera del EOCD64")?;
+                z.skip(8, "entradas en disco")?;
                 n_entradas = z.u64le("entradas totales (Zip64)")?;
                 cd_tam = z.u64le("tamano del directorio (Zip64)")?;
                 cd_off = z.u64le("desplazamiento del directorio (Zip64)")?;
@@ -115,7 +115,7 @@ impl<R: Read + Seek> ZipArchive<R> {
         let mut entradas = Vec::with_capacity(n_entradas.min(4096) as usize);
         let mut c = Cursor::new(&cd);
         for i in 0..n_entradas {
-            if c.restantes() < CD_FIJO {
+            if c.remaining() < CD_FIJO {
                 break;
             }
             match leer_cabecera_central(&mut c) {
@@ -160,12 +160,12 @@ impl<R: Read + Seek> ZipArchive<R> {
                 e.name, e.offset
             )));
         }
-        c.saltar(2, "version")?;
+        c.skip(2, "version")?;
         let flags = c.u16le("flags")?;
         if flags & 1 != 0 {
             return Err(Error::Unsupported(format!("«{}» esta cifrada", e.name)));
         }
-        c.saltar(18, "resto de la cabecera local")?;
+        c.skip(18, "resto de la cabecera local")?;
         let n_len = c.u16le("longitud del nombre")? as u64;
         let x_len = c.u16le("longitud de extra")? as u64;
 
@@ -202,7 +202,7 @@ impl<R: Read + Seek> ZipArchive<R> {
         let (_, crc, escritos) = cw.finalizar();
 
         if crc != e.crc32 {
-            return Err(Error::Integrity { name: e.name.clone(), esperado: e.crc32, obtenido: crc });
+            return Err(Error::Integrity { name: e.name.clone(), expected: e.crc32, found: crc });
         }
         if escritos != e.size {
             return Err(Error::Format(format!(
@@ -259,7 +259,7 @@ fn leer_cabecera_central(c: &mut Cursor<'_>) -> Result<Entry> {
     if c.u32le("firma del directorio")? != SIG_CD {
         return Err(Error::Format("firma de entrada invalida".into()));
     }
-    c.saltar(4, "versiones")?;
+    c.skip(4, "versiones")?;
     let flags = c.u16le("flags")?;
     let metodo = c.u16le("metodo")?;
     let hora = c.u16le("hora")?;
@@ -270,7 +270,7 @@ fn leer_cabecera_central(c: &mut Cursor<'_>) -> Result<Entry> {
     let n_len = c.u16le("longitud del nombre")? as usize;
     let x_len = c.u16le("longitud de extra")? as usize;
     let k_len = c.u16le("longitud del comentario")? as usize;
-    c.saltar(4, "disco y atributos internos")?;
+    c.skip(4, "disco y atributos internos")?;
     let _ext_attr = c.u32le("atributos externos")?;
     let mut offset = c.u32le("desplazamiento local")? as u64;
 
@@ -283,30 +283,30 @@ fn leer_cabecera_central(c: &mut Cursor<'_>) -> Result<Entry> {
 
     let nombre_bytes = c.bytes(n_len, "nombre")?;
     let extra = c.bytes(x_len, "campo extra")?;
-    c.saltar(k_len, "comentario")?;
+    c.skip(k_len, "comentario")?;
 
     if sin_comp == 0xFFFF_FFFF || comp == 0xFFFF_FFFF || offset == 0xFFFF_FFFF {
         let mut x = Cursor::new(extra);
-        while x.restantes() >= 4 {
+        while x.remaining() >= 4 {
             let id = x.u16le("id de campo extra")?;
             let tam = x.u16le("tamano de campo extra")? as usize;
-            if tam > x.restantes() {
+            if tam > x.remaining() {
                 break;
             }
             if id == 0x0001 {
                 let mut z = Cursor::new(x.bytes(tam, "datos Zip64")?);
-                if sin_comp == 0xFFFF_FFFF && z.restantes() >= 8 {
+                if sin_comp == 0xFFFF_FFFF && z.remaining() >= 8 {
                     sin_comp = z.u64le("tamano sin comprimir Zip64")?;
                 }
-                if comp == 0xFFFF_FFFF && z.restantes() >= 8 {
+                if comp == 0xFFFF_FFFF && z.remaining() >= 8 {
                     comp = z.u64le("tamano comprimido Zip64")?;
                 }
-                if offset == 0xFFFF_FFFF && z.restantes() >= 8 {
+                if offset == 0xFFFF_FFFF && z.remaining() >= 8 {
                     offset = z.u64le("desplazamiento Zip64")?;
                 }
                 break;
             }
-            x.saltar(tam, "campo extra")?;
+            x.skip(tam, "campo extra")?;
         }
     }
 
@@ -335,7 +335,7 @@ fn leer_cabecera_central(c: &mut Cursor<'_>) -> Result<Entry> {
         method,
         crc32: crc,
         is_dir,
-        mtime: arca_core::dos_a_unix(fecha, hora),
+        mtime: arca_core::dos_to_unix(fecha, hora),
         offset,
     })
 }
@@ -371,11 +371,11 @@ impl<W: Write + Seek> ZipWriter<W> {
         nivel: Level,
         mtime: Option<i64>,
     ) -> Result<()> {
-        let (fecha, hora) = arca_core::unix_a_dos(mtime.unwrap_or(0));
+        let (fecha, hora) = arca_core::unix_to_dos(mtime.unwrap_or(0));
         let nombre_b = comprobar_nombre(nombre)?;
         let metodo = metodo_de(codec);
         let offset = self.pos;
-        self.escribir_lfh(&nombre_b, metodo.codigo(), fecha, hora)?;
+        self.escribir_lfh(&nombre_b, metodo.code(), fecha, hora)?;
         let extra_off = offset + LFH_FIJO as u64 + nombre_b.len() as u64;
 
         let mut hasher = crc32fast::Hasher::new();
@@ -397,7 +397,7 @@ impl<W: Write + Seek> ZipWriter<W> {
             Method::Deflate => {
                 let mut enc = DeflateEncoder::new(
                     Contador::new(&mut self.salida),
-                    Compression::new(nivel.a_flate2()),
+                    Compression::new(nivel.to_flate2()),
                 );
                 loop {
                     let n = datos.read(&mut buf)?;
@@ -413,7 +413,7 @@ impl<W: Write + Seek> ZipWriter<W> {
                 {
                     let mut enc = zstd::stream::write::Encoder::new(
                         Contador::new(&mut self.salida),
-                        nivel.a_zstd(),
+                        nivel.to_zstd(),
                     )
                     .map_err(Error::Io)?;
                     let _ = enc.multithread(hilos_disponibles());
@@ -451,10 +451,10 @@ impl<W: Write + Seek> ZipWriter<W> {
         metodo: Method,
         mtime: Option<i64>,
     ) -> Result<()> {
-        let (fecha, hora) = arca_core::unix_a_dos(mtime.unwrap_or(0));
+        let (fecha, hora) = arca_core::unix_to_dos(mtime.unwrap_or(0));
         let nombre_b = comprobar_nombre(nombre)?;
         let offset = self.pos;
-        self.escribir_lfh(&nombre_b, metodo.codigo(), fecha, hora)?;
+        self.escribir_lfh(&nombre_b, metodo.code(), fecha, hora)?;
         let extra_off = offset + LFH_FIJO as u64 + nombre_b.len() as u64;
         self.salida.write_all(comprimido)?;
         self.cerrar_entrada(
@@ -497,7 +497,7 @@ impl<W: Write + Seek> ZipWriter<W> {
             comp,
             sin_comp,
             offset,
-            metodo: metodo.codigo(),
+            metodo: metodo.code(),
             fecha,
             hora,
             dir,
@@ -666,14 +666,14 @@ pub fn comprimir_bloque(datos: &[u8], codec: Codec, nivel: Level) -> Result<(Vec
     match codec {
         Codec::Store => Ok((datos.to_vec(), Method::Store, crc)),
         Codec::Deflate => {
-            let mut e = DeflateEncoder::new(Vec::new(), Compression::new(nivel.a_flate2()));
+            let mut e = DeflateEncoder::new(Vec::new(), Compression::new(nivel.to_flate2()));
             e.write_all(datos)?;
             Ok((e.finish()?, Method::Deflate, crc))
         }
         Codec::Zstd => {
             #[cfg(feature = "codecs-native")]
             {
-                let c = zstd::bulk::compress(datos, nivel.a_zstd()).map_err(Error::Io)?;
+                let c = zstd::bulk::compress(datos, nivel.to_zstd()).map_err(Error::Io)?;
                 Ok((c, Method::Zstd, crc))
             }
             #[cfg(not(feature = "codecs-native"))]
