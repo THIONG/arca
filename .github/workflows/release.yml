@@ -1,0 +1,158 @@
+name: Release
+
+# Se dispara al empujar una etiqueta vX.Y.Z. Tambien a mano, para ensayar
+# el proceso sin publicar nada de verdad.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binarios:
+    name: ${{ matrix.nombre }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - nombre: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - nombre: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - nombre: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+          - nombre: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Un binario que no pasa las pruebas no se publica. La etiqueta puede
+      # apuntar a un commit que CI nunca vio.
+      - name: Pruebas
+        run: cargo test --workspace
+
+      - name: Compilar
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Comprobar que el binario arranca
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            BIN="target/${{ matrix.target }}/release/arca.exe"
+          else
+            BIN="target/${{ matrix.target }}/release/arca"
+          fi
+          "$BIN" --version
+          "$BIN" --help > /dev/null
+
+      - name: Empaquetar
+        shell: bash
+        run: |
+          set -eu
+          NOMBRE="arca-${{ github.ref_name }}-${{ matrix.nombre }}"
+          mkdir -p "dist/$NOMBRE"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "target/${{ matrix.target }}/release/arca.exe" "dist/$NOMBRE/"
+          else
+            cp "target/${{ matrix.target }}/release/arca" "dist/$NOMBRE/"
+          fi
+          cp README.md LICENSE "dist/$NOMBRE/"
+          cd dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            7z a -tzip "$NOMBRE.zip" "$NOMBRE" > /dev/null
+            ARCHIVO="$NOMBRE.zip"
+          else
+            tar czf "$NOMBRE.tar.gz" "$NOMBRE"
+            ARCHIVO="$NOMBRE.tar.gz"
+          fi
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$ARCHIVO" > "$ARCHIVO.sha256"
+          else
+            shasum -a 256 "$ARCHIVO" > "$ARCHIVO.sha256"
+          fi
+          cat "$ARCHIVO.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.nombre }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          retention-days: 7
+
+  publicar:
+    name: Publicar el Release
+    needs: binarios
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      # Si la etiqueta y la version del workspace no coinciden, el Release
+      # saldria mintiendo sobre lo que contiene.
+      - name: La etiqueta debe coincidir con la version del workspace
+        run: |
+          ETIQUETA="${GITHUB_REF_NAME#v}"
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "etiqueta=$ETIQUETA  Cargo.toml=$VERSION"
+          test "$ETIQUETA" = "$VERSION"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artefactos
+
+      - name: Reunir los ficheros y las sumas
+        run: |
+          mkdir -p publicar
+          find artefactos -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} publicar/ \;
+          cat artefactos/*/*.sha256 | sed 's#.*/##' > publicar/SHA256SUMS.txt
+          ls -la publicar
+          cat publicar/SHA256SUMS.txt
+
+      # Con `gh`, que ya viene en el runner y usa el token del propio flujo:
+      # una accion de terceros menos en la cadena de suministro de un proyecto
+      # que se define por no fiarse de lo que le llega.
+      - name: Publicar
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notas.md <<'FIN'
+          ## Binarios
+
+          Descomprime y coloca `arca` en el PATH. Comprueba la descarga con
+          `SHA256SUMS.txt`:
+
+          ```sh
+          sha256sum -c SHA256SUMS.txt --ignore-missing
+          ```
+
+          ## Sin firmar
+
+          Estos binarios no llevan firma de codigo. Windows mostrara un aviso de
+          SmartScreen y macOS uno de Gatekeeper; en macOS se levanta con
+          `xattr -d com.apple.quarantine arca`. Firmarlos exige un certificado de
+          pago y esta en la lista de pendientes.
+
+          La extension del menu contextual de Windows no se distribuye aqui:
+          necesita un paquete MSIX firmado. Se construye desde el repo con
+          `windows\construir.ps1`, que requiere el Modo de desarrollador.
+          FIN
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Arca $GITHUB_REF_NAME" \
+            --notes-file notas.md \
+            publicar/*
