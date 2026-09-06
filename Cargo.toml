@@ -13,9 +13,14 @@ license = "Apache-2.0"
 authors = ["Proyecto Arca"]
 
 [workspace.dependencies]
-arca-core = { version = "0.1", path = "arca-core" }
-arca-zip  = { version = "0.1", path = "arca-zip" }
-arca-tar  = { version = "0.1", path = "arca-tar" }
+# Sin `version`, solo `path`. Llevaban "0.1" y al subir el workspace a 0.2.0 se
+# quedaron atras: cargo dejo de resolver y CI se cayo en las tres plataformas.
+# Un numero que hay que sincronizar a mano es un fallo esperando a ocurrir, y
+# aqui no aporta nada porque estos crates no se publican en crates.io. Si algun
+# dia se publican, hay que devolver el `version` a los tres.
+arca-core = { path = "arca-core" }
+arca-zip  = { path = "arca-zip" }
+arca-tar  = { path = "arca-tar" }
 # DEFLATE: zlib-rs, la implementacion en Rust mas rapida medida (ver diseno S02)
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 crc32fast = "1"
