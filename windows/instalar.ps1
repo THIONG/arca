@@ -23,6 +23,79 @@ $ClsidClasico = "{B528A7F3-C889-4C98-B052-5D7F7F778E14}"
 $TiposMenu    = @("*", "Directory")
 $ClaveDesinst = "Software\Microsoft\Windows\CurrentVersion\Uninstall\Arca"
 
+# Extensiones que Arca sabe abrir. Cada una necesita su propio ProgID: Windows
+# asocia la extension al ProgID, y el ProgID a un comando.
+$Formatos = @{
+    ".zip"    = @{ ProgId = "Arca.zip";    Texto = "Archivo ZIP" }
+    ".tar"    = @{ ProgId = "Arca.tar";    Texto = "Archivo TAR" }
+    ".gz"     = @{ ProgId = "Arca.targz";  Texto = "Archivo TAR comprimido" }
+    ".tgz"    = @{ ProgId = "Arca.tgz";    Texto = "Archivo TAR comprimido" }
+}
+
+# Tres registros distintos, y hacen falta los tres:
+#   1. El ProgID, que dice con que comando se abre.
+#   2. OpenWithProgids en la extension, que es lo que llena «Abrir con».
+#   3. Capabilities + RegisteredApplications, que es lo que hace que Arca
+#      aparezca en Configuracion > Aplicaciones predeterminadas.
+function Registrar-Asociaciones($gui) {
+    foreach ($ext in $Formatos.Keys) {
+        $progid = $Formatos[$ext].ProgId
+        $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Software\Classes\$progid")
+        $k.SetValue("", $Formatos[$ext].Texto)
+        $k.Close()
+        $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Software\Classes\$progid\DefaultIcon")
+        $k.SetValue("", "$gui,0")
+        $k.Close()
+        $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Software\Classes\$progid\shell\open\command")
+        $k.SetValue("", "`"$gui`" `"%1`"")
+        $k.Close()
+
+        $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Software\Classes\$ext\OpenWithProgids")
+        $k.SetValue($progid, [byte[]]@(), [Microsoft.Win32.RegistryValueKind]::None)
+        $k.Close()
+    }
+
+    $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Software\Classes\Applications\arca-gui.exe\shell\open\command")
+    $k.SetValue("", "`"$gui`" `"%1`"")
+    $k.Close()
+    $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Software\Classes\Applications\arca-gui.exe\SupportedTypes")
+    foreach ($ext in $Formatos.Keys) { $k.SetValue($ext, "") }
+    $k.Close()
+
+    $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Software\Arca\Capabilities")
+    $k.SetValue("ApplicationName", "Arca")
+    $k.SetValue("ApplicationDescription", "Archivador rapido y seguro")
+    $k.Close()
+    $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Software\Arca\Capabilities\FileAssociations")
+    foreach ($ext in $Formatos.Keys) { $k.SetValue($ext, $Formatos[$ext].ProgId) }
+    $k.Close()
+    $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("Software\RegisteredApplications")
+    $k.SetValue("Arca", "Software\Arca\Capabilities")
+    $k.Close()
+}
+
+function Desregistrar-Asociaciones {
+    foreach ($ext in $Formatos.Keys) {
+        $progid = $Formatos[$ext].ProgId
+        [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree("Software\Classes\$progid", $false)
+        $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\Classes\$ext\OpenWithProgids", $true)
+        if ($k) { $k.DeleteValue($progid, $false); $k.Close() }
+    }
+    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree("Software\Classes\Applications\arca-gui.exe", $false)
+    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree("Software\Arca", $false)
+    $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\RegisteredApplications", $true)
+    if ($k) { $k.DeleteValue("Arca", $false); $k.Close() }
+}
+
+# Sin esto el Explorador tarda en enterarse de que las asociaciones cambiaron.
+function Refrescar-Asociaciones {
+    Add-Type -Namespace Shell -Name Aviso -MemberDefinition @'
+[DllImport("shell32.dll")]
+public static extern void SHChangeNotify(int eventId, uint flags, IntPtr a, IntPtr b);
+'@ -ErrorAction SilentlyContinue
+    try { [Shell.Aviso]::SHChangeNotify(0x08000000, 0x0000, [IntPtr]::Zero, [IntPtr]::Zero) } catch {}
+}
+
 # cargo escribe su progreso en stderr, incluso cuando todo va bien. Con
 # ErrorActionPreference = Stop, PowerShell lo convierte en excepcion en cuanto
 # alguien captura la salida del script. Lo unico que indica un fallo de verdad
@@ -97,14 +170,27 @@ if ($Quitar) {
     Desregistrar-MenuClasico
     Write-Host "    menu clasico desregistrado"
 
+    Desregistrar-Asociaciones
+    Refrescar-Asociaciones
+    Write-Host "    asociaciones de archivo borradas"
+
     [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($ClaveDesinst, $false)
     Write-Host "    entrada de «Aplicaciones instaladas» borrada"
 
+    $acceso = Join-Path ([Environment]::GetFolderPath("Programs")) "Arca.lnk"
+    if (Test-Path $acceso) {
+        Remove-Item $acceso -Force
+        Write-Host "    acceso directo del menú Inicio borrado"
+    }
+
     Quitar-DelPath $Destino
 
-    # Salir de la carpeta antes de borrarla: si es la de trabajo, Windows la
-    # mantiene bloqueada y el borrado falla.
-    Set-Location $env:TEMP
+    # Solo hay que salir de la carpeta si estamos dentro: Windows la mantiene
+    # bloqueada y el borrado fallaria. Fuera de ese caso no se toca el
+    # directorio de quien llama al script.
+    if ((Get-Location).Path.StartsWith($Destino, [StringComparison]::OrdinalIgnoreCase)) {
+        Set-Location $env:TEMP
+    }
     if (Test-Path $Destino) {
         Remove-Item $Destino -Recurse -Force -ErrorAction SilentlyContinue
         if (Test-Path $Destino) {
@@ -138,11 +224,12 @@ Ejecutar "cargo" @("build","--release","--target","x86_64-pc-windows-msvc")
 Pop-Location
 
 $Exe = "$Raiz\target\x86_64-pc-windows-msvc\release\arca.exe"
+$Gui = "$Raiz\target\x86_64-pc-windows-msvc\release\arca-gui.exe"
 $Dll = "$PSScriptRoot\arca-shell\target\x86_64-pc-windows-msvc\release\arca_shell.dll"
 
 Write-Host "==> Copiando" -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path $Destino, "$Destino\Assets" | Out-Null
-Copy-Item $Exe, $Dll $Destino -Force
+Copy-Item $Exe, $Gui, $Dll $Destino -Force
 Copy-Item "$PSScriptRoot\AppxManifest.xml" $Destino -Force
 Copy-Item "$PSScriptRoot\instalar.ps1" $Destino -Force
 Copy-Item "$Raiz\LICENSE", "$Raiz\README.md" $Destino -Force
@@ -166,8 +253,21 @@ Get-AppxPackage $Paquete -ErrorAction SilentlyContinue | Remove-AppxPackage
 Add-AppxPackage -Register "$Destino\AppxManifest.xml" -ExternalLocation $Destino
 Registrar-MenuClasico "$Destino\arca_shell.dll"
 
+Write-Host "==> Asociando los formatos comprimidos" -ForegroundColor Cyan
+Registrar-Asociaciones "$Destino\arca-gui.exe"
+Refrescar-Asociaciones
+
 Write-Host "==> PATH" -ForegroundColor Cyan
 Anadir-AlPath $Destino
+
+Write-Host "==> Acceso directo en el menú Inicio" -ForegroundColor Cyan
+$MenuInicio = [Environment]::GetFolderPath("Programs")
+$acceso = (New-Object -ComObject WScript.Shell).CreateShortcut("$MenuInicio\Arca.lnk")
+$acceso.TargetPath = "$Destino\arca-gui.exe"
+$acceso.WorkingDirectory = $Destino
+$acceso.IconLocation = "$Destino\arca-gui.exe,0"
+$acceso.Description = "Archivador rápido y seguro"
+$acceso.Save()
 
 Write-Host "==> Entrada en «Aplicaciones instaladas»" -ForegroundColor Cyan
 $tam = [math]::Round((Get-ChildItem $Destino -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1KB)
