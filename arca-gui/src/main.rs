@@ -2988,6 +2988,7 @@ impl Arca {
         // Paired with the index they came from. `body.rows` only builds the
         // ones on screen, so after any scrolling these do not start at nought.
         let mut row_rects: Vec<(usize, egui::Rect)> = Vec::with_capacity(visible.len());
+        let pressing = ui.input(|i| i.pointer.any_down());
         let mut icons = std::mem::take(&mut self.icons);
         let order = self.order;
         let hint = s.sort_hint;
@@ -3076,6 +3077,16 @@ impl Arca {
                     // row the keyboard was on said nothing about what the
                     // buttons were going to act on.
                     row.set_selected(self.is_checked(r));
+                    // The table works out which row the pointer is over, keeps
+                    // it, and tints it on the next frame. One frame late is
+                    // fine while the pointer is only passing over rows, and is
+                    // a flicker trailing behind it once a button is held down
+                    // and the pointer is moving with intent: rows light up as
+                    // if picked, a step behind, and go out again. Nothing in
+                    // the Explorer lights up under a held button either.
+                    if pressing {
+                        row.set_hovered(false);
+                    }
                     let cut = self.cut_names.contains(&r.path) || r.entry.is_some_and(|i| self.cut_names.contains(&self.entries[i].name));
                     let mut flag = self.is_checked(r);
                     row.col(|ui| {
