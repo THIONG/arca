@@ -51,10 +51,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - run: cargo test --workspace
+      # Sin continue-on-error: la release ya lo compila sin red desde la v0.3.0,
+      # asi que dejarlo pasar de largo solo servia para ocultar una rotura hasta
+      # el momento de publicar. Va fuera del workspace, de ahi el directorio.
       - name: Extensión de shell
         working-directory: windows/arca-shell
-        run: cargo build --release
-        continue-on-error: true
+        run: |
+          cargo build --release
+          cargo clippy --release --all-targets -- -D warnings
 
   macos:
     name: Compilar en macOS

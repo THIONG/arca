@@ -2,26 +2,27 @@
 name = "arca-shell"
 version = "0.1.0"
 edition = "2021"
-description = "Extensión del menú contextual del Explorador de Windows para Arca"
+description = "Windows Explorer context menu extension for Arca"
 license = "Apache-2.0"
 
 [lib]
-# La DLL que carga el Explorador.
+# The DLL Explorer loads.
 crate-type = ["cdylib"]
 
 [dependencies]
-# Pinado a propósito: la API de `#[implement]` y las firmas de los traits
-# cambian entre versiones menores de este crate. Si subes la versión, revisa
-# las firmas de IExplorerCommand_Impl antes de nada.
+# Pinned on purpose: the `#[implement]` API and the trait signatures change
+# between minor versions of this crate. Before raising the version, check the
+# IExplorerCommand_Impl signatures first.
 windows = { version = "0.58", features = [
-    # Sin esto, los traits IExplorerCommand_Impl y compania no existen: viven en
-    # un impl.rs que el crate incluye tras #[cfg(feature = "implement")]. Es lo
-    # que hace falta para implementar interfaces COM, no solo para llamarlas.
+    # Without this the IExplorerCommand_Impl traits and friends do not exist:
+    # they live in an impl.rs the crate includes behind
+    # #[cfg(feature = "implement")]. It is what implementing a COM interface
+    # needs, as opposed to only calling one.
     "implement",
     "Win32_Foundation",
-    # IContextMenu (el menu clasico) arrastra STGMEDIUM, que a su vez pide
-    # Gdi y StructuredStorage por su union, mas Ole por CF_HDROP y
-    # ReleaseStgMedium, y Registry por la firma de IShellExtInit::Initialize.
+    # IContextMenu, the classic menu, drags in STGMEDIUM, which in turn asks for
+    # Gdi and StructuredStorage because of its union, plus Ole for CF_HDROP and
+    # ReleaseStgMedium, and Registry for the IShellExtInit::Initialize signature.
     "Win32_Graphics_Gdi",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Ole",

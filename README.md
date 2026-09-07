@@ -1,109 +1,112 @@
 # Arca
 
-Archivador multiplataforma en Rust. **Fases F01 y parte de F03**: núcleo, ZIP y TAR,
-Zstandard, compresión multihilo y línea de comandos.
+Cross-platform archiver in Rust. **Phase F01 and part of F03**: core, ZIP and TAR,
+Zstandard, multi-threaded compression and a command line.
 
-Los parsers de contenedor están escritos en safe Rust con `#![forbid(unsafe_code)]`
-a nivel de crate. Un archivo malformado produce un error, nunca corrupción de memoria.
+The container parsers are written in safe Rust with `#![forbid(unsafe_code)]` at
+crate level. A malformed archive produces an error, never memory corruption.
 
-## Construir
-
-```sh
-cargo build --release      # binario en target/release/arca
-cargo test --workspace     # 45 pruebas
-bash interop.sh            # criterio de aceptación de la fase
-```
-
-Dos perfiles, como fija la sección 03 del diseño:
+## Build
 
 ```sh
-cargo build --release                              # codecs-native: incluye libzstd (C)
-cargo build --release --no-default-features        # Rust puro: compila a cualquier objetivo
+cargo build --release      # binary at target/release/arca
+cargo test --workspace     # 45 tests
+bash interop.sh            # the phase acceptance criterion
 ```
 
-## Uso
+Two profiles, as section 03 of the design lays down:
 
 ```sh
-arca create copia.zip mis-ficheros/ -l normal   # store | fast | normal | best
-arca create copia.zip mis-ficheros/ -c zstd    # auto | store | deflate | zstd
-arca create copia.zip mis-ficheros/ -j 8       # hilos; 0 = todos los núcleos
-arca create copia.tar.gz mis-ficheros/
-arca create copia.zip mis-ficheros/ -p clave     # cifra con AES-256
-arca list copia.zip --time
-arca extract copia.zip -o destino/
-arca extract copia.zip -o destino/ -p clave     # archivo cifrado
-arca extract copia.zip -o destino/ -j 8        # hilos; 0 = todos los núcleos
-arca password copia.zip -p clave                 # le quita la contraseña
-arca password copia.zip --new clave              # se la pone
-arca password copia.zip -p vieja --new nueva     # se la cambia
-arca test copia.zip                              # verifica CRC sin escribir en disco
-arca bench copia.zip                             # mide los requisitos R1 y R2
+cargo build --release                              # codecs-native: includes libzstd (C)
+cargo build --release --no-default-features        # pure Rust: builds for any target
 ```
 
-Aliases cortos: `c`, `l`, `x`, `t`.
+## Use
 
-## Estructura
+```sh
+arca create copy.zip my-files/ -l normal        # store | fast | normal | best
+arca create copy.zip my-files/ -c zstd          # auto | store | deflate | zstd
+arca create copy.zip my-files/ -j 8             # threads; 0 = every core
+arca create copy.tar.gz my-files/
+arca create copy.zip my-files/ -p secret        # encrypts with AES-256
+arca list copy.zip --time
+arca extract copy.zip -o where/
+arca extract copy.zip -o where/ -p secret       # encrypted archive
+arca extract copy.zip -o where/ -j 8            # threads; 0 = every core
+arca password copy.zip -p secret                # takes the password off
+arca password copy.zip --new secret             # puts one on
+arca password copy.zip -p old --new new         # changes it
+arca test copy.zip                              # checks the CRC without writing to disk
+arca bench copy.zip                             # measures requirements R1 and R2
+```
 
-| Crate | Qué hace | `unsafe` |
+Short aliases: `c`, `l`, `x`, `t`.
+
+## Layout
+
+| Crate | What it does | `unsafe` |
 |---|---|---|
-| `arca-core` | Errores, límites, lectura acotada de cabeceras, fechas MS-DOS, defensa Zip Slip | prohibido |
-| `arca-zip` | ZIP con Zip64; store, deflate sobre zlib-rs y Zstandard | prohibido |
-| `arca-tar` | TAR ustar con verificación de checksum | prohibido |
-| `arca-cli` | Binario `arca` | permitido, sin usar |
+| `arca-core` | Errors, limits, bounded header reads, MS-DOS dates, Zip Slip defence | forbidden |
+| `arca-zip` | ZIP with Zip64; store, deflate over zlib-rs, Zstandard, AES-256 | forbidden |
+| `arca-tar` | ustar TAR with checksum verification | forbidden |
+| `arca-cli` | The `arca` binary | allowed, unused |
+| `arca-gui` | The `arca-gui` window | forbidden |
+| `windows/arca-shell` | Explorer context menu. Outside the workspace so `cargo build` still works on Linux and macOS | required: COM |
 
-## Medido en esta máquina
+## Measured
 
-Xeon 2,80 GHz, 2 núcleos, Linux.
+The first set is from a Xeon at 2.80 GHz, 2 cores, Linux.
 
-| Requisito | Objetivo | Medido | |
+| Requirement | Target | Measured | |
 |---|---|---|---|
-| R1 arranque en frío | < 15 ms | **1,6 ms** | unzip 2,0 · 7z 3,7 |
-| R2 listar 6000 entradas | < 200 ms | **4,5 ms** | unzip 17,2 · 7z 45,4 |
-| R3 escalado a 2 hilos | ≥ 1,6× | **1,89×** | 94 % de eficiencia |
+| R1 cold start | < 15 ms | **1.6 ms** | unzip 2.0 · 7z 3.7 |
+| R2 list 6000 entries | < 200 ms | **4.5 ms** | unzip 17.2 · 7z 45.4 |
+| R3 scaling to 2 threads | ≥ 1.6× | **1.89×** | 94 % efficiency |
 
-Comprimir 81 MB en 120 ficheros distintos, 2 hilos:
+Compressing 81 MB across 120 separate files, 2 threads:
 
-| | Tiempo | Tamaño |
+| | Time | Size |
 |---|---|---|
-| **Arca, zstd** | **330 ms** | **26,16 MB** |
-| Arca, deflate | 941 ms | 28,35 MB |
-| `zip -6` | 3934 ms | 27,65 MB |
-| 7-Zip zip, 2 hilos | 5358 ms | 26,88 MB |
+| **Arca, zstd** | **330 ms** | **26.16 MB** |
+| Arca, deflate | 941 ms | 28.35 MB |
+| `zip -6` | 3934 ms | 27.65 MB |
+| 7-Zip zip, 2 threads | 5358 ms | 26.88 MB |
 
-Con Zstandard, Arca es 11,9× más rápido que `zip` y 16,2× más rápido que 7-Zip,
-y además produce el archivo más pequeño de los cuatro. Con deflate es 4,2× más
-rápido que `zip` a cambio de un 2,5 % de tamaño: el compromiso conocido de zlib-rs.
+With Zstandard, Arca is 11.9× faster than `zip` and 16.2× faster than 7-Zip on
+that machine, and produces the smallest archive of the four. With deflate it is
+4.2× faster than `zip` at the cost of 2.5 % in size: the known zlib-rs trade.
 
-Esos números son de otra máquina y no se deben leer como una ventaja general.
-Medido en Windows 11 con 16 hilos, deflate contra deflate, mejor de 3:
+Those numbers come from a different machine and should not be read as a general
+advantage. Measured on Windows 11 with 16 threads, deflate against deflate, best
+of 3:
 
-| Corpus | Arca | 7-Zip `-mx5` | Tamaño Arca | Tamaño 7-Zip |
+| Corpus | Arca | 7-Zip `-mx5` | Arca size | 7-Zip size |
 |---|---|---|---|---|
-| 5358 ficheros de código, 54,8 MB | 0,710 s | **0,627 s** | 13 729 308 | 13 747 705 |
-| 16 ficheros, 287 MB | **0,402 s** | 2,285 s | 56 757 284 | 54 753 868 |
+| 5358 source files, 54.8 MB | 0.710 s | **0.627 s** | 13,729,308 | 13,747,705 |
+| 16 files, 287 MB | **0.402 s** | 2.285 s | 56,757,284 | 54,753,868 |
 
 ```
 arca create c1.zip src
 7z a -tzip -mx5 c2.zip src
 ```
 
-Es decir: con ficheros grandes Arca comprime 5,7× más rápido a cambio de un 3,7 %
-de tamaño, y con muchos ficheros pequeños 7-Zip va algo por delante con el mismo
-tamaño. No hay un ganador único, depende del corpus.
+So: with large files Arca compresses 5.7× faster at the cost of 3.7 % in size,
+and with many small files 7-Zip is somewhat ahead at the same size. There is no
+single winner; it depends on the corpus.
 
-### Extracción en paralelo
+### Parallel extraction
 
-Un `.zip` es de acceso aleatorio: el directorio central dice dónde empieza cada
-entrada, así que un hilo por núcleo puede abrir el archivo y descomprimir una
-entrada distinta. Un `.tar` es un flujo único y ahí no hay nada que repartir.
+A `.zip` is random access: the central directory says where every entry starts,
+so one thread per core can each open the file and decompress a different entry.
+A `.tar` is a single stream and there is nothing to split.
 
-Medido en Windows 11, 16 hilos, sobre 287 MB en 16 ficheros de texto:
+Measured on Windows 11, 16 threads, over 287 MB in 16 text files:
 
-| | Tiempo |
+| | Time |
 |---|---|
-| **Arca, 16 hilos** | **0,207 s** |
-| Arca, `-j 1` | 0,686 s |
-| 7-Zip | 1,020 s |
+| **Arca, 16 threads** | **0.207 s** |
+| Arca, `-j 1` | 0.686 s |
+| 7-Zip | 1.020 s |
 
 ```
 arca create big.zip big
@@ -111,96 +114,96 @@ arca extract big.zip -o out -j 1
 arca extract big.zip -o out
 7z x -o"out" big7z.zip
 ```
-Mejor de 3, borrando `out` antes de cada pasada.
+Best of 3, deleting `out` before each pass.
 
-Sobre muchos ficheros pequeños el reparto no cambia nada, y conviene decir por
-qué: extraer 5358 ficheros de código fuente tarda 4,5 s, pero descomprimir esos
-mismos 55 MB tarda 0,128 s (`arca test bench.zip`). El 97 % del tiempo se va en
-crear ficheros en NTFS, no en descomprimir. 7-Zip tarda lo mismo (4,6 s) porque
-choca contra el mismo muro.
+Over many small files the split changes nothing, and it is worth saying why:
+extracting 5358 source files takes 4.5 s, but decompressing those same 55 MB
+takes 0.128 s (`arca test bench.zip`). 97 % of the time goes into creating files
+on NTFS, not into decompressing. 7-Zip takes the same 4.6 s because it hits the
+same wall.
 
-**Aviso sobre Zstandard en ZIP:** es el método 93, registrado en la especificación
-pero que `unzip` clásico todavía no lee. Por eso `-c auto` usa deflate en `.zip`:
-un zip existe para que lo abra cualquiera. Zstandard se pide a mano, y será el
-valor por defecto cuando exista formato propio.
+**A note on Zstandard in ZIP:** it is method 93, registered in the specification
+but not yet read by classic `unzip`. That is why `-c auto` uses deflate in a
+`.zip`: a zip exists so that anything can open it. Zstandard is asked for by
+hand, and will be the default once there is a native format.
 
-## Cifrado
+## Encryption
 
-AES-256 en `.zip`, con el esquema WinZip AE-2: PBKDF2-HMAC-SHA1 de 1000 rondas
-para derivar la clave, AES-256 en modo CTR, y un HMAC-SHA1 que autentica el
-texto cifrado. Es lo mismo que escriben 7-Zip, WinRAR y NanaZip, y `interop.sh`
-lo comprueba en las dos direcciones contra 7-Zip.
+AES-256 in `.zip`, using the WinZip AE-2 scheme: PBKDF2-HMAC-SHA1 over 1000
+rounds to derive the key, AES-256 in CTR mode, and an HMAC-SHA1 authenticating
+the ciphertext. It is the same thing 7-Zip, WinRAR and NanaZip write, and
+`interop.sh` checks it in both directions against 7-Zip.
 
-Cada entrada lleva su propia sal aleatoria de 16 bytes. Reutilizar una sal entre
-entradas reutilizaría el flujo de clave, y dos ficheros iguales se verían iguales
-en el archivo.
+Every entry carries its own random 16-byte salt. Reusing a salt across entries
+would reuse the keystream, and two identical files would look identical inside
+the archive.
 
-Se cifra después de comprimir, que es el orden que manda la especificación: al
-revés el compresor no encontraría nada que comprimir. El CRC se guarda a cero, lo
-que dice AE-2: es una suma del contenido en claro y no tiene por qué estar ahí
-cuando el HMAC ya responde por los datos.
+Encryption happens after compression, which is the order the specification calls
+for: the other way round the compressor would find nothing to compress. The CRC
+is stored as zero, which is what AE-2 says: it is a checksum of the plaintext and
+has no business being there once the HMAC speaks for the data.
 
-Un byte alterado no sale como contenido, falla el código de autenticación. El
-descifrado va en flujo, así que ese veredicto llega cuando los bytes ya están
-escritos: quien llama debe tirar lo que escribió si la extracción falla.
+An altered byte does not come out as content, it fails the authentication code.
+Decryption is streaming, so that verdict arrives once the bytes are already
+written: the caller has to throw away what it wrote if extraction fails.
 
-Lo que **no** hace: ZipCrypto, el esquema antiguo de contraseña, que está roto y
-no se lee ni se escribe. Los nombres de los ficheros no se cifran, porque el
-formato ZIP no lo permite: se ve la lista del contenido sin la contraseña.
-
-```sh
-arca create secreto.zip carpeta/ -p "una clave"
-arca extract secreto.zip -o destino/ -p "una clave"
-7z t -p"una clave" secreto.zip        # lo lee 7-Zip
-```
-
-En la interfaz gráfica hay un campo de contraseña al crear, y al abrir un archivo
-cifrado la ventana la pide antes de extraer.
-
-### Cambiar la contraseña de un archivo que ya existe
+What it does **not** do: ZipCrypto, the old password scheme, which is broken and
+is neither read nor written. File names are not encrypted, because the ZIP format
+does not allow it: the listing is visible without the password.
 
 ```sh
-arca password secreto.zip -p "una clave"                   # se la quita
-arca password normal.zip --new "una clave"                 # se la pone
-arca password secreto.zip -p "vieja" --new "nueva"         # se la cambia
-arca password secreto.zip -p "una clave" -o limpio.zip     # sin tocar el original
+arca create secret.zip folder/ -p "a password"
+arca extract secret.zip -o where/ -p "a password"
+7z t -p"a password" secret.zip        # 7-Zip reads it
 ```
 
-No se vuelve a comprimir nada. AES cifra los bytes ya comprimidos, así que
-quitarle el cifrado devuelve exactamente el mismo flujo deflate que había: sale
-tal cual, y el tamaño comprimido no cambia. Lo que sí cuesta es el CRC, porque
-una entrada AE-2 lo guarda a cero y hay que descomprimirla una vez para
-calcularlo antes de poder escribirla sin cifrar.
+The window has a password field when creating, and asks for the password before
+extracting when the archive it opens is encrypted.
 
-Reemplazar en el sitio destruye la única copia de los datos, así que el archivo
-nuevo se construye al lado, se lee entero para comprobar que está bien, y solo
-entonces se mueve encima. Si algo falla, el original se queda como estaba y no
-queda ningún temporal.
+### Changing the password of an existing archive
 
-En la interfaz gráfica es un botón en la barra: **Quitar contraseña** si el
-archivo abierto está cifrado, **Poner contraseña…** si no lo está.
+```sh
+arca password secret.zip -p "a password"                 # takes it off
+arca password plain.zip --new "a password"               # puts one on
+arca password secret.zip -p "old" --new "new"            # changes it
+arca password secret.zip -p "a password" -o clean.zip    # leaving the original alone
+```
 
-## Interoperabilidad
+Nothing is compressed again. AES encrypts the already compressed bytes, so
+removing the encryption gives back exactly the deflate stream that was there: it
+goes straight through and the compressed size does not change. What it does cost
+is the CRC, because an AE-2 entry stores zero there and the entry has to be
+decompressed once to work it out before it can be written unencrypted.
 
-`interop.sh` comprueba 34 casos verificando el SHA-256 del contenido:
+Replacing in place destroys the only copy of the data, so the new archive is
+built alongside the old one, read back in full to check it is sound, and only
+then moved over it. If anything fails the original is left as it was, and no
+temporary file is left behind.
 
-- Lo que escribe Arca lo leen `unzip`, `tar` y 7-Zip, en los cuatro niveles
-- Lo que escriben `zip`, `tar` y 7-Zip lo lee Arca sin perder un byte
-- Un archivo cifrado con AES-256 por Arca lo abre 7-Zip, y al revés
-- Poner y quitar la contraseña de un archivo ya hecho, propio o de 7-Zip
-- Un byte alterado se detecta por CRC, o por el HMAC si está cifrado
-- Una entrada con `../../` se rechaza en vez de escribir fuera del destino
+In the window it is a button on the toolbar: **Remove password** when the open
+archive is encrypted, **Set password…** when it is not.
+
+## Interoperability
+
+`interop.sh` checks 34 cases, verifying the SHA-256 of the contents:
+
+- What Arca writes is read by `unzip`, `tar` and 7-Zip, at all four levels
+- What `zip`, `tar` and 7-Zip write is read by Arca without losing a byte
+- An archive Arca encrypted with AES-256 opens in 7-Zip, and the other way round
+- Adding and removing the password of an existing archive, Arca's own or 7-Zip's
+- An altered byte is caught by the CRC, or by the HMAC when encrypted
+- An entry with `../../` is rejected instead of writing outside the destination
 
 ## Windows
 
-`windows/` contiene la extensión del menú contextual del Explorador: el menú
-moderno de Windows 11 (`IExplorerCommand` + paquete MSIX disperso) y el clásico
-(`IContextMenu` + registro). Compilada, instalada y verificada en Windows 11.
-El instalador se genera con Inno Setup desde `windows/arca.iss`. Ver
-`windows/LEEME.md`.
+`windows/` holds the Explorer context menu extension: the modern Windows 11 menu
+(`IExplorerCommand` plus a sparse MSIX package) and the classic one
+(`IContextMenu` plus registry keys). Built, installed and verified on Windows 11.
+The installer is produced with Inno Setup from `windows/arca.iss`. See
+`windows/README.md`.
 
-## Todavía no
+## Not yet
 
-Formato 7z, xz/LZMA2, enlaces simbólicos, nombres largos de GNU tar,
-archivo sólido (comprimir todos los ficheros como un flujo, que es de donde sale
-la mayor ganancia de ratio) e integración de escritorio.
+7z format, xz/LZMA2, symbolic links, GNU tar long names, solid archives
+(compressing every file as one stream, which is where the largest ratio gain
+comes from) and desktop integration on Linux and macOS.

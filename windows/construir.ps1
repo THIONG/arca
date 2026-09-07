@@ -21,7 +21,7 @@ $Paquete = "Arca.Archivador"
 # para no necesitar permisos de administrador.
 #
 # Este CLSID es el del manejador clásico y debe coincidir con
-# CLSID_ARCA_CLASICO en src/lib.rs. Es distinto del de IExplorerCommand a
+# CLSID_ARCA_CLASSIC en src/lib.rs. Es distinto del de IExplorerCommand a
 # propósito: son dos objetos con interfaces distintas.
 $ClsidClasico = "{B528A7F3-C889-4C98-B052-5D7F7F778E14}"
 $TiposMenu    = @("*", "Directory")
