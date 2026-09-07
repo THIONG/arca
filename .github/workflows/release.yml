@@ -1,7 +1,7 @@
 name: Release
 
-# Se dispara al empujar una etiqueta vX.Y.Z. Tambien a mano, para ensayar
-# el proceso sin publicar nada de verdad.
+# Fires on pushing a vX.Y.Z tag. Also by hand, to rehearse the process without
+# publishing anything for real.
 on:
   push:
     tags: ["v*"]
@@ -14,34 +14,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  binarios:
-    name: ${{ matrix.nombre }}
+  binaries:
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - nombre: linux-x86_64
+          - name: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            nativo: true
-          - nombre: windows-x86_64
+            native: true
+          - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            nativo: true
-          # El binario Intel se compila cruzado desde el runner ARM. Con
-          # `macos-13`, el ultimo Intel que queda, un trabajo se pasaba 40
-          # minutos esperando runner: GitHub lo esta retirando y hay cola.
-          # El precio es que aqui no se puede comprobar que arranque, porque
-          # el runner ARM no ejecuta un binario x86_64.
-          - nombre: macos-x86_64
+            native: true
+          # The Intel binary is cross-compiled from the ARM runner. With
+          # `macos-13`, the last Intel one left, a job spent 40 minutes waiting
+          # for a runner: GitHub is retiring them and there is a queue. The
+          # price is that its startup cannot be checked here, because an ARM
+          # runner will not execute an x86_64 binary.
+          - name: macos-x86_64
             os: macos-latest
             target: x86_64-apple-darwin
-            nativo: false
-          - nombre: macos-arm64
+            native: false
+          - name: macos-arm64
             os: macos-latest
             target: aarch64-apple-darwin
-            nativo: true
+            native: true
     steps:
       - uses: actions/checkout@v4
 
@@ -49,16 +49,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Un binario que no pasa las pruebas no se publica. La etiqueta puede
-      # apuntar a un commit que CI nunca vio.
-      - name: Pruebas
+      # A binary that does not pass the tests does not get published. The tag
+      # can point at a commit CI never saw.
+      - name: Tests
         run: cargo test --workspace
 
-      - name: Compilar
+      - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Comprobar que el binario arranca
-        if: matrix.nativo
+      - name: Check the binary starts
+        if: matrix.native
         shell: bash
         run: |
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
@@ -71,38 +71,38 @@ jobs:
           "$BIN" --version
           "$BIN" --help > /dev/null
 
-      - name: Empaquetar
+      - name: Package
         shell: bash
         run: |
           set -eu
-          NOMBRE="arca-${{ github.ref_name }}-${{ matrix.nombre }}"
-          mkdir -p "dist/$NOMBRE"
+          NAME="arca-${{ github.ref_name }}-${{ matrix.name }}"
+          mkdir -p "dist/$NAME"
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp "target/${{ matrix.target }}/release/arca.exe" "dist/$NOMBRE/"
-            cp "target/${{ matrix.target }}/release/arca-gui.exe" "dist/$NOMBRE/"
+            cp "target/${{ matrix.target }}/release/arca.exe" "dist/$NAME/"
+            cp "target/${{ matrix.target }}/release/arca-gui.exe" "dist/$NAME/"
           else
-            cp "target/${{ matrix.target }}/release/arca" "dist/$NOMBRE/"
-            cp "target/${{ matrix.target }}/release/arca-gui" "dist/$NOMBRE/"
+            cp "target/${{ matrix.target }}/release/arca" "dist/$NAME/"
+            cp "target/${{ matrix.target }}/release/arca-gui" "dist/$NAME/"
           fi
-          cp README.md LICENSE "dist/$NOMBRE/"
+          cp README.md LICENSE "dist/$NAME/"
           cd dist
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            7z a -tzip "$NOMBRE.zip" "$NOMBRE" > /dev/null
-            ARCHIVO="$NOMBRE.zip"
+            7z a -tzip "$NAME.zip" "$NAME" > /dev/null
+            FILE="$NAME.zip"
           else
-            tar czf "$NOMBRE.tar.gz" "$NOMBRE"
-            ARCHIVO="$NOMBRE.tar.gz"
+            tar czf "$NAME.tar.gz" "$NAME"
+            FILE="$NAME.tar.gz"
           fi
           if command -v sha256sum > /dev/null; then
-            sha256sum "$ARCHIVO" > "$ARCHIVO.sha256"
+            sha256sum "$FILE" > "$FILE.sha256"
           else
-            shasum -a 256 "$ARCHIVO" > "$ARCHIVO.sha256"
+            shasum -a 256 "$FILE" > "$FILE.sha256"
           fi
-          cat "$ARCHIVO.sha256"
+          cat "$FILE.sha256"
 
       # Only on Windows: a real setup.exe, with its uninstaller in Installed
       # apps. The zip above is just loose binaries and installs no menus.
-      - name: Instalador de Windows
+      - name: Windows installer
         if: matrix.os == 'windows-latest'
         shell: bash
         run: |
@@ -128,12 +128,12 @@ jobs:
             "//DShellDir=arca-shell\\target\\${{ matrix.target }}\\release" \
             windows/arca.iss
           ls -la dist
-          ARCHIVO=$(ls dist/arca-setup-*.exe)
-          sha256sum "$ARCHIVO" | sed 's#dist/##' >> "dist/$(basename "$ARCHIVO").sha256"
+          FILE=$(ls dist/arca-setup-*.exe)
+          sha256sum "$FILE" | sed 's#dist/##' >> "dist/$(basename "$FILE").sha256"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.nombre }}
+          name: ${{ matrix.name }}
           path: |
             dist/*.tar.gz
             dist/*.zip
@@ -141,46 +141,46 @@ jobs:
             dist/*.sha256
           retention-days: 7
 
-  publicar:
-    name: Publicar el Release
-    needs: binarios
+  publish:
+    name: Publish the Release
+    needs: binaries
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
 
-      # Si la etiqueta y la version del workspace no coinciden, el Release
-      # saldria mintiendo sobre lo que contiene.
-      - name: La etiqueta debe coincidir con la version del workspace
+      # If the tag and the workspace version disagree, the Release would go out
+      # lying about what it contains.
+      - name: The tag must match the workspace version
         run: |
-          ETIQUETA="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME#v}"
           VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          echo "etiqueta=$ETIQUETA  Cargo.toml=$VERSION"
-          test "$ETIQUETA" = "$VERSION"
+          echo "tag=$TAG  Cargo.toml=$VERSION"
+          test "$TAG" = "$VERSION"
 
       - uses: actions/download-artifact@v4
         with:
-          path: artefactos
+          path: artifacts
 
-      - name: Reunir los ficheros y las sumas
+      - name: Gather the files and the checksums
         run: |
-          mkdir -p publicar
-          find artefactos -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' \) -exec cp {} publicar/ \;
-          cat artefactos/*/*.sha256 | sed 's#.*/##' > publicar/SHA256SUMS.txt
-          ls -la publicar
-          cat publicar/SHA256SUMS.txt
+          mkdir -p publish
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' \) -exec cp {} publish/ \;
+          cat artifacts/*/*.sha256 | sed 's#.*/##' > publish/SHA256SUMS.txt
+          ls -la publish
+          cat publish/SHA256SUMS.txt
 
-      # Con `gh`, que ya viene en el runner y usa el token del propio flujo:
-      # una accion de terceros menos en la cadena de suministro de un proyecto
-      # que se define por no fiarse de lo que le llega.
-      - name: Publicar
+      # With `gh`, which already ships on the runner and uses the workflow's own
+      # token: one third-party action fewer in the supply chain of a project
+      # that defines itself by not trusting what reaches it.
+      - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cat > notas.md <<'FIN'
-          ## Binarios
+          cat > notes.md <<'END'
+          ## Binaries
 
-          Descomprime y coloca `arca` en el PATH. Comprueba la descarga con
+          Unpack and put `arca` on your PATH. Check the download against
           `SHA256SUMS.txt`:
 
           ```sh
@@ -204,8 +204,8 @@ jobs:
           The modern Windows 11 menu also needs Developer Mode, because it is
           registered as an unsigned sparse MSIX package. Without it the classic
           menu, under "Show more options", still works.
-          FIN
+          END
           gh release create "$GITHUB_REF_NAME" \
             --title "Arca $GITHUB_REF_NAME" \
-            --notes-file notas.md \
-            publicar/*
+            --notes-file notes.md \
+            publish/*

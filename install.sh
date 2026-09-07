@@ -10,9 +10,9 @@
 # the context menu is a COM DLL; the equivalent in Dolphin, Thunar, Nemo,
 # Nautilus or Finder is a different mechanism in each case.
 #
-# Usage:  ./instalar.sh             install into ~/.local/bin
-#         ./instalar.sh --system    install into /usr/local/bin
-#         ./instalar.sh --uninstall remove it
+# Usage:  ./install.sh             install into ~/.local/bin
+#         ./install.sh --system    install into /usr/local/bin
+#         ./install.sh --uninstall remove it
 
 set -euo pipefail
 

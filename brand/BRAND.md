@@ -32,4 +32,4 @@ con una sola tinta.
 ## Pendiente
 
 Convertir `arca-isotipo.svg` a `.ico` con 16, 24, 32, 48 y 256 dentro, para
-sustituir los PNG de relleno que genera `windows/construir.ps1`.
+sustituir los PNG de relleno que genera `windows/build.ps1`.

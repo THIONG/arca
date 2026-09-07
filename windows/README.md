@@ -37,7 +37,7 @@ If the crate version is ever raised, that is the order worth looking in.
 | `arca-shell/src/lib.rs` | The DLL: `IExplorerCommand` and `IContextMenu`, with a submenu of three actions |
 | `AppxManifest.xml` | Sparse MSIX package giving the extension an identity |
 | `arca.iss` | Inno Setup script that produces the installer |
-| `construir.ps1` | Builds, packages and registers both menus for development |
+| `build.ps1` | Builds, packages and registers both menus for development |
 
 ## Two menus, two interfaces, two CLSIDs
 
@@ -90,7 +90,7 @@ shadows MSVC's `link.exe` and the resulting error does not look like it.
 
 ```powershell
 cd windows
-.\construir.ps1
+.\build.ps1
 Stop-Process -Name explorer -Force
 ```
 
@@ -101,13 +101,13 @@ And the checklist:
 3. "Extract here" unpacks next to the archive, with no console window
 4. Select several files → "Compress to .zip" puts them all in
 5. Explorer does not freeze for an instant (requirement R5)
-6. `.\construir.ps1 -Quitar` leaves everything as it was
+6. `.\build.ps1 -Remove` leaves everything as it was
 
 And the classic menu ones, which are a separate implementation:
 
 7. "Show more options" on a `.zip` → **Arca** with all three
 8. "Show more options" on a `.txt` → **Arca** with "Compress" only
-9. `-Quitar` also deletes the keys under `HKCU\Software\Classes`
+9. `-Remove` also deletes the keys under `HKCU\Software\Classes`
 
 All of them pass. The first four were additionally checked by driving the COM
 object by hand — loading the DLL and calling `GetState` and `Invoke` the way
@@ -141,9 +141,9 @@ a memory bug, a malicious archive could not reach it, because it never opens one
   runs silently and says nothing when it fails.
 - **The labels are English only**: the window follows the system language, this
   does not.
-- **Real icons**: `construir.ps1` generates 1×1 PNGs so the package validates.
-  The classic menu puts no icon on its entries either; that would need
-  `MENUITEMINFOW` with a bitmap.
+- **No icons on the classic menu entries**: the package icons are real now, out
+  of `windows/assets`, but the classic menu puts none on its own items. That
+  would need `MENUITEMINFOW` with a bitmap.
 - **`GetCommandString` returns `E_NOTIMPL`**: Explorer has no status-bar help
   text for the classic menu entries.
 - **Signing**: distributing it needs `makeappx` plus `signtool` and a

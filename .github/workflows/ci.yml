@@ -9,69 +9,69 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  prueba:
-    name: Pruebas e interoperabilidad
+  test:
+    name: Tests and interoperability
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - name: Herramientas de referencia
+      - name: Reference tools
         run: sudo apt-get update && sudo apt-get install -y zip unzip p7zip-full zstd
 
-      # La interfaz grafica entra en el workspace, asi que este job la compila.
-      # eframe necesita estas cabeceras en Linux; en Windows y macOS no hace
-      # falta nada porque el sistema ya las trae.
-      - name: Dependencias de la interfaz grafica
+      # The window is part of the workspace, so this job builds it too. eframe
+      # needs these headers on Linux; on Windows and macOS nothing is required
+      # because the system already ships them.
+      - name: Window dependencies
         run: sudo apt-get install -y libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev libgl1-mesa-dev libxcursor-dev libxinerama-dev
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      - name: Compilar sin códecs de C (Rust puro)
+      - name: Build without the C codecs (pure Rust)
         run: cargo build --release --no-default-features
       - run: cargo build --release
-      - name: Interoperabilidad verificada por hash
+      - name: Interoperability verified by hash
         run: bash interop.sh
 
-      # El instalador se escribio en Windows: esto es lo unico que comprueba
-      # que de verdad funciona en Linux, ida y vuelta.
-      - name: Instalador, ida y vuelta
+      # The installer was written on Windows: this is the only thing checking
+      # that it really works on Linux, there and back.
+      - name: Installer, there and back
         run: |
-          ./instalar.sh
+          ./install.sh
           test -x "$HOME/.local/bin/arca" && test -x "$HOME/.local/bin/arca-gui"
           "$HOME/.local/bin/arca" --version
-          ./instalar.sh --uninstall
+          ./install.sh --uninstall
           test ! -e "$HOME/.local/bin/arca" && test ! -e "$HOME/.local/bin/arca-gui"
 
   windows:
-    name: Compilar en Windows
+    name: Build on Windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - run: cargo test --workspace
-      # Sin continue-on-error: la release ya lo compila sin red desde la v0.3.0,
-      # asi que dejarlo pasar de largo solo servia para ocultar una rotura hasta
-      # el momento de publicar. Va fuera del workspace, de ahi el directorio.
-      - name: Extensión de shell
+      # No continue-on-error: the release has been building this without a net
+      # since v0.3.0, so letting it slide here only hid a breakage until
+      # publishing time. It lives outside the workspace, hence the directory.
+      - name: Shell extension
         working-directory: windows/arca-shell
         run: |
           cargo build --release
           cargo clippy --release --all-targets -- -D warnings
 
   macos:
-    name: Compilar en macOS
+    name: Build on macOS
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - run: cargo test --workspace
-      - name: Instalador, ida y vuelta
+      - name: Installer, there and back
         run: |
-          ./instalar.sh
+          ./install.sh
           test -x "$HOME/.local/bin/arca" && test -x "$HOME/.local/bin/arca-gui"
           "$HOME/.local/bin/arca" --version
-          ./instalar.sh --uninstall
+          ./install.sh --uninstall
           test ! -e "$HOME/.local/bin/arca" && test ! -e "$HOME/.local/bin/arca-gui"
