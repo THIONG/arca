@@ -1918,18 +1918,16 @@ impl Arca {
                 let _ = fs::remove_dir_all(old);
             }
             let _ = tx.send(match outcome {
-                Ok(n) => {
+                // Nothing to say. Copying somewhere else does not announce
+                // itself either, and the rows a cut is holding are already
+                // faded; what is worth a line is the entries leaving the
+                // archive, and that has its own. An empty message hands the
+                // status bar back to the summary of what is open.
+                Ok(_) => {
                     if cut {
                         let _ = tx.send(Message::CutReady);
                     }
-                    Message::Done(fill(
-                        if cut {
-                            s.cut_to_clipboard
-                        } else {
-                            s.copied_to_clipboard
-                        },
-                        &[("n", &n.to_string())],
-                    ))
+                    Message::Done(String::new())
                 }
                 Err(why) => Message::Failed(fill(s.clipboard_failed, &[("why", &why)])),
             });
@@ -2182,12 +2180,13 @@ impl Arca {
         // has none, which is exactly the case here. What does still arrive is
         // the key going back up, because the early return only covers the press
         // -- so that is what a paste is recognised by.
-        let (ctrl, shift, o, e, n, f, f5, del, cut, copy, paste) = ctx.input(|i| {
+        let (ctrl, shift, o, e, t, n, f, f5, del, cut, copy, paste) = ctx.input(|i| {
             (
                 i.modifiers.command,
                 i.modifiers.shift,
                 i.key_pressed(egui::Key::O),
                 i.key_pressed(egui::Key::E),
+                i.key_pressed(egui::Key::T),
                 i.key_pressed(egui::Key::N),
                 i.key_pressed(egui::Key::F),
                 i.key_pressed(egui::Key::F5),
@@ -2259,6 +2258,14 @@ impl Arca {
         }
         if e && self.archive.is_some() {
             self.ask_extract(ctx, false);
+        }
+        // Verifying an archive is a job this program has had all along, reached
+        // from the shell menu and from the command line, and from inside the
+        // window there was no way to ask for it at all.
+        if t {
+            if let Some(archive) = self.archive.clone() {
+                self.run_job(ctx, Job::Test(archive));
+            }
         }
         if n {
             if let Some(files) = rfd::FileDialog::new().pick_files() {
@@ -2956,29 +2963,36 @@ impl Arca {
         let mut up_level = false;
         let mut shift = false;
         let mut check_all = false;
+        let mut invert = false;
         let mut typed = String::new();
 
         ctx.input(|i| {
             let at = self.cursor.unwrap_or(0);
             shift = i.modifiers.shift;
             check_all = i.modifiers.command && i.key_pressed(egui::Key::A);
-            for (key, to) in [
-                (egui::Key::ArrowDown, (at + 1).min(last)),
-                (egui::Key::ArrowUp, at.saturating_sub(1)),
-                (egui::Key::PageDown, (at + page).min(last)),
-                (egui::Key::PageUp, at.saturating_sub(page)),
-                (egui::Key::Home, 0),
-                (egui::Key::End, last),
-            ] {
-                if i.key_pressed(key) {
-                    // The first press only lands the cursor somewhere visible
-                    // instead of jumping a row from nowhere.
-                    moved = Some(if self.cursor.is_none() { 0 } else { to });
+            invert = i.modifiers.command && i.key_pressed(egui::Key::I);
+            // Alt belongs to the shortcuts that walk the folders, not to the
+            // cursor: Alt and up is one level out, not one row up.
+            if !i.modifiers.alt {
+                for (key, to) in [
+                    (egui::Key::ArrowDown, (at + 1).min(last)),
+                    (egui::Key::ArrowUp, at.saturating_sub(1)),
+                    (egui::Key::PageDown, (at + page).min(last)),
+                    (egui::Key::PageUp, at.saturating_sub(page)),
+                    (egui::Key::Home, 0),
+                    (egui::Key::End, last),
+                ] {
+                    if i.key_pressed(key) {
+                        // The first press only lands the cursor somewhere
+                        // visible instead of jumping a row from nowhere.
+                        moved = Some(if self.cursor.is_none() { 0 } else { to });
+                    }
                 }
             }
             enter = i.key_pressed(egui::Key::Enter);
             space = i.key_pressed(egui::Key::Space);
-            up_level = i.key_pressed(egui::Key::Backspace);
+            up_level = i.key_pressed(egui::Key::Backspace)
+                || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowUp));
             // Plain letters, the way the Explorer jumps to a name. Ctrl and Alt
             // are somebody else's shortcut.
             if !i.modifiers.command && !i.modifiers.alt {
@@ -2989,6 +3003,17 @@ impl Arca {
                 }
             }
         });
+
+        // What every file list calls inverting a selection: keep what was not
+        // picked and let go of what was, which is how you pick everything but
+        // the handful you can see.
+        if invert {
+            let flipped: Vec<bool> = rows.iter().map(|r| !self.is_checked(r)).collect();
+            for (r, on) in rows.iter().zip(flipped) {
+                self.set_checked(r, on);
+            }
+            return;
+        }
 
         if check_all {
             let value = rows.iter().any(|r| !self.is_checked(r));
@@ -3598,6 +3623,10 @@ impl eframe::App for Arca {
                 self.cancel_password();
             } else if self.show_settings {
                 self.show_settings = false;
+            } else if matches!(self.view, View::Browse) && !self.busy {
+                // Nothing on top of the list any more, so it backs out of the
+                // last thing there is to back out of: what is picked.
+                self.clear_picked();
             }
         }
 
