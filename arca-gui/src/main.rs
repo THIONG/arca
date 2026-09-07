@@ -705,6 +705,13 @@ enum Job {
         current: Option<String>,
         new: Option<String>,
     },
+    // Taking entries out. A zip has no hole to leave behind, so this rebuilds
+    // the archive without them.
+    Delete {
+        archive: PathBuf,
+        names: Vec<String>,
+        password: Option<String>,
+    },
     Compress {
         out: PathBuf,
         inputs: Vec<PathBuf>,
@@ -876,6 +883,40 @@ fn run_job_blocking(
                 &[("name", &name)],
             ))
         }
+        // Same shape as the password rewrite, and the same care: the archive
+        // is the only copy of what is inside it, so the new one is built
+        // alongside, read back in full, and only then moved over.
+        Job::Delete {
+            archive,
+            names,
+            password,
+        } => {
+            if detect(&archive) != Some(Format::Zip) {
+                return Err(s.only_zip_can_change.to_string());
+            }
+            let doomed: HashSet<String> = names.into_iter().collect();
+            let temp = archive.with_file_name(format!(
+                "{}.arca-new",
+                archive
+                    .file_name()
+                    .map(|x| x.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            ));
+            let done = arca_zip::remove_entries(
+                &archive,
+                &temp,
+                password.as_deref(),
+                &|e| !doomed.contains(&e.name),
+                notify,
+            );
+            let gone = doomed.len();
+            if let Err(e) = done {
+                let _ = fs::remove_file(&temp);
+                return Err(e.to_string());
+            }
+            fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
+            Ok(fill(s.deleted, &[("n", &gone.to_string())]))
+        }
         Job::Compress {
             out,
             inputs,
@@ -996,6 +1037,14 @@ struct Arca {
     cursor: Option<usize>,
     // One texture per extension, filled the first time a kind is seen.
     icons: HashMap<String, Option<egui::TextureHandle>>,
+    // Where a rubber band started, and what was ticked before it did. The
+    // second is what lets the band be recomputed from scratch every frame, so
+    // dragging back over a row lets go of it again.
+    band: Option<egui::Pos2>,
+    band_base: Vec<bool>,
+    // Names waiting on a yes before they are taken out of the archive. There
+    // is no undo, so this one asks.
+    confirm_delete: Option<Vec<String>>,
     // Set when the cursor moves by keyboard, so the table can scroll it into
     // view on the next frame and then forget about it.
     scroll_to_cursor: bool,
@@ -1041,6 +1090,9 @@ impl Arca {
             here: 0,
             cursor: None,
             icons: HashMap::new(),
+            band: None,
+            band_base: Vec::new(),
+            confirm_delete: None,
             scroll_to_cursor: false,
         }
     }
@@ -1192,12 +1244,17 @@ impl Arca {
             Job::Extract { .. } => s.extracting.to_string(),
             Job::Test(_) => s.testing.to_string(),
             Job::Password { .. } => s.changing_password.to_string(),
+            Job::Delete { .. } => s.deleting.to_string(),
             Job::Compress { .. } => s.compressing.to_string(),
         };
-        self.close_when_done = !matches!(job, Job::Test(_) | Job::Password { .. });
+        self.close_when_done =
+            !matches!(job, Job::Test(_) | Job::Password { .. } | Job::Delete { .. });
         // The file on disk is about to change, so the listing has to be redone.
         if let Job::Password { archive, new, .. } = &job {
             self.after_password = Some((archive.clone(), new.clone()));
+        }
+        if let Job::Delete { archive, password, .. } = &job {
+            self.after_password = Some((archive.clone(), password.clone()));
         }
 
         let (reply_tx, reply_rx) = channel::<Answer>();
@@ -1443,6 +1500,145 @@ impl Arca {
     // Escape and the Cancel button are the same act, so they go through the
     // same code: two copies of this would drift apart the first time one side
     // grew a step.
+    // The names ticked right now, which is what every action that works on a
+    // selection needs.
+    fn selected_names(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .zip(&self.checked)
+            .filter(|(_, &on)| on)
+            .map(|(e, _)| e.name.clone())
+            .collect()
+    }
+
+    // Windows shortcuts that mean something here. The ones that would need the
+    // archive to grow a feature it has not got are left out rather than made to
+    // look present and do nothing.
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        if !matches!(self.view, View::Browse) || self.busy || self.confirm_delete.is_some() {
+            return;
+        }
+        let typing = ctx.memory(|m| m.focused().is_some());
+        let (ctrl, o, e, c, n, f, f5, del) = ctx.input(|i| {
+            (
+                i.modifiers.command,
+                i.key_pressed(egui::Key::O),
+                i.key_pressed(egui::Key::E),
+                i.key_pressed(egui::Key::C),
+                i.key_pressed(egui::Key::N),
+                i.key_pressed(egui::Key::F),
+                i.key_pressed(egui::Key::F5),
+                i.key_pressed(egui::Key::Delete),
+            )
+        });
+
+        if f5 && !typing {
+            if let Some(p) = self.archive.clone() {
+                let keep = self.archive_password.clone();
+                self.open(ctx, p);
+                self.archive_password = keep;
+            }
+        }
+        if del && !typing && self.archive.is_some() {
+            let names = self.selected_names();
+            if !names.is_empty() {
+                self.confirm_delete = Some(names);
+            }
+        }
+        if !ctrl {
+            return;
+        }
+        if o {
+            if let Some(p) = rfd::FileDialog::new()
+                .add_filter("Archives", &["zip", "tar", "gz", "tgz"])
+                .pick_file()
+            {
+                self.open(ctx, p);
+            }
+        }
+        if e && self.archive.is_some() {
+            self.ask_extract(ctx, false);
+        }
+        if n {
+            if let Some(files) = rfd::FileDialog::new().pick_files() {
+                if !files.is_empty() {
+                    self.output_name = quick_output(&files, self.format)
+                        .file_name()
+                        .map(|x| x.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    self.pending_inputs = files;
+                    self.view = View::Add;
+                }
+            }
+        }
+        if f {
+            // Nothing else here is a text box, so handing the keyboard to the
+            // filter is the whole of "find".
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("filter")));
+        }
+        if c {
+            // The names, as text. Putting the files themselves on the clipboard
+            // is a different job: it needs a data object the shell can pull
+            // bytes out of on demand, and that is not written.
+            let names = self.selected_names();
+            if !names.is_empty() {
+                ctx.copy_text(names.join("\r\n"));
+            }
+        }
+    }
+
+    fn confirm_delete_window(&mut self, ctx: &egui::Context) {
+        let Some(names) = self.confirm_delete.clone() else {
+            return;
+        };
+        let s = self.s();
+        let mut go = false;
+        let mut cancel = false;
+        egui::Window::new(s.delete_word)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.label(fill(s.confirm_delete, &[("n", &names.len().to_string())]));
+                ui.add_space(6.0);
+                // Enough of them to see what is about to go, not so many that
+                // the window becomes the list itself.
+                for n in names.iter().take(8) {
+                    ui.weak(format!("  {n}"));
+                }
+                if names.len() > 8 {
+                    ui.weak(format!("  … {}", names.len() - 8));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button(s.delete_word).clicked() {
+                        go = true;
+                    }
+                    if ui.button(s.cancel).clicked() {
+                        cancel = true;
+                    }
+                });
+                ui.add_space(4.0);
+            });
+        if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.confirm_delete = None;
+        }
+        if go {
+            self.confirm_delete = None;
+            if let Some(archive) = self.archive.clone() {
+                self.run_job(
+                    ctx,
+                    Job::Delete {
+                        archive,
+                        names,
+                        password: self.archive_password.clone(),
+                    },
+                );
+            }
+        }
+    }
+
     fn cancel_password(&mut self) {
         let was_job = matches!(self.waiting_on_password, Some(Pending::Extract(_)));
         self.waiting_on_password = None;
@@ -1663,6 +1859,7 @@ impl Arca {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.filter)
+                        .id(egui::Id::new("filter"))
                         .hint_text(s.filter_hint)
                         .desired_width(170.0),
                 );
@@ -1837,6 +2034,71 @@ impl Arca {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
+    }
+
+    // Press on the list and drag: a rectangle follows the pointer and every row
+    // it touches gets ticked, the way it works in any file list.
+    //
+    // It is worked out again from `band_base` on every frame instead of being
+    // added to as the pointer moves. That is what lets dragging back over a row
+    // let go of it: growing a selection is easy, shrinking one is what needs
+    // the starting point remembered.
+    fn rubber_band(
+        &mut self,
+        ui: &mut egui::Ui,
+        visible: &[Row],
+        row_rects: &[egui::Rect],
+        body_area: egui::Rect,
+    ) {
+        let (down, origin, now, ctrl) = ui.input(|i| {
+            (
+                i.pointer.primary_down(),
+                i.pointer.press_origin(),
+                i.pointer.interact_pos(),
+                i.modifiers.command,
+            )
+        });
+
+        if !down {
+            self.band = None;
+            return;
+        }
+        // The header sits at the top of this area and is not part of the list:
+        // dragging a column edge must not start a selection.
+        let inside = origin
+            .is_some_and(|p| body_area.contains(p) && p.y > body_area.top() + ROW_HEIGHT + 6.0);
+        if self.band.is_none() {
+            if !inside {
+                return;
+            }
+            self.band = origin;
+            self.band_base = if ctrl {
+                self.checked.clone()
+            } else {
+                vec![false; self.checked.len()]
+            };
+        }
+
+        let (Some(start), Some(here)) = (self.band, now) else {
+            return;
+        };
+        // A click is a drag of no distance. Under this it is left alone, so
+        // clicking a row still means clicking a row.
+        if (here - start).length() < 4.0 {
+            return;
+        }
+
+        let band = egui::Rect::from_two_pos(start, here);
+        self.checked.clone_from(&self.band_base);
+        for (row, rect) in visible.iter().zip(row_rects) {
+            if rect.intersects(band) {
+                self.set_checked(row, true);
+            }
+        }
+
+        let fill = ui.visuals().selection.bg_fill.linear_multiply(0.25);
+        let stroke = egui::Stroke::new(1.0_f32, ui.visuals().selection.stroke.color);
+        ui.painter().rect(band.intersect(body_area), 0.0, fill, stroke);
     }
 
     fn set_checked(&mut self, row: &Row, value: bool) {
@@ -2086,7 +2348,11 @@ impl Arca {
         let mut requested: Option<SortColumn> = None;
         let mut toggle: Option<(usize, bool)> = None;
         let mut opened: Option<usize> = None;
-        let mut moved_cursor: Option<usize> = None;
+        let mut clicked: Option<usize> = None;
+        let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(visible.len());
+        // Taken before the table draws, so it covers the empty space under the
+        // last row too: a band has to be able to start down there.
+        let body_area = ui.available_rect_before_wrap();
         let mut icons = std::mem::take(&mut self.icons);
         let order = self.order;
         let hint = s.sort_hint;
@@ -2206,8 +2472,9 @@ impl Arca {
                         resp.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                     if resp.clicked() {
-                        moved_cursor = Some(idx);
+                        clicked = Some(idx);
                     }
+                    row_rects.push(resp.rect);
                     if resp.double_clicked() {
                         opened = Some(idx);
                     }
@@ -2232,9 +2499,31 @@ impl Arca {
         }
         self.icons = icons;
         self.scroll_to_cursor = false;
-        if let Some(index) = moved_cursor {
+
+        // Ctrl adds or removes one, Shift takes everything between here and
+        // where the cursor was, and a plain click starts again with just this
+        // one. That is what every file list does, and the ticks are the
+        // selection here, so this is what they act on.
+        if let Some(index) = clicked {
+            let mods = ui.input(|i| i.modifiers);
+            let target = visible[index].clone();
+            if mods.command {
+                let value = !self.is_checked(&target);
+                self.set_checked(&target, value);
+            } else if mods.shift {
+                let from = self.cursor.unwrap_or(index);
+                let (lo, hi) = if from <= index { (from, index) } else { (index, from) };
+                for r in &visible[lo..=hi] {
+                    self.set_checked(r, true);
+                }
+            } else {
+                self.checked.iter_mut().for_each(|c| *c = false);
+                self.set_checked(&target, true);
+            }
             self.cursor = Some(index);
         }
+
+        self.rubber_band(ui, &visible, &row_rects, body_area);
         if let Some(index) = opened {
             let target = &visible[index];
             if target.is_dir {
@@ -2257,6 +2546,7 @@ impl Arca {
 impl eframe::App for Arca {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive(ctx);
+        self.shortcuts(ctx);
 
         // Escape backs out of whatever is on top, innermost first, the way it
         // does everywhere else. The password prompt goes through the same path
@@ -2273,24 +2563,6 @@ impl eframe::App for Arca {
         // and egui hands over as Extra1 and Extra2. Alt+Left and Alt+Right do
         // the same, for anyone without them.
         if matches!(self.view, View::Browse) && !self.busy {
-            let (open, extract) = ctx.input(|i| {
-                (
-                    i.modifiers.command && i.key_pressed(egui::Key::O),
-                    i.modifiers.command && i.key_pressed(egui::Key::E),
-                )
-            });
-            if open {
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Archives", &["zip", "tar", "gz", "tgz"])
-                    .pick_file()
-                {
-                    self.open(ctx, p);
-                }
-            }
-            if extract && self.archive.is_some() {
-                self.ask_extract(ctx, false);
-            }
-
             let (back, forward) = ctx.input(|i| {
                 (
                     i.pointer.button_pressed(egui::PointerButton::Extra1)
@@ -2348,8 +2620,14 @@ impl eframe::App for Arca {
                 self.settings_window(&ctx2);
                 self.conflict_window(&ctx2);
                 self.password_window(&ctx2);
-                egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-                    ui.add_space(5.0);
+                self.confirm_delete_window(&ctx2);
+                // An exact height with the content centred inside it. Padding
+                // above and below looked symmetrical in the source and was not
+                // on screen: the text sat high in the bar.
+                egui::TopBottomPanel::bottom("status")
+                    .exact_height(30.0)
+                    .show(ctx, |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     if self.busy {
                         let f = if self.total_count == 0 {
                             0.0
@@ -2369,7 +2647,7 @@ impl eframe::App for Arca {
                         };
                         ui.colored_label(color, &self.notice);
                     }
-                    ui.add_space(5.0);
+                    });
                 });
                 egui::CentralPanel::default().show(ctx, |ui| {
                     if self.entries.is_empty() {

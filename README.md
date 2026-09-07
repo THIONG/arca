@@ -10,7 +10,7 @@ crate level. A malformed archive produces an error, never memory corruption.
 
 ```sh
 cargo build --release      # binary at target/release/arca
-cargo test --workspace     # 49 tests
+cargo test --workspace     # 51 tests
 bash interop.sh            # the phase acceptance criterion
 ```
 
@@ -293,8 +293,21 @@ jumping blindly:
 | letters | jump to the next row starting with them, wrapping round |
 | Ctrl+A | tick everything, or untick it if it is all ticked |
 | Alt+← Alt+→ | back and forward |
-| Ctrl+O · Ctrl+E | open an archive · extract it all |
-| Esc | back out of the password prompt or the settings window |
+| Ctrl+O · Ctrl+N · Ctrl+E | open · new archive · extract it all |
+| Ctrl+C | copy the selected names |
+| Ctrl+F · F5 | jump to the filter box · read the archive again |
+| Delete | take the selected entries out of the archive |
+| Esc | back out of whatever is on top |
+
+The mouse picks the same way a file list does: click for one, Ctrl+click to add
+or drop one, Shift+click for everything in between, and press on the list and
+drag for a rectangle that takes what it touches.
+
+**Ctrl+V is not there, and neither is Ctrl+C onto the clipboard as files.**
+Pasting means adding to an archive that already exists, which the writer cannot
+do yet, and copying files out means handing the shell an object it can pull
+bytes from on demand. Both are real work rather than a missing keybinding, so
+they are absent instead of present and broken.
 
 While the filter box or a dialog has the keyboard, none of these apply: the
 typing belongs there. The window also declares itself through AccessKit, so

@@ -82,6 +82,7 @@ pub fn draw_icon(ui: &mut egui::Ui, kind: Kind) {
     p.add(egui::Shape::convex_polygon(fold, c, egui::Stroke::NONE));
 }
 
+#[derive(Clone)]
 pub struct Row {
     pub label: String,
     pub path: String,

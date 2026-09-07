@@ -1022,10 +1022,43 @@ pub fn rewrite_password(
     new: Option<&str>,
     notify: &dyn Fn(usize, usize, &str),
 ) -> Result<u64> {
+    rewrite(archive, out, current, new, &|_| true, notify)
+}
+
+/// Writes a copy of `archive` at `out` without the entries `keep` turns down.
+///
+/// A zip cannot have entries taken out of it in place: the central directory
+/// records where every one of them starts, so removing bytes from the middle
+/// moves everything after it. The archive is built again instead, and since
+/// nothing is compressed a second time this costs a copy of the bytes that
+/// survive and nothing else.
+pub fn remove_entries(
+    archive: &std::path::Path,
+    out: &std::path::Path,
+    password: Option<&str>,
+    keep: &dyn Fn(&Entry) -> bool,
+    notify: &dyn Fn(usize, usize, &str),
+) -> Result<u64> {
+    rewrite(archive, out, password, password, keep, notify)
+}
+
+fn rewrite(
+    archive: &std::path::Path,
+    out: &std::path::Path,
+    current: Option<&str>,
+    new: Option<&str>,
+    keep: &dyn Fn(&Entry) -> bool,
+    notify: &dyn Fn(usize, usize, &str),
+) -> Result<u64> {
     use std::fs::File;
     use std::io::{BufReader, BufWriter};
 
-    let entries = ZipArchive::open(File::open(archive)?)?.entries().to_vec();
+    let entries: Vec<Entry> = ZipArchive::open(File::open(archive)?)?
+        .entries()
+        .iter()
+        .filter(|e| keep(e))
+        .cloned()
+        .collect();
     let total = entries.len();
     let mut w = ZipWriter::new(BufWriter::with_capacity(STREAM_BUF, File::create(out)?));
     let mut bytes = 0u64;
@@ -1259,6 +1292,74 @@ mod tests {
         let mut out = Vec::new();
         a.extract_to_with(0, &mut out, password).unwrap();
         (out, encrypted, packed)
+    }
+
+    // What remove_entries does, without going through a file: filter, then let
+    // the survivors through untouched.
+    fn keeping(buf: &[u8], keep: &dyn Fn(&Entry) -> bool) -> Vec<u8> {
+        let entries: Vec<Entry> = ZipArchive::open(IoCursor::new(buf.to_vec()))
+            .unwrap()
+            .entries()
+            .iter()
+            .filter(|e| keep(e))
+            .cloned()
+            .collect();
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        for e in &entries {
+            let mut src = IoCursor::new(buf.to_vec());
+            w.copy_entry(&e.name, e.crc32, e.size, e.method, e.mtime, None, |sink| {
+                copy_compressed(&mut src, e, sink, None)
+            })
+            .unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    // Taking entries out is the one operation with no undo, so whatever
+    // survives has to survive byte for byte.
+    #[test]
+    fn removing_entries_leaves_the_rest_untouched() {
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        let bodies: Vec<Vec<u8>> = (0..6)
+            .map(|i| format!("contents of number {i} ").repeat(30).into_bytes())
+            .collect();
+        for (i, body) in bodies.iter().enumerate() {
+            w.add(&format!("f{i}.txt"), &body[..], Codec::Deflate, Level::Normal, None)
+                .unwrap();
+        }
+        let buf = w.finish().unwrap().into_inner();
+
+        let doomed = ["f1.txt", "f4.txt"];
+        let kept = keeping(&buf, &|e| !doomed.contains(&e.name.as_str()));
+
+        let mut a = ZipArchive::open(IoCursor::new(kept)).unwrap();
+        let names: Vec<String> = a.entries().iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, ["f0.txt", "f2.txt", "f3.txt", "f5.txt"]);
+        for (i, name) in names.iter().enumerate() {
+            let mut out = Vec::new();
+            a.extract_to(i, &mut out).unwrap();
+            let which: usize = name[1..2].parse().unwrap();
+            assert_eq!(out, bodies[which], "{name}");
+        }
+    }
+
+    #[test]
+    fn removing_nothing_and_removing_everything_both_work() {
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        w.add("only.txt", &b"payload"[..], Codec::Deflate, Level::Normal, None).unwrap();
+        let buf = w.finish().unwrap().into_inner();
+
+        let same = keeping(&buf, &|_| true);
+        let mut a = ZipArchive::open(IoCursor::new(same)).unwrap();
+        assert_eq!(a.len(), 1);
+        let mut out = Vec::new();
+        a.extract_to(0, &mut out).unwrap();
+        assert_eq!(out, b"payload");
+
+        // An archive with nothing left in it is still a readable archive.
+        let empty = keeping(&buf, &|_| false);
+        let a = ZipArchive::open(IoCursor::new(empty)).unwrap();
+        assert!(a.is_empty());
     }
 
     #[test]
