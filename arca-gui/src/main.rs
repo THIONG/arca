@@ -75,13 +75,22 @@ fn detect(p: &Path) -> Option<Format> {
 // question asked here is which row has started by this height, and the answer
 // in a gap is the row above it.
 //
-// Below the last row that gives the last row, and above the first it clamps to
-// the first: a drag that has run off one end of the list is still asking for
-// everything up to that end.
-fn row_at(rects: &[(usize, egui::Rect)], y: f32) -> Option<usize> {
+// Above the first row it clamps to the first: a drag that has run off that end
+// is still asking for everything up to it. Under the last row there are two
+// different situations and they cannot share an answer. If there is more list
+// below, still to be scrolled into view, the answer is that last row and the
+// drag carries on from there. If the list has ended, the height is in the empty
+// space under it and the answer is `len`, one past the end, which is not a row:
+// pressing down there and moving a little must pick nothing at all rather than
+// reach up and grab whatever happens to be last.
+fn row_at(rects: &[(usize, egui::Rect)], y: f32, len: usize) -> Option<usize> {
     let (first, top) = *rects.first()?;
     if y <= top.top() {
         return Some(first);
+    }
+    let (last, bottom) = *rects.last()?;
+    if y > bottom.bottom() && last + 1 >= len {
+        return Some(len);
     }
     rects
         .iter()
@@ -2657,7 +2666,7 @@ impl Arca {
             let Some(p) = origin.filter(|p| room.contains(*p)) else {
                 return;
             };
-            let Some(anchor) = row_at(row_rects, p.y) else {
+            let Some(anchor) = row_at(row_rects, p.y, visible.len()) else {
                 return;
             };
             self.band = origin;
@@ -2702,21 +2711,30 @@ impl Arca {
         // where the button went down stops meaning anything the moment it does;
         // it also loses every row that scrolls out of sight, because those are
         // the only ones the table still knows the position of.
-        let head = row_at(row_rects, here.y).unwrap_or(anchor);
+        let head = row_at(row_rects, here.y, visible.len()).unwrap_or(anchor);
         let (lo, hi) = if anchor <= head {
             (anchor, head)
         } else {
             (head, anchor)
         };
         self.checked.clone_from(&self.band_base);
-        for row in visible.get(lo..=hi).unwrap_or_default() {
-            self.set_checked(row, true);
+        // Both ends past the last row means the band is entirely in the empty
+        // space under the list, and has reached nothing.
+        if lo < visible.len() {
+            for row in &visible[lo..=hi.min(visible.len() - 1)] {
+                self.set_checked(row, true);
+            }
         }
 
         // Drawn from the row the drag began on rather than from the point the
         // button went down, so that it stays put against the rows when the list
         // scrolls under it.
-        let edge = match row_rects.iter().find(|(i, _)| *i == anchor) {
+        let anchor_rect = if anchor < visible.len() {
+            row_rects.iter().find(|(i, _)| *i == anchor)
+        } else {
+            None
+        };
+        let edge = match anchor_rect {
             // Its far side, so that the row the drag began on falls inside the
             // band whichever way the drag then went.
             Some((_, r)) => {
@@ -2726,6 +2744,9 @@ impl Arca {
                     r.top()
                 }
             }
+            // Begun in the empty space under the list, where there is no row to
+            // hang the band on, so it hangs from where the button went down.
+            None if anchor >= visible.len() => start.y,
             // Scrolled out of sight, which happens as soon as a drag has run
             // far enough for the list to follow it. Which edge to start from is
             // decided by where that row went, and that is its number against
