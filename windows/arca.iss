@@ -128,6 +128,10 @@ Root: HKCU; Subkey: "Software\Classes\.tar\OpenWithProgids"; ValueType: string; 
 Root: HKCU; Subkey: "Software\Classes\.gz\OpenWithProgids"; ValueType: string; ValueName: "Arca.targz"; ValueData: ""; Flags: uninsdeletevalue; Tasks: fileassoc
 Root: HKCU; Subkey: "Software\Classes\.tgz\OpenWithProgids"; ValueType: string; ValueName: "Arca.tgz"; ValueData: ""; Flags: uninsdeletevalue; Tasks: fileassoc
 
+; Windows shows FriendlyAppName in "Open with" and in Settings. Without it the
+; list falls back to the executable name, which reads like something the user
+; did not install on purpose.
+Root: HKCU; Subkey: "Software\Classes\Applications\arca-gui.exe"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "Arca"; Tasks: fileassoc
 Root: HKCU; Subkey: "Software\Classes\Applications\arca-gui.exe\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\arca-gui.exe"" ""%1"""; Flags: uninsdeletekey; Tasks: fileassoc
 Root: HKCU; Subkey: "Software\Classes\Applications\arca-gui.exe\SupportedTypes"; ValueType: string; ValueName: ".zip"; ValueData: ""; Tasks: fileassoc
 Root: HKCU; Subkey: "Software\Classes\Applications\arca-gui.exe\SupportedTypes"; ValueType: string; ValueName: ".tar"; ValueData: ""; Tasks: fileassoc
@@ -237,11 +241,40 @@ begin
   end;
 end;
 
+// Whatever the user picked in Settings > Default apps points at one of our
+// ProgIDs, and the uninstall is about to delete those. Leaving UserChoice
+// behind pins the extension to a handler that no longer exists: the file then
+// opens with nothing and Settings shows a broken entry that is awkward to undo.
+//
+// Writing a UserChoice is blocked by Windows, on purpose, because it is how an
+// application would steal a default. Deleting one is allowed, and it puts the
+// extension back to whatever Windows decides on its own.
+procedure ForgetDefaults();
+var
+  Exts: array[0..3] of string;
+  Key, ProgId: string;
+  I: Integer;
+begin
+  Exts[0] := '.zip';
+  Exts[1] := '.tar';
+  Exts[2] := '.gz';
+  Exts[3] := '.tgz';
+  for I := 0 to 3 do
+  begin
+    Key := 'Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\' + Exts[I] + '\UserChoice';
+    if RegQueryStringValue(HKCU, Key, 'ProgId', ProgId) then
+      // Only ours. Somebody else's default is none of our business.
+      if Copy(ProgId, 1, 5) = 'Arca.' then
+        RegDeleteKeyIncludingSubkeys(HKCU, Key);
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
   begin
     UnregisterModernMenu();
+    ForgetDefaults();
     RemoveFromPath();
     // Runs before the files are deleted, so the Explorer lets go of the DLL
     // and the uninstall does not leave it behind.

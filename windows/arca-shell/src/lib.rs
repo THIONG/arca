@@ -73,8 +73,12 @@ fn paths_from(items: Option<&IShellItemArray>) -> Vec<PathBuf> {
     v
 }
 
-// arca.exe sits next to this DLL, so the path is derived from where the DLL
+// arca-gui.exe sits next to this DLL, so the path is derived from where the DLL
 // itself was loaded from rather than from the registry or the PATH.
+//
+// The window and not the CLI: it shows a progress bar, asks what to do when a
+// file is already there, and says so when something fails. The CLI would run
+// with no console window, so a failed extraction was silent.
 fn exe_path() -> Result<PathBuf> {
     use windows::Win32::System::LibraryLoader::*;
     let mut buf = [0u16; 32_768];
@@ -90,7 +94,7 @@ fn exe_path() -> Result<PathBuf> {
             return Err(E_FAIL.into());
         }
         let dll = PathBuf::from(String::from_utf16_lossy(&buf[..n]));
-        Ok(dll.with_file_name("arca.exe"))
+        Ok(dll.with_file_name("arca-gui.exe"))
     }
 }
 
@@ -104,41 +108,32 @@ fn launch(action: Action, paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+// One process for the whole selection rather than one per file, which is what
+// the CLI needed. Requirement R5 gives this 16 ms and a CreateProcess costs
+// around 5, so four selected archives used to be most of the budget.
 fn run(action: Action, paths: &[PathBuf]) -> Result<()> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
+    let mut cmd = std::process::Command::new(exe_path()?);
     match action {
-        Action::ExtractHere | Action::ExtractToFolder => {
+        Action::ExtractHere => {
+            cmd.arg("--extract-here");
             for p in paths.iter().filter(|p| is_archive(p)) {
-                let dest = if action == Action::ExtractHere {
-                    p.parent().map(PathBuf::from).unwrap_or_default()
-                } else {
-                    p.with_extension("")
-                };
-                let mut cmd = std::process::Command::new(exe_path()?);
-                cmd.creation_flags(CREATE_NO_WINDOW)
-                    .arg("extract")
-                    .arg(p)
-                    .arg("-o")
-                    .arg(dest);
-                cmd.spawn().map_err(|_| Error::from(E_FAIL))?;
+                cmd.arg(p);
+            }
+        }
+        Action::ExtractToFolder => {
+            cmd.arg("--extract-to-folder");
+            for p in paths.iter().filter(|p| is_archive(p)) {
+                cmd.arg(p);
             }
         }
         Action::CompressZip => {
-            let Some(first) = paths.first() else {
-                return Ok(());
-            };
-            let mut cmd = std::process::Command::new(exe_path()?);
-            cmd.creation_flags(CREATE_NO_WINDOW)
-                .arg("create")
-                .arg(first.with_extension("zip"));
+            cmd.arg("--add-quick");
             for p in paths {
                 cmd.arg(p);
             }
-            cmd.spawn().map_err(|_| Error::from(E_FAIL))?;
         }
     }
+    cmd.spawn().map_err(|_| Error::from(E_FAIL))?;
     Ok(())
 }
 

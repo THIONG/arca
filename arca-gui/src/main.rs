@@ -211,6 +211,151 @@ fn is_encrypted(archive: &Path) -> bool {
         .unwrap_or(false)
 }
 
+// A folder of its own per archive, so two archives holding a file with the same
+// name do not overwrite each other's copy. safe_name is what keeps an entry
+// called "../../evil" from landing outside it.
+fn extract_one(
+    archive: &Path,
+    entry: &Entry,
+    password: Option<&str>,
+) -> arca_core::Result<PathBuf> {
+    let room = std::env::temp_dir()
+        .join("Arca")
+        .join(archive_stem(archive));
+    let path = room.join(arca_core::safe_name(&entry.name)?);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let Some(format) = detect(archive) else {
+        return Err(arca_core::Error::Unsupported("unknown format".into()));
+    };
+    let mut out = BufWriter::with_capacity(BUF, File::create(&path)?);
+    match format {
+        Format::Zip => {
+            let mut source = BufReader::with_capacity(BUF, File::open(archive)?);
+            arca_zip::extract_entry_with(&mut source, entry, &mut out, password)?;
+        }
+        _ => {
+            // A tar has no index, so the only way to one entry is through all
+            // the ones before it.
+            let mut r = TarReader::new(open_source(archive, format)?);
+            let mut found = false;
+            while let Some(e) = r.next_entry()? {
+                if e.entry.name == entry.name && !e.entry.is_dir {
+                    r.copy_data(&e, &mut out)?;
+                    found = true;
+                    break;
+                }
+                r.skip_data(&e)?;
+            }
+            if !found {
+                return Err(arca_core::Error::Format(format!(
+                    "'{}' is not in the archive any more",
+                    entry.name
+                )));
+            }
+        }
+    }
+    out.flush()?;
+    Ok(path)
+}
+
+// Whatever the desktop opens this kind of file with. The child is left to run
+// on its own; the window does not wait for it and does not care what it was.
+#[cfg(windows)]
+fn launch_with_system(path: &Path) -> arca_core::Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    // The empty pair of quotes is the window title `start` insists on eating.
+    // Without it a quoted path becomes the title and nothing opens. No /WAIT
+    // either: that would leave a cmd sitting around until the viewer is closed.
+    std::process::Command::new("cmd")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["/C", "start", ""])
+        .arg(path)
+        .spawn()
+        .map_err(arca_core::Error::Io)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn launch_with_system(path: &Path) -> arca_core::Result<()> {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    std::process::Command::new(opener)
+        .arg(path)
+        .spawn()
+        .map_err(arca_core::Error::Io)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arrow {
+    Left,
+    Right,
+    Up,
+}
+
+// Painted rather than written. The arrows that would say this in text are not
+// in the fonts egui ships by default, and a button showing a hollow box is
+// worse than no button at all.
+fn arrow_button(ui: &mut egui::Ui, dir: Arrow, enabled: bool, tip: &str) -> egui::Response {
+    let size = egui::vec2(28.0, 22.0);
+    let (rect, response) = ui.allocate_exact_size(
+        size,
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let fill = if enabled {
+            visuals.weak_bg_fill
+        } else {
+            ui.visuals().widgets.noninteractive.weak_bg_fill
+        };
+        let stroke = if enabled {
+            visuals.fg_stroke.color
+        } else {
+            ui.visuals().widgets.noninteractive.fg_stroke.color
+        };
+        ui.painter().rect(rect, 3.0, fill, visuals.bg_stroke);
+
+        let c = rect.center();
+        let w = 4.5;
+        let h = 5.5;
+        let p = match dir {
+            Arrow::Left => [
+                egui::pos2(c.x + w * 0.6, c.y - h),
+                egui::pos2(c.x + w * 0.6, c.y + h),
+                egui::pos2(c.x - w, c.y),
+            ],
+            Arrow::Right => [
+                egui::pos2(c.x - w * 0.6, c.y - h),
+                egui::pos2(c.x - w * 0.6, c.y + h),
+                egui::pos2(c.x + w, c.y),
+            ],
+            Arrow::Up => [
+                egui::pos2(c.x - h, c.y + w * 0.6),
+                egui::pos2(c.x + h, c.y + w * 0.6),
+                egui::pos2(c.x, c.y - w),
+            ],
+        };
+        ui.painter()
+            .add(egui::Shape::convex_polygon(p.to_vec(), stroke, egui::Stroke::NONE));
+    }
+
+    if enabled {
+        response.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Answer {
     Replace,
@@ -813,6 +958,11 @@ struct Arca {
     // Where to look again once a password job has rewritten the archive, and the
     // password it now carries.
     after_password: Option<(PathBuf, Option<String>)>,
+    // Where the window has been, so the mouse back and forward buttons have
+    // somewhere to go. `here` indexes into it; going somewhere new throws away
+    // whatever was ahead, the way a browser does.
+    history: Vec<String>,
+    here: usize,
 }
 
 impl Arca {
@@ -851,6 +1001,8 @@ impl Arca {
             add_password: String::new(),
             archive_password: None,
             after_password: None,
+            history: vec![String::new()],
+            here: 0,
         }
     }
 
@@ -1045,6 +1197,8 @@ impl Arca {
                             self.format = f;
                         }
                         self.archive = Some(path);
+                        self.history = vec![String::new()];
+                        self.here = 0;
                         self.current_dir = String::new();
                         self.busy = false;
                         close = true;
@@ -1470,11 +1624,15 @@ impl Arca {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let at_root = self.current_dir.is_empty();
-            if ui
-                .add_enabled(!at_root, egui::Button::new(format!("  {}  ", s.up)))
-                .clicked()
-            {
-                self.current_dir = parent_of(&self.current_dir);
+            if arrow_button(ui, Arrow::Left, self.can_go_back(), s.back).clicked() {
+                self.go_back();
+            }
+            if arrow_button(ui, Arrow::Right, self.can_go_forward(), s.forward).clicked() {
+                self.go_forward();
+            }
+            if arrow_button(ui, Arrow::Up, !at_root, s.up).clicked() {
+                let parent = parent_of(&self.current_dir);
+                self.go_to(parent);
             }
             ui.separator();
             let here = if self.current_dir.is_empty() {
@@ -1645,6 +1803,79 @@ impl Arca {
         }
     }
 
+    // Double clicking a file pulls that one entry out to a temporary folder and
+    // hands it to whatever the system opens it with. It runs on its own thread
+    // because the entry can be large, and reports through the same progress
+    // window as everything else.
+    fn open_file(&mut self, ctx: &egui::Context, index: usize) {
+        let Some(archive) = self.archive.clone() else {
+            return;
+        };
+        let Some(entry) = self.entries.get(index).cloned() else {
+            return;
+        };
+        if entry.is_dir {
+            return;
+        }
+        let password = self.archive_password.clone();
+        let s = self.s();
+        let ctx2 = ctx.clone();
+        self.close_when_done = false;
+        self.title = s.opening.to_string();
+        self.view = View::Running;
+        self.spawn(ctx, 1, move |tx| {
+            let _ = tx.send(Message::Progress(0, 1, entry.name.clone()));
+            ctx2.request_repaint();
+            let outcome = extract_one(&archive, &entry, password.as_deref())
+                .and_then(|path| launch_with_system(&path).map(|()| path));
+            let _ = tx.send(match outcome {
+                Ok(path) => Message::Done(fill(
+                    s.opened_with_system,
+                    &[("name", &path.display().to_string())],
+                )),
+                Err(e) => Message::Failed(e.to_string()),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    // Going somewhere new drops whatever was ahead in the history, the way a
+    // browser does. Re-entering the folder already showing is not a move.
+    fn go_to(&mut self, path: String) {
+        if self.history.get(self.here) == Some(&path) {
+            return;
+        }
+        self.history.truncate(self.here + 1);
+        self.history.push(path.clone());
+        self.here = self.history.len() - 1;
+        self.current_dir = path;
+        self.filter.clear();
+    }
+
+    fn can_go_back(&self) -> bool {
+        self.here > 0
+    }
+
+    fn can_go_forward(&self) -> bool {
+        self.here + 1 < self.history.len()
+    }
+
+    fn go_back(&mut self) {
+        if self.can_go_back() {
+            self.here -= 1;
+            self.current_dir = self.history[self.here].clone();
+            self.filter.clear();
+        }
+    }
+
+    fn go_forward(&mut self) {
+        if self.can_go_forward() {
+            self.here += 1;
+            self.current_dir = self.history[self.here].clone();
+            self.filter.clear();
+        }
+    }
+
     fn is_checked(&self, row: &Row) -> bool {
         match row.entry {
             Some(i) => self.checked[i],
@@ -1684,7 +1915,7 @@ impl Arca {
 
         let mut requested: Option<SortColumn> = None;
         let mut toggle: Option<(usize, bool)> = None;
-        let mut enter: Option<String> = None;
+        let mut opened: Option<usize> = None;
         let order = self.order;
         let hint = s.sort_hint;
         let head = |ui: &mut egui::Ui, text: &str, col: SortColumn| -> bool {
@@ -1706,6 +1937,9 @@ impl Arca {
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
+            // Without this the cells only sense hovering, and row.response()
+            // would never report a double click.
+            .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::exact(26.0))
             .column(Column::exact(22.0))
@@ -1782,11 +2016,18 @@ impl Arca {
                         } else {
                             egui::RichText::new(&r.label)
                         };
-                        let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
-                        if r.is_dir && resp.double_clicked() {
-                            enter = Some(r.path.clone());
-                        }
+                        ui.add(egui::Label::new(text).selectable(false));
                     });
+
+                    // The whole row answers, not just the name: aiming at the
+                    // text to open something is a nuisance nobody expects.
+                    let resp = row.response();
+                    if resp.hovered() {
+                        resp.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.double_clicked() {
+                        opened = Some(idx);
+                    }
                 });
             });
 
@@ -1803,9 +2044,14 @@ impl Arca {
                 }
             }
         }
-        if let Some(path) = enter {
-            self.current_dir = path;
-            self.filter.clear();
+        if let Some(index) = opened {
+            let target = &visible[index];
+            if target.is_dir {
+                let path = target.path.clone();
+                self.go_to(path);
+            } else if let Some(i) = target.entry {
+                self.open_file(ui.ctx(), i);
+            }
         }
         if let Some(c) = requested {
             if self.order.0 == c {
@@ -1820,6 +2066,26 @@ impl Arca {
 impl eframe::App for Arca {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive(ctx);
+
+        // The side buttons on a mouse, which winit reports as Back and Forward
+        // and egui hands over as Extra1 and Extra2. Alt+Left and Alt+Right do
+        // the same, for anyone without them.
+        if matches!(self.view, View::Browse) && !self.busy {
+            let (back, forward) = ctx.input(|i| {
+                (
+                    i.pointer.button_pressed(egui::PointerButton::Extra1)
+                        || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)),
+                    i.pointer.button_pressed(egui::PointerButton::Extra2)
+                        || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight)),
+                )
+            });
+            if back {
+                self.go_back();
+            }
+            if forward {
+                self.go_forward();
+            }
+        }
 
         if matches!(self.view, View::Browse) {
             let dropped: Vec<PathBuf> = ctx.input(|i| {

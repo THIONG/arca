@@ -183,6 +183,20 @@ temporary file is left behind.
 In the window it is a button on the toolbar: **Remove password** when the open
 archive is encrypted, **Set password…** when it is not.
 
+## The window
+
+Double clicking a folder goes into it; double clicking a file pulls that one
+entry out to a temporary folder and hands it to whatever the system opens it
+with. The whole row answers, not just the name, and the cursor says so.
+
+The mouse back and forward buttons move through where you have been, and so do
+Alt+Left and Alt+Right. The three arrows on the toolbar do the same thing, plus
+one level up.
+
+Right clicking an archive in the Explorer opens the window with a progress bar
+rather than running the command line with no console: an extraction that fails,
+or that finds a file already there, now says so instead of doing nothing.
+
 ## Interoperability
 
 `interop.sh` checks 34 cases, verifying the SHA-256 of the contents:

@@ -98,7 +98,7 @@ And the checklist:
 
 1. Right click a `.zip` → **Arca** appears with three options
 2. Right click a `.txt` → "Extract here" does **not** appear
-3. "Extract here" unpacks next to the archive, with no console window
+3. "Extract here" unpacks next to the archive, showing a progress window
 4. Select several files → "Compress to .zip" puts them all in
 5. Explorer does not freeze for an instant (requirement R5)
 6. `.\build.ps1 -Remove` leaves everything as it was
@@ -116,9 +116,10 @@ just that "the menu does not show up". `GetState`, the call Explorer makes while
 building the menu, takes **3–23 µs**; the R5 budget is 16 ms.
 
 `Invoke` used to take **5.0 ms**, which is what a `CreateProcess` costs, and
-`launch()` chained them one after another: with four `.zip` files selected that
-was around 20 ms, over R5. `launch()` now leaves the work on its own thread and
-returns in **68 µs**, regardless of how many files are selected.
+`launch()` chained one per file: with four `.zip` files selected that was around
+20 ms, over R5. It now leaves the work on its own thread and starts a single
+process for the whole selection, so the cost no longer depends on how many
+files are selected.
 
 ## Why this DLL does use `unsafe`
 
@@ -126,19 +127,16 @@ It is the only crate in Arca that allows it, and there is no alternative: COM
 requires raw pointers and C calling conventions.
 
 What matters is that **no file is parsed here**. This DLL collects the selected
-paths and launches `arca.exe`; all the work on data of unknown origin happens in
-the child process, in the crates that forbid `unsafe`. Even if this extension had
-a memory bug, a malicious archive could not reach it, because it never opens one.
+paths and launches `arca-gui.exe`; all the work on data of unknown origin
+happens in the child process, in the crates that forbid `unsafe`. Even if this
+extension had a memory bug, a malicious archive could not reach it, because it
+never opens one.
 
 ## What is missing
 
 - **Windows 10 untested**: the `IContextMenu` it needs is written and works in
   the Windows 11 classic menu, which is the same mechanism. But nobody has run it
   on a real Windows 10.
-- **The menu does not use the window**: `arca-gui.exe` has `--extract-here`,
-  `--extract-to-folder`, `--add` and `--add-quick` modes, with a progress bar and
-  the overwrite prompt. The DLL still calls the CLI, so a right-click extraction
-  runs silently and says nothing when it fails.
 - **The labels are English only**: the window follows the system language, this
   does not.
 - **No icons on the classic menu entries**: the package icons are real now, out
@@ -152,7 +150,5 @@ a memory bug, a malicious archive could not reach it, because it never opens one
   subject letter for letter.
 - **Formats**: `is_archive` only offers the extensions the CLI can open (`.zip`,
   `.tar`, `.tar.gz`, `.tgz`). Adding 7z or rar means touching that list and the
-  CLI's `detect()` at the same time, or the menu will offer something that fails
-  silently: the child process runs with no console window.
-- **R5 with large selections**: `launch()` chains one `CreateProcess` per file,
-  about 5 ms each. Worth batching before somebody selects ten.
+  CLI's `detect()` at the same time, or the menu will offer something the
+  window then refuses to open.

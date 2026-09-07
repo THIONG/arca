@@ -114,6 +114,10 @@ pub struct Strings {
     pub password_set: &'static str,
     pub password_removed: &'static str,
     pub changing_password: &'static str,
+    pub back: &'static str,
+    pub forward: &'static str,
+    pub opening: &'static str,
+    pub opened_with_system: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -194,6 +198,10 @@ const EN: Strings = Strings {
     password_set: "{name} is now encrypted with AES-256",
     password_removed: "{name} is no longer encrypted",
     changing_password: "Rewriting the archive",
+    back: "Back",
+    forward: "Forward",
+    opening: "Opening",
+    opened_with_system: "Opened {name}",
 };
 
 const ES: Strings = Strings {
@@ -274,6 +282,10 @@ const ES: Strings = Strings {
     password_set: "{name} queda cifrado con AES-256",
     password_removed: "{name} ya no está cifrado",
     changing_password: "Reescribiendo el archivo",
+    back: "Atrás",
+    forward: "Adelante",
+    opening: "Abriendo",
+    opened_with_system: "Abierto {name}",
 };
 
 pub fn strings(l: Lang) -> &'static Strings {
