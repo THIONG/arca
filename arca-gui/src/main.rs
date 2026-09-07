@@ -1942,15 +1942,21 @@ impl Arca {
             .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::exact(26.0))
-            .column(Column::exact(22.0))
+            // Name first and wide, with the icon inside it. That is where the
+            // Explorer and every archiver put it, and a separate icon column
+            // only pushed the one thing you read away from its picture.
+            .column(Column::initial(300.0).at_least(140.0))
             .column(Column::initial(90.0).at_least(70.0))
             .column(Column::initial(90.0).at_least(70.0))
             .column(Column::initial(80.0).at_least(60.0))
-            .column(Column::initial(60.0).at_least(50.0))
-            .column(Column::remainder().at_least(120.0))
+            .column(Column::remainder().at_least(50.0))
             .header(22.0, |mut h| {
                 h.col(|_| {});
-                h.col(|_| {});
+                h.col(|ui| {
+                    if head(ui, s.col_name, SortColumn::Name) {
+                        requested = Some(SortColumn::Name);
+                    }
+                });
                 h.col(|ui| {
                     if head(ui, s.col_size, SortColumn::Size) {
                         requested = Some(SortColumn::Size);
@@ -1971,11 +1977,6 @@ impl Arca {
                         requested = Some(SortColumn::Saved);
                     }
                 });
-                h.col(|ui| {
-                    if head(ui, s.col_name, SortColumn::Name) {
-                        requested = Some(SortColumn::Name);
-                    }
-                });
             })
             .body(|body| {
                 body.rows(ROW_HEIGHT, visible.len(), |mut row| {
@@ -1989,6 +1990,13 @@ impl Arca {
                     });
                     row.col(|ui| {
                         draw_icon(ui, r.kind);
+                        ui.add_space(4.0);
+                        let text = if r.is_dir {
+                            egui::RichText::new(&r.label).strong()
+                        } else {
+                            egui::RichText::new(&r.label)
+                        };
+                        ui.add(egui::Label::new(text).selectable(false).truncate());
                     });
                     row.col(|ui| {
                         ui.monospace(human(r.size));
@@ -2010,15 +2018,6 @@ impl Arca {
                         let shown = if pct.abs() < 0.5 { 0.0 } else { pct };
                         ui.monospace(format!("{shown:.0}%"));
                     });
-                    row.col(|ui| {
-                        let text = if r.is_dir {
-                            egui::RichText::new(&r.label).strong()
-                        } else {
-                            egui::RichText::new(&r.label)
-                        };
-                        ui.add(egui::Label::new(text).selectable(false));
-                    });
-
                     // The whole row answers, not just the name: aiming at the
                     // text to open something is a nuisance nobody expects.
                     let resp = row.response();

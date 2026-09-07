@@ -17,12 +17,22 @@ arca-zip.workspace = true
 arca-tar.workspace = true
 rayon.workspace = true
 
-# egui en Rust puro. Se descarta wgpu a proposito: glow arranca antes y no
-# arrastra el tiempo de ejecucion de Vulkan/DX12, que para listar un zip no
-# aporta nada. Nada de esto necesita bibliotecas del sistema en ejecucion.
+# egui in pure Rust. wgpu is dropped on purpose: glow starts sooner and does
+# not drag in the Vulkan/DX12 runtime, which adds nothing to listing a zip.
+#
+# default-features = false also dropped accesskit, which is what exposes the
+# window to Narrator and NVDA. Turning it off was not a decision, it was a side
+# effect, and it left the window unreadable to a screen reader.
+#
+# x11 and wayland are already reaching winit through glutin-winit's own
+# defaults, so they are not a fix; naming them here stops that from being an
+# accident that a dependency could take away without anyone noticing.
 eframe = { version = "0.29", default-features = false, features = [
     "glow",
     "default_fonts",
+    "accesskit",
+    "x11",
+    "wayland",
 ] }
 
 # Dialogos de fichero nativos. Es lo unico que toca la plataforma.
