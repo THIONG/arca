@@ -8,13 +8,16 @@ use arca_core::{Codec, Entry, Level};
 use arca_tar::{TarReader, TarWriter};
 use arca_zip::{ZipArchive, ZipWriter};
 use eframe::egui;
+use rayon::prelude::*;
 use egui::ThemePreference;
 use egui_extras::{Column, TableBuilder};
 use i18n::{strings, Lang, Strings};
 use tree::{children_of, draw_icon, entries_under, kind_of, parent_of, Row};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
 
@@ -236,7 +239,10 @@ fn conflict_asker<'a>(
     }
 }
 
-fn free_name(path: &Path) -> PathBuf {
+// `claimed` holds the names this run has already handed out. A .zip decides
+// every destination before writing anything, so `exists()` alone would give two
+// entries with the same name the same free name.
+fn free_name(path: &Path, claimed: &HashSet<PathBuf>) -> PathBuf {
     let dir = path.parent().map(PathBuf::from).unwrap_or_default();
     let stem = path
         .file_stem()
@@ -248,7 +254,7 @@ fn free_name(path: &Path) -> PathBuf {
         .unwrap_or_default();
     for n in 1..10_000u32 {
         let candidate = dir.join(format!("{stem} ({n}){ext}"));
-        if !candidate.exists() {
+        if !candidate.exists() && !claimed.contains(&candidate) {
             return candidate;
         }
     }
@@ -261,6 +267,7 @@ fn dest_path(
     name: &str,
     is_dir: bool,
     ask: &dyn Fn(&Path) -> Answer,
+    claimed: &mut HashSet<PathBuf>,
 ) -> arca_core::Result<Option<PathBuf>> {
     let path = dest.join(arca_core::safe_name(name)?);
     if is_dir {
@@ -270,22 +277,34 @@ fn dest_path(
     if let Some(p) = path.parent() {
         fs::create_dir_all(p)?;
     }
-    if !path.exists() {
+    if !path.exists() && !claimed.contains(&path) {
+        claimed.insert(path.clone());
         return Ok(Some(path));
     }
-    match ask(&path) {
-        Answer::Replace | Answer::ReplaceAll => Ok(Some(path)),
-        Answer::Skip | Answer::SkipAll => Ok(None),
-        Answer::Rename | Answer::RenameAll => Ok(Some(free_name(&path))),
-        Answer::Cancel => Err(arca_core::Error::Format("cancelled".into())),
-    }
+    let chosen = match ask(&path) {
+        Answer::Replace | Answer::ReplaceAll => path,
+        Answer::Skip | Answer::SkipAll => return Ok(None),
+        Answer::Rename | Answer::RenameAll => free_name(&path, claimed),
+        Answer::Cancel => return Err(arca_core::Error::Format("cancelled".into())),
+    };
+    claimed.insert(chosen.clone());
+    Ok(Some(chosen))
 }
 
+// A .zip is random access: the central directory says where every entry starts,
+// so one thread per core can each open the file and decompress a different one.
+// A .tar is a single stream, and a .tar.gz a single gzip stream on top of it, so
+// there is nothing to split there and that branch stays sequential.
+//
+// The directories and the overwrite questions are settled first, in one thread.
+// Asking the window from several threads at once would put the same dialog on
+// screen twice, and racing on which name is free gives a different result every
+// run.
 fn extract(
     archive: &Path,
     dest: &Path,
     wanted: &[bool],
-    notify: &dyn Fn(usize, usize, &str),
+    notify: &(dyn Fn(usize, usize, &str) + Sync),
     ask: &dyn Fn(&Path) -> Answer,
 ) -> arca_core::Result<u64> {
     let Some(format) = detect(archive) else {
@@ -293,22 +312,36 @@ fn extract(
     };
     fs::create_dir_all(dest)?;
     let mut bytes = 0u64;
+    let mut claimed: HashSet<PathBuf> = HashSet::new();
 
     match format {
         Format::Zip => {
-            let mut a = ZipArchive::open(File::open(archive)?)?;
-            let total = a.len();
-            for i in 0..total {
-                let e = a.entries()[i].clone();
-                notify(i, total, &e.name);
+            let a = ZipArchive::open(File::open(archive)?)?;
+            let mut jobs: Vec<(Entry, PathBuf)> = Vec::new();
+            for (i, e) in a.entries().iter().enumerate() {
                 if !wanted.is_empty() && !wanted.get(i).copied().unwrap_or(true) {
                     continue;
                 }
-                if let Some(path) = dest_path(dest, &e.name, e.is_dir, ask)? {
-                    let f = BufWriter::with_capacity(BUF, File::create(&path)?);
-                    bytes += a.extract_to(i, f)?;
+                if let Some(path) = dest_path(dest, &e.name, e.is_dir, ask, &mut claimed)? {
+                    jobs.push((e.clone(), path));
                 }
             }
+            drop(a);
+
+            let total = jobs.len();
+            let done = AtomicUsize::new(0);
+            let written: Vec<u64> = jobs
+                .par_iter()
+                .map(|(e, path)| {
+                    let mut source = BufReader::with_capacity(BUF, File::open(archive)?);
+                    let mut f = BufWriter::with_capacity(BUF, File::create(path)?);
+                    let w = arca_zip::extract_entry(&mut source, e, &mut f)?;
+                    f.flush()?;
+                    notify(done.fetch_add(1, Ordering::Relaxed) + 1, total, &e.name);
+                    Ok(w)
+                })
+                .collect::<arca_core::Result<Vec<u64>>>()?;
+            bytes = written.iter().sum();
             notify(total, total, "");
         }
         _ => {
@@ -322,7 +355,7 @@ fn extract(
                     i += 1;
                     continue;
                 }
-                match dest_path(dest, &e.entry.name, e.entry.is_dir, ask)? {
+                match dest_path(dest, &e.entry.name, e.entry.is_dir, ask, &mut claimed)? {
                     Some(path) => {
                         let mut w = BufWriter::with_capacity(BUF, File::create(&path)?);
                         bytes += r.copy_data(&e, &mut w)?;
@@ -340,7 +373,7 @@ fn extract(
 
 fn test_archive(
     archive: &Path,
-    notify: &dyn Fn(usize, usize, &str),
+    notify: &(dyn Fn(usize, usize, &str) + Sync),
 ) -> arca_core::Result<(usize, Vec<String>)> {
     let Some(format) = detect(archive) else {
         return Err(arca_core::Error::Unsupported("unknown format".into()));
@@ -417,7 +450,7 @@ fn compress(
     format: Format,
     codec: Codec,
     level: Level,
-    notify: &dyn Fn(usize, usize, &str),
+    notify: &(dyn Fn(usize, usize, &str) + Sync),
 ) -> arca_core::Result<(u64, u64)> {
     let files = collect_files(inputs)?;
     let total = files.len();
@@ -552,7 +585,7 @@ fn fill(template: &str, pairs: &[(&str, &str)]) -> String {
 fn run_job_blocking(
     job: Job,
     s: &'static Strings,
-    notify: &dyn Fn(usize, usize, &str),
+    notify: &(dyn Fn(usize, usize, &str) + Sync),
     ask: &dyn Fn(&Path) -> Answer,
 ) -> std::result::Result<String, String> {
     match job {

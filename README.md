@@ -68,6 +68,34 @@ Con Zstandard, Arca es 11,9× más rápido que `zip` y 16,2× más rápido que 7
 y además produce el archivo más pequeño de los cuatro. Con deflate es 4,2× más
 rápido que `zip` a cambio de un 2,5 % de tamaño: el compromiso conocido de zlib-rs.
 
+### Extracción en paralelo
+
+Un `.zip` es de acceso aleatorio: el directorio central dice dónde empieza cada
+entrada, así que un hilo por núcleo puede abrir el archivo y descomprimir una
+entrada distinta. Un `.tar` es un flujo único y ahí no hay nada que repartir.
+
+Medido en Windows 11, 16 hilos, sobre 287 MB en 16 ficheros de texto:
+
+| | Tiempo |
+|---|---|
+| **Arca, 16 hilos** | **0,207 s** |
+| Arca, `-j 1` | 0,686 s |
+| 7-Zip | 1,020 s |
+
+```
+arca create big.zip big
+arca extract big.zip -o out -j 1
+arca extract big.zip -o out
+7z x -o"out" big7z.zip
+```
+Mejor de 3, borrando `out` antes de cada pasada.
+
+Sobre muchos ficheros pequeños el reparto no cambia nada, y conviene decir por
+qué: extraer 5358 ficheros de código fuente tarda 4,5 s, pero descomprimir esos
+mismos 55 MB tarda 0,128 s (`arca test bench.zip`). El 97 % del tiempo se va en
+crear ficheros en NTFS, no en descomprimir. 7-Zip tarda lo mismo (4,6 s) porque
+choca contra el mismo muro.
+
 **Aviso sobre Zstandard en ZIP:** es el método 93, registrado en la especificación
 pero que `unzip` clásico todavía no lee. Por eso `-c auto` usa deflate en `.zip`:
 un zip existe para que lo abra cualquiera. Zstandard se pide a mano, y será el

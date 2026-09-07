@@ -151,69 +151,80 @@ impl<R: Read + Seek> ZipArchive<R> {
             .get(idx)
             .ok_or_else(|| Error::Format(format!("no such entry: {idx}")))?
             .clone();
+        extract_entry(&mut self.source, &e, dest)
+    }
+}
 
-        self.source.seek(SeekFrom::Start(e.offset))?;
-        let mut lfh = [0u8; LFH_FIXED];
-        self.source.read_exact(&mut lfh)?;
-        let mut c = Cursor::new(&lfh);
-        if c.u32le("local header signature")? != SIG_LFH {
-            return Err(Error::Format(format!(
-                "'{}': no local header at offset {}",
-                e.name, e.offset
-            )));
+// Takes its own reader instead of borrowing the archive, so several threads
+// can each open the file and pull a different entry at the same time. A ZIP is
+// random access through its central directory, which is what makes that
+// possible at all.
+pub fn extract_entry<R: Read + Seek, W: Write>(
+    source: &mut R,
+    e: &Entry,
+    dest: W,
+) -> Result<u64> {
+    source.seek(SeekFrom::Start(e.offset))?;
+    let mut lfh = [0u8; LFH_FIXED];
+    source.read_exact(&mut lfh)?;
+    let mut c = Cursor::new(&lfh);
+    if c.u32le("local header signature")? != SIG_LFH {
+        return Err(Error::Format(format!(
+            "'{}': no local header at offset {}",
+            e.name, e.offset
+        )));
+    }
+    c.skip(2, "version")?;
+    let flags = c.u16le("flags")?;
+    if flags & 1 != 0 {
+        return Err(Error::Unsupported(format!("'{}' is encrypted", e.name)));
+    }
+    c.skip(18, "rest of the local header")?;
+    let n_len = c.u16le("name length")? as u64;
+    let x_len = c.u16le("extra field length")? as u64;
+
+    let data_start = e.offset + LFH_FIXED as u64 + n_len + x_len;
+    source.seek(SeekFrom::Start(data_start))?;
+    let bounded = source.take(e.compressed_size);
+
+    let mut cw = CrcWriter::new(dest);
+    match e.method {
+        Method::Store => {
+            let mut a = bounded;
+            io::copy(&mut a, &mut cw)?;
         }
-        c.skip(2, "version")?;
-        let flags = c.u16le("flags")?;
-        if flags & 1 != 0 {
-            return Err(Error::Unsupported(format!("'{}' is encrypted", e.name)));
+        Method::Deflate => {
+            let mut dec = flate2::read::DeflateDecoder::new(bounded);
+            io::copy(&mut dec, &mut cw)?;
         }
-        c.skip(18, "rest of the local header")?;
-        let n_len = c.u16le("name length")? as u64;
-        let x_len = c.u16le("extra field length")? as u64;
-
-        let inicio_datos = e.offset + LFH_FIXED as u64 + n_len + x_len;
-        self.source.seek(SeekFrom::Start(inicio_datos))?;
-        let acotado = (&mut self.source).take(e.compressed_size);
-
-        let mut cw = CrcWriter::new(dest);
-        match e.method {
-            Method::Store => {
-                let mut a = acotado;
-                io::copy(&mut a, &mut cw)?;
-            }
-            Method::Deflate => {
-                let mut dec = flate2::read::DeflateDecoder::new(acotado);
+        Method::Zstd => {
+            #[cfg(feature = "codecs-native")]
+            {
+                let mut dec = zstd::stream::read::Decoder::new(bounded)
+                    .map_err(Error::Io)?;
                 io::copy(&mut dec, &mut cw)?;
             }
-            Method::Zstd => {
-                #[cfg(feature = "codecs-native")]
-                {
-                    let mut dec = zstd::stream::read::Decoder::new(acotado)
-                        .map_err(Error::Io)?;
-                    io::copy(&mut dec, &mut cw)?;
-                }
-                #[cfg(not(feature = "codecs-native"))]
-                {
-                    let _ = acotado;
-                    return Err(Error::Unsupported(
-                        "'{}' uses Zstandard and this binary was built without it".into(),
-                    ));
-                }
+            #[cfg(not(feature = "codecs-native"))]
+            {
+                let _ = bounded;
+                return Err(Error::Unsupported(
+                    "'{}' uses Zstandard and this binary was built without it".into(),
+                ));
             }
         }
-        let (_, crc_val, written) = cw.finalize();
-
-        if crc_val != e.crc32 {
-            return Err(Error::Integrity { name: e.name.clone(), expected: e.crc32, found: crc_val });
-        }
-        if written != e.size {
-            return Err(Error::Format(format!(
-                "'{}': expected {} bytes but produced {written}",
-                e.name, e.size
-            )));
-        }
-        Ok(written)
     }
+    let (_, crc_val, written) = cw.finalize();
+
+    if crc_val != e.crc32 {
+        return Err(Error::Integrity { name: e.name.clone(), expected: e.crc32, found: crc_val });
+    }
+    if written != e.size {
+        return Err(Error::Format(format!(
+            "'{}': expected {} bytes but produced {written}",
+            e.name, e.size
+        )));
+    }
+    Ok(written)
 }
 
 fn find_backwards(buf: &[u8], signature: u32) -> Option<usize> {
@@ -732,6 +743,49 @@ mod tests {
         let mut a = ZipArchive::open(IoCursor::new(buf)).unwrap();
         let r = a.extract_to(0, &mut Vec::new());
         assert!(matches!(r, Err(Error::Integrity { .. })), "{r:?}");
+    }
+
+    // extract_entry takes the entry and the reader separately so several
+    // threads can pull from the same archive at once. That also means it can be
+    // handed an entry that does not describe what is at that offset.
+    #[test]
+    fn extract_entry_with_an_entry_that_lies_does_not_panic() {
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        w.add("a.txt", &b"content"[..], Codec::Store, Level::Store, None).unwrap();
+        let buf = w.finish().unwrap().into_inner();
+        let real = ZipArchive::open(IoCursor::new(buf.clone())).unwrap().entries()[0].clone();
+
+        for seed in 0u64..500 {
+            let mut e = real.clone();
+            e.offset = seed.wrapping_mul(2_654_435_761) % (buf.len() as u64 + 64);
+            e.compressed_size = seed.wrapping_mul(97) % 4096;
+            e.size = seed.wrapping_mul(31) % 4096;
+            e.crc32 = seed as u32;
+            let mut source = IoCursor::new(buf.clone());
+            let r = extract_entry(&mut source, &e, &mut Vec::new());
+            assert!(r.is_err() || e.offset == real.offset, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn extract_entry_pulls_the_same_bytes_as_the_archive() {
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        for i in 0..8 {
+            let body = format!("entry number {i} ").repeat(40);
+            w.add(&format!("f{i}.txt"), body.as_bytes(), Codec::Deflate, Level::Normal, None)
+                .unwrap();
+        }
+        let buf = w.finish().unwrap().into_inner();
+        let mut a = ZipArchive::open(IoCursor::new(buf.clone())).unwrap();
+        let entries = a.entries().to_vec();
+        for (i, e) in entries.iter().enumerate() {
+            let mut through_archive = Vec::new();
+            a.extract_to(i, &mut through_archive).unwrap();
+            let mut alone = Vec::new();
+            let mut source = IoCursor::new(buf.clone());
+            extract_entry(&mut source, e, &mut alone).unwrap();
+            assert_eq!(through_archive, alone, "entry {i}");
+        }
     }
 
     #[test]

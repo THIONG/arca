@@ -15,6 +15,7 @@ path = "src/main.rs"
 arca-core.workspace = true
 arca-zip.workspace = true
 arca-tar.workspace = true
+rayon.workspace = true
 
 # egui en Rust puro. Se descarta wgpu a proposito: glow arranca antes y no
 # arrastra el tiempo de ejecucion de Vulkan/DX12, que para listar un zip no

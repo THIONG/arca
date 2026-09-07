@@ -3,6 +3,7 @@ use arca_tar::{TarReader, TarWriter};
 use arca_zip::{compress_block, ZipArchive, ZipWriter};
 use rayon::prelude::*;
 use clap::{Parser, Subcommand, ValueEnum};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -58,6 +59,9 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = OnConflict::Overwrite,
               help = "What to do when the file is already in the destination")]
         on_conflict: OnConflict,
+        #[arg(short = 'j', long, default_value_t = 0,
+              help = "Threads to use. 0 means every core. Only .zip can go parallel")]
+        threads: usize,
     },
     #[command(visible_alias = "t", about = "Check integrity without writing to disk")]
     Test {
@@ -154,7 +158,8 @@ fn run(cli: Cli) -> Result<()> {
             archive,
             dest,
             on_conflict,
-        } => extract(&archive, &dest, on_conflict),
+            threads,
+        } => extract(&archive, &dest, on_conflict, threads),
         Cmd::Test { archive } => test_archive(&archive),
         Cmd::Bench { archive } => bench(&archive),
     }
@@ -391,58 +396,94 @@ fn list(archive: &Path, time: bool) -> Result<()> {
     Ok(())
 }
 
-fn free_name(path: &Path) -> PathBuf {
+// `claimed` holds the names this run has already handed out. Extraction decides
+// every destination before it writes anything, so `exists()` alone would give
+// two entries with the same name the same free name.
+fn free_name(path: &Path, claimed: &HashSet<PathBuf>) -> PathBuf {
     let dir = path.parent().map(PathBuf::from).unwrap_or_default();
     let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let ext = path.extension().map(|s| format!(".{}", s.to_string_lossy())).unwrap_or_default();
     for n in 1..10_000u32 {
         let candidate = dir.join(format!("{stem} ({n}){ext}"));
-        if !candidate.exists() {
+        if !candidate.exists() && !claimed.contains(&candidate) {
             return candidate;
         }
     }
     path.to_path_buf()
 }
 
-fn resolve_conflict(path: PathBuf, policy: OnConflict) -> Option<PathBuf> {
-    if !path.exists() {
-        return Some(path);
-    }
-    match policy {
-        OnConflict::Overwrite => Some(path),
-        OnConflict::Skip => None,
-        OnConflict::Rename => Some(free_name(&path)),
-    }
+fn resolve_conflict(
+    path: PathBuf,
+    policy: OnConflict,
+    claimed: &mut HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    let taken = path.exists() || claimed.contains(&path);
+    let chosen = if !taken {
+        path
+    } else {
+        match policy {
+            OnConflict::Overwrite => path,
+            OnConflict::Skip => return None,
+            OnConflict::Rename => free_name(&path, claimed),
+        }
+    };
+    claimed.insert(chosen.clone());
+    Some(chosen)
 }
 
-fn extract(archive: &Path, dest: &Path, policy: OnConflict) -> Result<()> {
+// A .zip is random access: the central directory says where every entry starts,
+// so one thread per core can each open the file and decompress a different one.
+// A .tar is a single stream, and a .tar.gz a single gzip stream on top of it, so
+// there is nothing to split there and that branch stays sequential.
+fn extract(archive: &Path, dest: &Path, policy: OnConflict, requested_threads: usize) -> Result<()> {
     let format_kind = detect(archive)?;
     fs::create_dir_all(dest)?;
     let t0 = Instant::now();
     let mut n = 0u64;
     let mut bytes = 0u64;
+    let threads = resolve_threads(requested_threads);
 
     match format_kind {
         Format::Zip => {
-            let mut a = ZipArchive::open(File::open(archive)?)?;
-            let total = a.len();
-            for i in 0..total {
-                let e = a.entries()[i].clone();
+            let a = ZipArchive::open(File::open(archive)?)?;
+            // Directories and conflicts are settled here, single threaded: two
+            // threads racing on create_dir_all or on picking a free name would
+            // give a result that depends on who won.
+            let mut claimed: HashSet<PathBuf> = HashSet::new();
+            let mut jobs: Vec<(arca_core::Entry, PathBuf)> = Vec::new();
+            for e in a.entries() {
+                let path = dest.join(arca_core::safe_name(&e.name)?);
                 if e.is_dir {
-                    fs::create_dir_all(dest.join(arca_core::safe_name(&e.name)?))?;
+                    fs::create_dir_all(&path)?;
                     continue;
                 }
-                let path = dest.join(arca_core::safe_name(&e.name)?);
                 if let Some(p) = path.parent() {
                     fs::create_dir_all(p)?;
                 }
-                let Some(path) = resolve_conflict(path, policy) else {
+                let Some(path) = resolve_conflict(path, policy, &mut claimed) else {
                     continue;
                 };
-                let f = BufWriter::with_capacity(BUF, File::create(&path)?);
-                bytes += a.extract_to(i, f)?;
-                n += 1;
+                jobs.push((e.clone(), path));
             }
+            drop(a);
+
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| Error::Format(format!("cannot start the thread pool: {e}")))?;
+            let written: Vec<u64> = pool.install(|| {
+                jobs.par_iter()
+                    .map(|(e, path)| {
+                        let mut source = BufReader::with_capacity(BUF, File::open(archive)?);
+                        let mut f = BufWriter::with_capacity(BUF, File::create(path)?);
+                        let w = arca_zip::extract_entry(&mut source, e, &mut f)?;
+                        f.flush()?;
+                        Ok(w)
+                    })
+                    .collect::<Result<Vec<u64>>>()
+            })?;
+            n = written.len() as u64;
+            bytes = written.iter().sum();
         }
         Format::Tar | Format::TarGz => {
             let f = BufReader::with_capacity(BUF, File::open(archive)?);
@@ -452,6 +493,7 @@ fn extract(archive: &Path, dest: &Path, policy: OnConflict) -> Result<()> {
                 Box::new(f)
             };
             let mut r = TarReader::new(source);
+            let mut claimed: HashSet<PathBuf> = HashSet::new();
             while let Some(e) = r.next_entry()? {
                 let path = dest.join(arca_core::safe_name(&e.entry.name)?);
                 if e.entry.is_dir {
@@ -462,7 +504,7 @@ fn extract(archive: &Path, dest: &Path, policy: OnConflict) -> Result<()> {
                 if let Some(p) = path.parent() {
                     fs::create_dir_all(p)?;
                 }
-                let Some(path) = resolve_conflict(path, policy) else {
+                let Some(path) = resolve_conflict(path, policy, &mut claimed) else {
                     r.skip_data(&e)?;
                     continue;
                 };
