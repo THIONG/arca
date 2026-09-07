@@ -2702,15 +2702,32 @@ impl Arca {
         // Drawn from the row the drag began on rather than from the point the
         // button went down, so that it stays put against the rows when the list
         // scrolls under it.
-        let edge = row_rects
-            .iter()
-            .find(|(i, _)| *i == anchor)
-            .map(|(_, r)| if here.y < r.top() { r.bottom() } else { r.top() })
-            .unwrap_or(if here.y < viewport.center().y {
-                viewport.bottom()
-            } else {
-                viewport.top()
-            });
+        let edge = match row_rects.iter().find(|(i, _)| *i == anchor) {
+            // Its far side, so that the row the drag began on falls inside the
+            // band whichever way the drag then went.
+            Some((_, r)) => {
+                if here.y < r.top() {
+                    r.bottom()
+                } else {
+                    r.top()
+                }
+            }
+            // Scrolled out of sight, which happens as soon as a drag has run
+            // far enough for the list to follow it. Which edge to start from is
+            // decided by where that row went, and that is its number against
+            // the ones still on screen. Asking where the pointer is instead
+            // said nothing about the anchor: after dragging to the bottom and
+            // turning back up, the band was drawn below the pointer, growing
+            // away from everything it had picked.
+            None => {
+                let first = row_rects.first().map(|(i, _)| *i).unwrap_or(anchor);
+                if anchor < first {
+                    viewport.top()
+                } else {
+                    viewport.bottom()
+                }
+            }
+        };
         let band = egui::Rect::from_two_pos(egui::pos2(start.x, edge), here);
         let fill = ui.visuals().selection.bg_fill.linear_multiply(0.25);
         ui.painter().rect(
