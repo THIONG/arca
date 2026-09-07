@@ -2927,6 +2927,16 @@ impl Arca {
         self.here = self.history.len() - 1;
         self.current_dir = path;
         self.filter.clear();
+        self.clear_picked();
+    }
+
+    // Every folder starts with nothing picked, the way the Explorer does.
+    // A folder is picked here by ticking every entry underneath it, which is
+    // what lets one be extracted whole, so clicking a folder and walking into
+    // it used to arrive with all of its contents already ticked.
+    fn clear_picked(&mut self) {
+        self.checked.iter_mut().for_each(|c| *c = false);
+        self.cursor = None;
     }
 
     fn can_go_back(&self) -> bool {
@@ -2942,6 +2952,7 @@ impl Arca {
             self.here -= 1;
             self.current_dir = self.history[self.here].clone();
             self.filter.clear();
+            self.clear_picked();
         }
     }
 
@@ -2950,6 +2961,7 @@ impl Arca {
             self.here += 1;
             self.current_dir = self.history[self.here].clone();
             self.filter.clear();
+            self.clear_picked();
         }
     }
 
@@ -3029,7 +3041,18 @@ impl Arca {
         let mut icons = std::mem::take(&mut self.icons);
         let order = self.order;
         let hint = s.sort_hint;
-        let head = |ui: &mut egui::Ui, text: &str, col: SortColumn| -> bool {
+        // The whole header cell answers, not the four letters of the name:
+        // aiming at the text to sort by a column is a nuisance, and the cell is
+        // what looks like the button.
+        //
+        // It cannot use the response the table hands back for the cell. The
+        // header row is built with row index 0, the same number the first row
+        // of the body carries, and the cell id is made out of that number and
+        // the column, so the two rows end up sharing ids and each one is handed
+        // the other's clicks: pressing a cell of the first row sorted by that
+        // column, and pressing a column name picked the first row. So the
+        // header asks for an interaction of its own, under an id of its own.
+        let head = |ui: &mut egui::Ui, text: &str, col: SortColumn| -> egui::Response {
             let arrow = if order.0 != col {
                 ""
             } else if order.1 {
@@ -3037,12 +3060,13 @@ impl Arca {
             } else {
                 " v"
             };
+            let cell = ui.max_rect();
             ui.add(
                 egui::Label::new(egui::RichText::new(format!("{text}{arrow}")).strong())
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_text(hint)
-            .clicked()
+                    .selectable(false),
+            );
+            ui.interact(cell, egui::Id::new(("arca-head", text)), egui::Sense::click())
+                .on_hover_text(hint)
         };
 
         let mut builder = TableBuilder::new(ui)
@@ -3087,22 +3111,38 @@ impl Arca {
                         }
                     }
                 };
-                h.col(|_| {}).1.context_menu(|ui| menu(ui));
+                // The tick column has no name to sort by, but it is still part
+                // of the header, so right clicking it offers the same list. Its
+                // own id for the same reason as the rest.
+                let mut corner = None;
                 h.col(|ui| {
-                    if head(ui, s.col_name, SortColumn::Name) {
+                    let cell = ui.max_rect();
+                    corner = Some(ui.interact(
+                        cell,
+                        egui::Id::new("arca-head-corner"),
+                        egui::Sense::click(),
+                    ));
+                });
+                if let Some(r) = corner {
+                    r.context_menu(|ui| menu(ui));
+                }
+                let mut resp = None;
+                h.col(|ui| resp = Some(head(ui, s.col_name, SortColumn::Name)));
+                if let Some(r) = resp {
+                    if r.clicked() {
                         requested = Some(SortColumn::Name);
                     }
-                })
-                .1
-                .context_menu(|ui| menu(ui));
+                    r.context_menu(|ui| menu(ui));
+                }
                 for which in &shown {
-                    h.col(|ui| {
-                        if head(ui, Columns::label(*which, s), *which) {
+                    let mut resp = None;
+                    h.col(|ui| resp = Some(head(ui, Columns::label(*which, s), *which)));
+                    if let Some(r) = resp {
+                        if r.clicked() {
                             requested = Some(*which);
                         }
-                    })
-                    .1
-                    .context_menu(|ui| menu(ui));
+                        r.context_menu(|ui| menu(ui));
+                    }
                 }
             })
             .body(|body| {
