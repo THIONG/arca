@@ -1274,6 +1274,9 @@ struct Arca {
     // list to when it runs off an edge. Row numbers rather than places on
     // screen, because the list moves while the drag is happening.
     band_anchor: Option<usize>,
+    // Set when a press lands on a row that is already picked: the gesture is
+    // still ambiguous until it has moved, and this is what it turns into.
+    drag_ready: Option<usize>,
     band_scroll: Option<f32>,
     // The last row a left click landed on, and when. What tells a second click
     // on the same row from the first one of a new pair.
@@ -1355,6 +1358,7 @@ impl Arca {
             cut_names: HashSet::new(),
             confirm_drop: None,
             band_anchor: None,
+            drag_ready: None,
             band_scroll: None,
             last_click: None,
             cut_armed: None,
@@ -1999,6 +2003,66 @@ impl Arca {
             },
         );
     }
+
+    // What is picked, named the way it should land where it is dropped: the
+    // folder on screen is the base, so dragging a folder out puts that folder
+    // down rather than scattering what was inside it.
+    fn dragged_files(&self) -> Vec<(Entry, String)> {
+        let base = &self.current_dir;
+        self.entries
+            .iter()
+            .zip(&self.checked)
+            .filter(|(e, &on)| on && !e.is_dir)
+            .map(|(e, _)| {
+                let full = e.name.replace('\\', "/");
+                let rel = full.strip_prefix(base.as_str()).unwrap_or(&full);
+                (e.clone(), rel.replace('/', "\\"))
+            })
+            .filter(|(_, rel)| !rel.is_empty())
+            .collect()
+    }
+
+    // Dragging the selection out of the window. Blocks until it has been
+    // dropped or abandoned, because that is what `DoDragDrop` does: the window
+    // stops repainting for as long as the drag lasts, which nobody sees because
+    // the pointer is somewhere else by then.
+    //
+    // Nothing is extracted here. The shell is handed a list of names and sizes
+    // and asks for one file at a time while it is dropping, so a drag that is
+    // thought better of costs nothing, and a drag of six gigabytes starts as
+    // fast as a drag of one file.
+    #[cfg(windows)]
+    fn drag_out(&mut self, ctx: &egui::Context) {
+        let Some(archive) = self.archive.clone() else {
+            return;
+        };
+        let picked = self.dragged_files();
+        if picked.is_empty() {
+            return;
+        }
+        let items: Vec<arca_drag::Item> = picked
+            .iter()
+            .map(|(e, name)| arca_drag::Item {
+                name: name.clone(),
+                size: e.size,
+                mtime: e.mtime,
+            })
+            .collect();
+        let password = self.archive_password.clone();
+        let entries: Vec<Entry> = picked.into_iter().map(|(e, _)| e).collect();
+        let deliver = Box::new(move |i: usize| {
+            entries
+                .get(i)
+                .and_then(|e| extract_one(&archive, e, password.as_deref()).ok())
+        });
+        // Copy only. Moving would mean taking the entries out of the archive,
+        // and the one gesture that does that already asks first.
+        let _ = arca_drag::drag(items, deliver, false);
+        ctx.request_repaint();
+    }
+
+    #[cfg(not(windows))]
+    fn drag_out(&mut self, _ctx: &egui::Context) {}
 
     // Ctrl+V: whatever files the shell is holding, into the folder on screen.
     fn paste_from_clipboard(&mut self, ctx: &egui::Context) {
@@ -2956,6 +3020,14 @@ impl Arca {
             let Some(anchor) = row_at(row_rects, p.y, visible.len()) else {
                 return;
             };
+            // Pressing on a row that is already picked and pulling is how you
+            // take the selection somewhere else; pressing anywhere else and
+            // pulling draws a new one. That is the rule in the Explorer, and it
+            // is the only one that lets both gestures share a button. Ctrl and
+            // Shift are for adding to a selection, never for carrying it.
+            let shift = ui.input(|i| i.modifiers.shift);
+            let picked = anchor < visible.len() && self.is_checked(&visible[anchor]);
+            self.drag_ready = (picked && !ctrl && !shift).then_some(anchor);
             self.band = origin;
             self.band_anchor = Some(anchor);
             self.band_base = if ctrl {
@@ -2975,6 +3047,17 @@ impl Arca {
         // band that appeared first would flash over the rows for the pixel or
         // two between the two thresholds every time a column was resized.
         if (here - start).length() < 10.0 {
+            return;
+        }
+
+        // Far enough to be a gesture, and it began on something picked: the
+        // selection is being carried out of the window, not redrawn.
+        if self.drag_ready.take().is_some() {
+            self.band = None;
+            self.band_anchor = None;
+            self.band_scroll = None;
+            let ctx = ui.ctx().clone();
+            self.drag_out(&ctx);
             return;
         }
 

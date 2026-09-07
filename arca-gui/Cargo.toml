@@ -51,3 +51,8 @@ clipboard-win = "5"
 
 [target."cfg(windows)".build-dependencies]
 winresource = "0.1"
+
+# Arrastrar entradas fuera de la ventana. Solo-Windows, y en su propio crate
+# porque es COM y unsafe, que aqui no se admite.
+[target."cfg(windows)".dependencies.arca-drag]
+path = "../arca-drag"
