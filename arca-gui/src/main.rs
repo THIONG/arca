@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod clipboard;
+mod glyphs;
 mod i18n;
 mod theme;
 mod tree;
@@ -458,6 +459,67 @@ fn arrow_button(ui: &mut egui::Ui, dir: Arrow, enabled: bool, tip: &str) -> egui
 
     if enabled {
         response.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+// A button with a picture on it, and a word next to the picture when the button
+// is one of the ones worth naming. Written out rather than built from
+// `egui::Button` because that one only takes an image for its icon, and these
+// are painted.
+fn tool_button(
+    ui: &mut egui::Ui,
+    glyph: glyphs::Glyph,
+    label: &str,
+    enabled: bool,
+    tip: &str,
+) -> egui::Response {
+    let gap = 6.0;
+    let pad = ui.spacing().button_padding;
+    let galley = (!label.is_empty()).then(|| {
+        ui.painter().layout_no_wrap(
+            label.to_owned(),
+            egui::TextStyle::Button.resolve(ui.style()),
+            egui::Color32::PLACEHOLDER,
+        )
+    });
+    let text_w = galley.as_ref().map_or(0.0, |g| g.size().x + gap);
+    let size = egui::vec2(
+        glyphs::SIZE + text_w + pad.x * 2.0,
+        (glyphs::SIZE + pad.y * 2.0).max(ui.spacing().interact_size.y),
+    );
+    let (rect, response) = ui.allocate_exact_size(
+        size,
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let (fill, stroke, fg) = if enabled {
+            (visuals.weak_bg_fill, visuals.bg_stroke, visuals.fg_stroke.color)
+        } else {
+            let off = ui.visuals().widgets.noninteractive;
+            (off.weak_bg_fill, off.bg_stroke, ui.visuals().weak_text_color())
+        };
+        ui.painter().rect(rect, visuals.rounding, fill, stroke);
+        let icon = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + pad.x, rect.center().y - glyphs::SIZE / 2.0),
+            egui::Vec2::splat(glyphs::SIZE),
+        );
+        glyphs::draw(ui.painter(), icon, glyph, fg);
+        if let Some(g) = galley {
+            let at = egui::pos2(icon.right() + gap, rect.center().y - g.size().y / 2.0);
+            ui.painter().galley(at, g, fg);
+        }
+    }
+
+    if enabled && !tip.is_empty() {
+        response.on_hover_text(tip)
     } else {
         response
     }
@@ -1293,6 +1355,7 @@ struct Arca {
     // Whether the window had the keyboard last frame. Getting it back is when a
     // paste elsewhere has had its chance to happen.
     was_focused: bool,
+    show_shortcuts: bool,
     // Set for work that says nothing while it runs. Copying to the clipboard is
     // the only such job: it is over before a bar has finished appearing, and a
     // bar that flashes past says less than nothing.
@@ -1352,6 +1415,7 @@ impl Arca {
             cut_armed: None,
             cut_pending: None,
             was_focused: true,
+            show_shortcuts: false,
             quiet: false,
         }
     }
@@ -1577,6 +1641,15 @@ impl Arca {
                         if let Some(f) = detect(&path) {
                             self.format = f;
                         }
+                        // The name of what is open goes where every other
+                        // program puts it, which frees a whole row above the
+                        // list for nothing at all.
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                            "{} — Arca",
+                            path.file_name()
+                                .map(|x| x.to_string_lossy().to_string())
+                                .unwrap_or_default()
+                        )));
                         self.archive = Some(path);
                         self.history = vec![String::new()];
                         self.here = 0;
@@ -2486,16 +2559,22 @@ impl Arca {
         }
     }
 
+    // Two rows: what can be done, and where you are. It used to be four, with
+    // the archive's name on one of its own and the two ticking buttons on
+    // another, which is a lot of furniture above a list. The name of the file
+    // moved to the title bar, where the name of the open document goes in every
+    // other program, and the ticking buttons in beside the counts they act on.
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let s = self.s();
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            // The password window is not modal on its own, so the toolbar behind it
-            // has to be shut off: a click there would run with a password that
-            // has not been given yet.
+            // The password window is not modal on its own, so the toolbar behind
+            // it has to be shut off: a click there would run with a password
+            // that has not been given yet.
             let idle = !self.busy && self.waiting_on_password.is_none();
+            let has = self.archive.is_some() && idle;
             ui.add_enabled_ui(idle, |ui| {
-                if ui.button(s.open).clicked() {
+                if tool_button(ui, glyphs::Glyph::Open, s.open, true, "Ctrl+O").clicked() {
                     if let Some(p) = rfd::FileDialog::new()
                         .add_filter("Archives", &["zip", "tar", "gz", "tgz"])
                         .pick_file()
@@ -2503,7 +2582,7 @@ impl Arca {
                         self.open(ctx, p);
                     }
                 }
-                if ui.button(s.compress).clicked() {
+                if tool_button(ui, glyphs::Glyph::Compress, s.compress, true, "Ctrl+N").clicked() {
                     if let Some(files) = rfd::FileDialog::new().pick_files() {
                         if !files.is_empty() {
                             self.output_name = quick_output(&files, self.format)
@@ -2515,65 +2594,87 @@ impl Arca {
                         }
                     }
                 }
-                ui.separator();
-                let has = self.archive.is_some();
-                if ui
-                    .add_enabled(has, egui::Button::new(s.extract_all))
-                    .clicked()
-                {
-                    self.ask_extract(ctx, false);
-                }
-                let n = self.checked.iter().filter(|b| **b).count();
-                if ui
-                    .add_enabled(has && n > 0, egui::Button::new(s.extract_selected))
-                    .clicked()
-                {
-                    self.ask_extract(ctx, true);
-                }
-                // Only .zip has anywhere to keep a password.
-                if has && self.format == Format::Zip {
-                    ui.separator();
-                    let encrypted = self.entries.iter().any(|e| e.encrypted);
-                    let archive = self.archive.clone().unwrap_or_default();
-                    if encrypted {
-                        if ui.button(s.remove_password).clicked() {
-                            let job = Job::Password {
-                                archive,
-                                current: self.archive_password.clone(),
-                                new: None,
-                            };
-                            // Cancelling the question when the archive opened
-                            // leaves us without it, so ask again instead of
-                            // failing halfway through the rewrite.
-                            match self.archive_password {
-                                Some(_) => self.run_job(ctx, job),
-                                None => {
-                                    self.password_input.clear();
-                                    self.waiting_on_password =
-                                        Some(Pending::CurrentPassword(Box::new(job)));
-                                }
-                            }
-                        }
-                    } else if ui.button(s.set_password).clicked() {
-                        self.password_input.clear();
-                        self.waiting_on_password =
-                            Some(Pending::NewPassword(Box::new(Job::Password {
-                                archive,
-                                current: None,
-                                new: None,
-                            })));
-                    }
-                }
             });
+            ui.separator();
+            if tool_button(ui, glyphs::Glyph::ExtractAll, s.extract_all, has, "Ctrl+E").clicked() {
+                self.ask_extract(ctx, false);
+            }
+            let n = self.checked.iter().filter(|b| **b).count();
+            if tool_button(
+                ui,
+                glyphs::Glyph::ExtractPicked,
+                s.extract_selected,
+                has && n > 0,
+                "",
+            )
+            .clicked()
+            {
+                self.ask_extract(ctx, true);
+            }
+            ui.separator();
+            if tool_button(ui, glyphs::Glyph::Test, "", has, s.test_word).clicked() {
+                if let Some(archive) = self.archive.clone() {
+                    self.run_job(ctx, Job::Test(archive));
+                }
+            }
+            // Only a .zip has anywhere to keep a password.
+            let zip = has && self.format == Format::Zip;
+            let encrypted = self.entries.iter().any(|e| e.encrypted);
+            let glyph = if encrypted {
+                glyphs::Glyph::Unlocked
+            } else {
+                glyphs::Glyph::Locked
+            };
+            let tip = if encrypted {
+                s.remove_password
+            } else {
+                s.set_password
+            };
+            if tool_button(ui, glyph, "", zip, tip).clicked() {
+                let archive = self.archive.clone().unwrap_or_default();
+                if encrypted {
+                    let job = Job::Password {
+                        archive,
+                        current: self.archive_password.clone(),
+                        new: None,
+                    };
+                    // Cancelling the question when the archive opened leaves us
+                    // without it, so ask again instead of failing halfway
+                    // through the rewrite.
+                    match self.archive_password {
+                        Some(_) => self.run_job(ctx, job),
+                        None => {
+                            self.password_input.clear();
+                            self.waiting_on_password =
+                                Some(Pending::CurrentPassword(Box::new(job)));
+                        }
+                    }
+                } else {
+                    self.password_input.clear();
+                    self.waiting_on_password =
+                        Some(Pending::NewPassword(Box::new(Job::Password {
+                            archive,
+                            current: None,
+                            new: None,
+                        })));
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if tool_button(ui, glyphs::Glyph::Settings, "", idle, s.settings).clicked() {
+                    self.show_settings = true;
+                }
+                if tool_button(ui, glyphs::Glyph::Help, "", true, s.shortcuts_title).clicked() {
+                    self.show_shortcuts = true;
+                }
                 ui.add(
                     egui::TextEdit::singleline(&mut self.filter)
                         .id(egui::Id::new("filter"))
                         .hint_text(s.filter_hint)
-                        .desired_width(170.0),
+                        .desired_width(180.0),
                 );
             });
         });
+
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let at_root = self.current_dir.is_empty();
@@ -2595,12 +2696,118 @@ impl Arca {
             };
             ui.label(egui::RichText::new(here).monospace());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(s.settings).clicked() {
-                    self.show_settings = true;
+                if self.archive.is_some() {
+                    let n = self.checked.iter().filter(|b| **b).count();
+                    let shown = self.visible_rows().len();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{shown} {} {} · {n} {}",
+                            s.visible_of,
+                            self.entries.len(),
+                            s.checked
+                        ))
+                        .weak(),
+                    );
+                    ui.separator();
+                    if tool_button(ui, glyphs::Glyph::UncheckAll, "", true, s.uncheck_all).clicked()
+                    {
+                        self.checked.iter_mut().for_each(|c| *c = false);
+                    }
+                    if tool_button(ui, glyphs::Glyph::CheckAll, "", true, s.check_all).clicked() {
+                        let rows = self.visible_rows();
+                        for r in &rows {
+                            self.set_checked(r, true);
+                        }
+                    }
                 }
             });
         });
         ui.add_space(6.0);
+    }
+
+    // Everything the keyboard does, in one place. There was nowhere to find
+    // this out short of reading the source, and a program whose shortcuts are a
+    // secret may as well not have them.
+    fn shortcuts_window(&mut self, ctx: &egui::Context) {
+        if !self.show_shortcuts {
+            return;
+        }
+        let s = self.s();
+        // `open` gives the window its own cross, which is one button fewer at
+        // the bottom and one row less of height.
+        let mut open = true;
+        egui::Window::new(s.shortcuts_title)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                // Two columns side by side. In one column this ran taller than
+                // the window it belongs to and lost both ends.
+                //
+                // The keys are spelled out rather than drawn with the arrows
+                // and the page symbols: Consolas has the four arrows and not
+                // the page ones, so half of that line came out as hollow boxes.
+                let left: [(&str, &str); 13] = [
+                    ("Ctrl+O", s.open),
+                    ("Ctrl+N", s.compress),
+                    ("Ctrl+E", s.extract_all),
+                    ("Ctrl+T", s.test_word),
+                    ("F5", s.refresh_word),
+                    ("Ctrl+F", s.find_word),
+                    ("", ""),
+                    ("Ctrl+A", s.select_all),
+                    ("Ctrl+I", s.invert_selection),
+                    ("Esc", s.clear_selection),
+                    ("Space", s.toggle_word),
+                    ("Supr", s.delete_word),
+                    ("F1", s.shortcuts_title),
+                ];
+                let right: [(&str, &str); 12] = [
+                    ("Ctrl+C", s.copy_word),
+                    ("Ctrl+X", s.cut_word),
+                    ("Ctrl+V", s.paste_word),
+                    ("Ctrl+Shift+C", s.copy_names),
+                    ("", ""),
+                    ("Enter", s.open_word),
+                    ("Backspace", s.up),
+                    ("Alt + \u{2191}", s.up),
+                    ("Alt + \u{2190} \u{2192}", s.back),
+                    ("\u{2191} \u{2193}", s.move_word),
+                    ("Home  End", s.move_word),
+                    ("A - Z", s.jump_word),
+                ];
+                let column = |ui: &mut egui::Ui, id: &str, rows: &[(&str, &str)]| {
+                    egui::Grid::new(id)
+                        .num_columns(2)
+                        .spacing(egui::vec2(14.0, 6.0))
+                        .show(ui, |ui| {
+                            for (key, what) in rows {
+                                if key.is_empty() {
+                                    ui.end_row();
+                                    continue;
+                                }
+                                ui.label(egui::RichText::new(*key).monospace().strong());
+                                ui.label(*what);
+                                ui.end_row();
+                            }
+                        });
+                };
+                // Space between the columns rather than a separator: a vertical
+                // separator inside a horizontal layout grows to the height
+                // available to it, and inside a window that is the height of
+                // the screen, which stretched this one until both ends of it
+                // were off the bottom and the top.
+                ui.horizontal_top(|ui| {
+                    column(ui, "shortcuts-left", &left);
+                    ui.add_space(28.0);
+                    column(ui, "shortcuts-right", &right);
+                });
+                ui.add_space(2.0);
+            });
+        if !open {
+            self.show_shortcuts = false;
+        }
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -3165,28 +3372,6 @@ impl Arca {
             self.cursor = if visible.is_empty() { None } else { Some(visible.len() - 1) };
         }
 
-        ui.horizontal(|ui| {
-            if ui.small_button(s.check_all).clicked() {
-                for r in &visible {
-                    self.set_checked(r, true);
-                }
-            }
-            if ui.small_button(s.uncheck_all).clicked() {
-                for r in &visible {
-                    self.set_checked(r, false);
-                }
-            }
-            ui.separator();
-            let n = self.checked.iter().filter(|b| **b).count();
-            ui.label(format!(
-                "{} {} {} · {n} {}",
-                visible.len(),
-                s.visible_of,
-                self.entries.len(),
-                s.checked
-            ));
-        });
-        ui.add_space(4.0);
 
         let mut requested: Option<SortColumn> = None;
         let mut toggle: Option<(usize, bool)> = None;
@@ -3637,9 +3822,18 @@ impl eframe::App for Arca {
         // Escape backs out of whatever is on top, innermost first, the way it
         // does everywhere else. The password prompt goes through the same path
         // as its Cancel button so a cancelled job is cancelled once.
+        // One place, and a switch rather than an opening: handled where the
+        // window is drawn as well, the same press would open it and close it
+        // again inside the one frame.
+        if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+            self.show_shortcuts = !self.show_shortcuts;
+        }
+
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.waiting_on_password.is_some() {
                 self.cancel_password();
+            } else if self.show_shortcuts {
+                self.show_shortcuts = false;
             } else if self.show_settings {
                 self.show_settings = false;
             } else if matches!(self.view, View::Browse) && !self.busy {
@@ -3711,6 +3905,7 @@ impl eframe::App for Arca {
                     self.toolbar(ui, &ctx2);
                 });
                 self.settings_window(&ctx2);
+                self.shortcuts_window(&ctx2);
                 self.conflict_window(&ctx2);
                 self.password_window(&ctx2);
                 self.confirm_delete_window(&ctx2);
@@ -3750,21 +3945,6 @@ impl eframe::App for Arca {
                             ui.label(egui::RichText::new(text).size(16.0).weak());
                         });
                         return;
-                    }
-                    if let Some(a) = self.archive.clone() {
-                        ui.horizontal(|ui| {
-                            ui.strong(
-                                a.file_name()
-                                    .map(|s| s.to_string_lossy().to_string())
-                                    .unwrap_or_default(),
-                            );
-                            ui.weak(
-                                a.parent()
-                                    .map(|p| p.display().to_string())
-                                    .unwrap_or_default(),
-                            );
-                        });
-                        ui.add_space(2.0);
                     }
                     self.table(ui);
                 });

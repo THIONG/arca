@@ -140,6 +140,15 @@ pub struct Strings {
     pub drop_question: &'static str,
     pub dropped_word: &'static str,
     pub drop_to_add: &'static str,
+    pub test_word: &'static str,
+    pub shortcuts_title: &'static str,
+    pub invert_selection: &'static str,
+    pub clear_selection: &'static str,
+    pub refresh_word: &'static str,
+    pub find_word: &'static str,
+    pub toggle_word: &'static str,
+    pub jump_word: &'static str,
+    pub move_word: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -246,6 +255,15 @@ const EN: Strings = Strings {
     drop_question: "Open it instead, or put it inside {name}?",
     dropped_word: "Dropped:",
     drop_to_add: "Let go to add it to {name}",
+    test_word: "Test the archive",
+    shortcuts_title: "Keyboard shortcuts",
+    invert_selection: "Invert the selection",
+    clear_selection: "Drop the selection",
+    refresh_word: "Read the archive again",
+    find_word: "Filter by name",
+    toggle_word: "Tick or untick",
+    jump_word: "Jump to a name",
+    move_word: "Move around the list",
 };
 
 const ES: Strings = Strings {
@@ -352,6 +370,15 @@ const ES: Strings = Strings {
     drop_question: "¿Lo abro, o lo meto dentro de {name}?",
     dropped_word: "Soltado:",
     drop_to_add: "Suelta para añadirlo a {name}",
+    test_word: "Verificar el archivo",
+    shortcuts_title: "Atajos de teclado",
+    invert_selection: "Invertir la selección",
+    clear_selection: "Soltar la selección",
+    refresh_word: "Releer el archivo",
+    find_word: "Filtrar por nombre",
+    toggle_word: "Marcar o desmarcar",
+    jump_word: "Saltar a un nombre",
+    move_word: "Moverse por la lista",
 };
 
 pub fn strings(l: Lang) -> &'static Strings {
