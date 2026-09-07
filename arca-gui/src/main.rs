@@ -71,6 +71,34 @@ fn saved_of(r: &Row) -> f64 {
     }
 }
 
+// A Unix timestamp as a date somebody can read. Done by hand rather than with
+// a date crate: the archive formats store civil time with no zone, so there is
+// nothing here worth a dependency that knows about leap seconds and Tokyo.
+fn when(mtime: Option<i64>) -> String {
+    let Some(t) = mtime.filter(|t| *t > 0) else {
+        return String::new();
+    };
+    let days = t.div_euclid(86_400);
+    let secs = t.rem_euclid(86_400);
+    // Days since 1970 to a civil date, by Howard Hinnant's method: shift the
+    // epoch to March so the leap day lands at the end of the year and the
+    // month lengths follow one formula.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = era * 400 + yoe + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60
+    )
+}
+
 fn human(n: u64) -> String {
     const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = n as f64;
@@ -116,6 +144,7 @@ fn config_file() -> Option<PathBuf> {
 struct Settings {
     lang: Option<Lang>,
     theme: ThemePreference,
+    columns: Columns,
 }
 
 impl Default for Settings {
@@ -123,6 +152,7 @@ impl Default for Settings {
         Settings {
             lang: None,
             theme: ThemePreference::System,
+            columns: Columns::default(),
         }
     }
 }
@@ -161,7 +191,18 @@ impl Settings {
             ThemePreference::Dark => "dark",
             ThemePreference::System => "system",
         };
-        let _ = fs::write(p, format!("lang = {lang}\ntheme = {theme}\n"));
+        let columns: Vec<&str> = Columns::ALL
+            .iter()
+            .filter(|(which, _)| self.columns.on(*which))
+            .map(|(_, name)| *name)
+            .collect();
+        let _ = fs::write(
+            p,
+            format!(
+                "lang = {lang}\ntheme = {theme}\ncolumns = {}\n",
+                columns.join(",")
+            ),
+        );
     }
 
     fn effective_lang(&self) -> Lang {
@@ -957,6 +998,75 @@ enum SortColumn {
     Packed,
     Method,
     Saved,
+    Modified,
+    Crc,
+}
+
+// Which columns the list shows. Name is not here: a list of nothing but sizes
+// would be a strange thing to allow.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Columns {
+    size: bool,
+    packed: bool,
+    method: bool,
+    saved: bool,
+    modified: bool,
+    crc: bool,
+}
+
+impl Default for Columns {
+    fn default() -> Self {
+        // What was on screen before any of this was a choice, plus the date,
+        // which both WinRAR and NanaZip show and which people look for.
+        Columns { size: true, packed: true, method: true, saved: true, modified: true, crc: false }
+    }
+}
+
+impl Columns {
+    const ALL: [(SortColumn, &'static str); 6] = [
+        (SortColumn::Size, "size"),
+        (SortColumn::Packed, "packed"),
+        (SortColumn::Method, "method"),
+        (SortColumn::Saved, "saved"),
+        (SortColumn::Modified, "modified"),
+        (SortColumn::Crc, "crc"),
+    ];
+
+    fn on(&self, which: SortColumn) -> bool {
+        match which {
+            SortColumn::Size => self.size,
+            SortColumn::Packed => self.packed,
+            SortColumn::Method => self.method,
+            SortColumn::Saved => self.saved,
+            SortColumn::Modified => self.modified,
+            SortColumn::Crc => self.crc,
+            SortColumn::Name => true,
+        }
+    }
+
+    fn set(&mut self, which: SortColumn, value: bool) {
+        match which {
+            SortColumn::Size => self.size = value,
+            SortColumn::Packed => self.packed = value,
+            SortColumn::Method => self.method = value,
+            SortColumn::Saved => self.saved = value,
+            SortColumn::Modified => self.modified = value,
+            SortColumn::Crc => self.crc = value,
+            SortColumn::Name => {}
+        }
+    }
+
+    fn label(which: SortColumn, s: &Strings) -> &'static str {
+        match which {
+            SortColumn::Size => s.col_size,
+            SortColumn::Packed => s.col_packed,
+            SortColumn::Method => s.col_method,
+            SortColumn::Saved => s.col_saved,
+            SortColumn::Modified => s.col_modified,
+            SortColumn::Crc => s.col_crc,
+            SortColumn::Name => s.col_name,
+        }
+    }
 }
 
 enum Message {
@@ -1161,6 +1271,8 @@ impl Arca {
                     method: e.method.name(),
                     encrypted: e.encrypted,
                     count: 0,
+                    mtime: e.mtime,
+                    crc32: e.crc32,
                 })
                 .collect()
         };
@@ -1182,6 +1294,8 @@ impl Arca {
                 SortColumn::Saved => saved_of(x)
                     .partial_cmp(&saved_of(y))
                     .unwrap_or(std::cmp::Ordering::Equal),
+                SortColumn::Modified => x.mtime.cmp(&y.mtime),
+                SortColumn::Crc => x.crc32.cmp(&y.crc32),
             };
             if asc {
                 o
@@ -2349,6 +2463,23 @@ impl Arca {
         let mut toggle: Option<(usize, bool)> = None;
         let mut opened: Option<usize> = None;
         let mut clicked: Option<usize> = None;
+        let columns = self.settings.columns;
+        // The ones on, in the order they are drawn. The header, the cells and
+        // the column widths all walk this same list, so they cannot drift.
+        let shown: Vec<SortColumn> = Columns::ALL
+            .iter()
+            .map(|(which, _)| *which)
+            .filter(|w| columns.on(*w))
+            .collect();
+        let toggle_column: std::cell::Cell<Option<SortColumn>> = std::cell::Cell::new(None);
+        // What the row menu asked for. Cells again, and acted on after the
+        // table: doing any of it inside the closure would be borrowing self
+        // while the table still holds it.
+        let wants_extract = std::cell::Cell::new(false);
+        let wants_delete = std::cell::Cell::new(false);
+        let wants_copy = std::cell::Cell::new(false);
+        let wants_select_all = std::cell::Cell::new(false);
+        let picked = std::cell::Cell::new(false);
         let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(visible.len());
         // Taken before the table draws, so it covers the empty space under the
         // last row too: a band has to be able to start down there.
@@ -2384,37 +2515,41 @@ impl Arca {
             // Explorer and every archiver put it, and a separate icon column
             // only pushed the one thing you read away from its picture.
             .column(Column::initial(300.0).at_least(140.0))
-            .column(Column::initial(90.0).at_least(70.0))
-            .column(Column::initial(90.0).at_least(70.0))
-            .column(Column::initial(80.0).at_least(60.0))
-            .column(Column::remainder().at_least(50.0))
+            .columns(Column::initial(95.0).at_least(60.0), shown.len().saturating_sub(1))
+            .column(Column::remainder().at_least(60.0))
             .header(22.0, |mut h| {
-                h.col(|_| {});
+                // Right clicking anywhere along the header offers the list of
+                // columns, which is where both WinRAR and NanaZip keep it.
+                // A Cell because every header cell hands the same menu to
+                // egui, and several closures cannot hold one &mut between them.
+                let menu = |ui: &mut egui::Ui| {
+                    ui.label(s.columns_word);
+                    ui.separator();
+                    for (which, _) in Columns::ALL {
+                        let mut on = columns.on(which);
+                        if ui.checkbox(&mut on, Columns::label(which, s)).clicked() {
+                            toggle_column.set(Some(which));
+                            ui.close_menu();
+                        }
+                    }
+                };
+                h.col(|_| {}).1.context_menu(|ui| menu(ui));
                 h.col(|ui| {
                     if head(ui, s.col_name, SortColumn::Name) {
                         requested = Some(SortColumn::Name);
                     }
-                });
-                h.col(|ui| {
-                    if head(ui, s.col_size, SortColumn::Size) {
-                        requested = Some(SortColumn::Size);
-                    }
-                });
-                h.col(|ui| {
-                    if head(ui, s.col_packed, SortColumn::Packed) {
-                        requested = Some(SortColumn::Packed);
-                    }
-                });
-                h.col(|ui| {
-                    if head(ui, s.col_method, SortColumn::Method) {
-                        requested = Some(SortColumn::Method);
-                    }
-                });
-                h.col(|ui| {
-                    if head(ui, s.col_saved, SortColumn::Saved) {
-                        requested = Some(SortColumn::Saved);
-                    }
-                });
+                })
+                .1
+                .context_menu(|ui| menu(ui));
+                for which in &shown {
+                    h.col(|ui| {
+                        if head(ui, Columns::label(*which, s), *which) {
+                            requested = Some(*which);
+                        }
+                    })
+                    .1
+                    .context_menu(|ui| menu(ui));
+                }
             })
             .body(|body| {
                 body.rows(ROW_HEIGHT, visible.len(), |mut row| {
@@ -2445,29 +2580,79 @@ impl Arca {
                         };
                         ui.add(egui::Label::new(text).selectable(false).truncate());
                     });
-                    row.col(|ui| {
-                        ui.monospace(human(r.size));
-                    });
-                    row.col(|ui| {
-                        ui.monospace(human(r.packed));
-                    });
-                    row.col(|ui| {
-                        if r.is_dir {
-                            ui.weak(format!("{} {}", r.count, s.items_word));
-                        } else if r.encrypted {
-                            ui.label(format!("AES-256 {}", r.method));
-                        } else {
-                            ui.label(r.method);
-                        }
-                    });
-                    row.col(|ui| {
-                        let pct = saved_of(r) * 100.0;
-                        let shown = if pct.abs() < 0.5 { 0.0 } else { pct };
-                        ui.monospace(format!("{shown:.0}%"));
-                    });
+                    for which in &shown {
+                        row.col(|ui| match which {
+                            SortColumn::Size => {
+                                ui.monospace(human(r.size));
+                            }
+                            SortColumn::Packed => {
+                                ui.monospace(human(r.packed));
+                            }
+                            SortColumn::Method => {
+                                if r.is_dir {
+                                    ui.weak(format!("{} {}", r.count, s.items_word));
+                                } else if r.encrypted {
+                                    ui.label(format!("AES-256 {}", r.method));
+                                } else {
+                                    ui.label(r.method);
+                                }
+                            }
+                            SortColumn::Saved => {
+                                let pct = saved_of(r) * 100.0;
+                                let value = if pct.abs() < 0.5 { 0.0 } else { pct };
+                                ui.monospace(format!("{value:.0}%"));
+                            }
+                            SortColumn::Modified => {
+                                ui.monospace(when(r.mtime));
+                            }
+                            SortColumn::Crc => {
+                                // A folder has no contents of its own to sum.
+                                if r.is_dir {
+                                    ui.weak("");
+                                } else {
+                                    ui.monospace(format!("{:08X}", r.crc32));
+                                }
+                            }
+                            SortColumn::Name => {}
+                        });
+                    }
                     // The whole row answers, not just the name: aiming at the
                     // text to open something is a nuisance nobody expects.
                     let resp = row.response();
+                    // Only what there is something behind. A menu offering
+                    // things this window cannot do would be worse than none.
+                    resp.context_menu(|ui| {
+                        // Right clicking something that is not picked picks it,
+                        // which is what every file list does.
+                        if !picked.get() {
+                            clicked = Some(idx);
+                            picked.set(true);
+                        }
+                        // Written out, not the return glyph: the fonts egui ships do
+                        // not have it and it came out as an empty box.
+                        if ui.button(format!("{}	Enter", s.open_word)).clicked() {
+                            opened = Some(idx);
+                            ui.close_menu();
+                        }
+                        if ui.button(format!("{}	Ctrl+E", s.extract_selected)).clicked() {
+                            wants_extract.set(true);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button(format!("{}	Supr", s.delete_word)).clicked() {
+                            wants_delete.set(true);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button(format!("{}	Ctrl+C", s.copy_names)).clicked() {
+                            wants_copy.set(true);
+                            ui.close_menu();
+                        }
+                        if ui.button(format!("{}	Ctrl+A", s.select_all)).clicked() {
+                            wants_select_all.set(true);
+                            ui.close_menu();
+                        }
+                    });
                     if resp.hovered() {
                         resp.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
@@ -2500,6 +2685,19 @@ impl Arca {
         self.icons = icons;
         self.scroll_to_cursor = false;
 
+        // Everything the two menus asked for, now that the table has let go of
+        // self. Turning a column off is not allowed to leave the list with
+        // nothing but names to look at, so the last one stays.
+        if let Some(which) = toggle_column.get() {
+            let mut c = self.settings.columns;
+            let turning_off = c.on(which);
+            if !turning_off || shown.len() > 1 {
+                c.set(which, !turning_off);
+                self.settings.columns = c;
+                self.settings.save();
+            }
+        }
+
         // Ctrl adds or removes one, Shift takes everything between here and
         // where the cursor was, and a plain click starts again with just this
         // one. That is what every file list does, and the ticks are the
@@ -2521,6 +2719,29 @@ impl Arca {
                 self.set_checked(&target, true);
             }
             self.cursor = Some(index);
+        }
+
+        if wants_select_all.get() {
+            for r in &visible {
+                self.set_checked(r, true);
+            }
+        }
+        if wants_copy.get() {
+            let names = self.selected_names();
+            if !names.is_empty() {
+                ui.ctx().copy_text(names.join("
+"));
+            }
+        }
+        if wants_delete.get() {
+            let names = self.selected_names();
+            if !names.is_empty() {
+                self.confirm_delete = Some(names);
+            }
+        }
+        if wants_extract.get() {
+            let ctx = ui.ctx().clone();
+            self.ask_extract(&ctx, true);
         }
 
         self.rubber_band(ui, &visible, &row_rects, body_area);
@@ -2731,4 +2952,59 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The only arithmetic in this file that can be wrong without anyone
+    // noticing: a date is either right or plausible, and plausible is worse.
+    #[test]
+    fn timestamps_become_the_dates_they_are() {
+        for (secs, text) in [
+            (0_i64, ""),                              // no date recorded
+            (-1, ""),                                 // before the epoch: tar can hold these
+            (1, "1970-01-01 00:00"),
+            (951_827_696, "2000-02-29 12:34"),        // leap day of a leap century
+            (1_078_012_800, "2004-02-29 00:00"),      // ordinary leap year
+            (1_709_164_800, "2024-02-29 00:00"),
+            (1_709_251_199, "2024-02-29 23:59"),      // last minute of that day
+            (1_735_689_600, "2025-01-01 00:00"),      // year boundary
+            (1_767_225_599, "2025-12-31 23:59"),
+            (2_208_988_800, "2040-01-01 00:00"),      // past a 32-bit second count
+        ] {
+            assert_eq!(when(Some(secs)), text, "{secs}");
+        }
+        assert_eq!(when(None), "");
+    }
+
+    // A folder keeps its whole name and a file loses its extension, and the
+    // shell extension has a copy of this that has to agree.
+    #[test]
+    fn archive_stem_strips_what_it_should() {
+        for (name, stem) in [
+            ("game.zip", "game"),
+            ("backup.tar.gz", "backup"),
+            ("backup.tgz", "backup"),
+            ("plain.tar", "plain"),
+            ("UPPER.ZIP", "UPPER"),
+            ("dots.in.name.zip", "dots.in.name"),
+            ("no-extension", "no-extension"),
+        ] {
+            assert_eq!(archive_stem(Path::new(name)), stem, "{name}");
+        }
+    }
+
+    #[test]
+    fn turning_columns_on_and_off_survives_a_round_trip() {
+        let mut c = Columns::default();
+        c.set(SortColumn::Crc, true);
+        c.set(SortColumn::Packed, false);
+        assert!(c.on(SortColumn::Crc));
+        assert!(!c.on(SortColumn::Packed));
+        // Name is not a column anyone may turn off.
+        c.set(SortColumn::Name, false);
+        assert!(c.on(SortColumn::Name));
+    }
 }

@@ -94,6 +94,10 @@ pub struct Row {
     pub method: &'static str,
     pub encrypted: bool,
     pub count: usize,
+    // Straight off the entry, for the columns that can be turned on. A folder
+    // has none of its own: it is not a thing the archive recorded.
+    pub mtime: Option<i64>,
+    pub crc32: u32,
 }
 
 fn normalized(e: &Entry) -> String {
@@ -138,6 +142,8 @@ pub fn children_of(entries: &[Entry], dir: &str) -> Vec<Row> {
                         method: e.method.name(),
                         encrypted: e.encrypted,
                         count: 0,
+                        mtime: e.mtime,
+                        crc32: e.crc32,
                     });
                 }
             }
@@ -156,6 +162,8 @@ pub fn children_of(entries: &[Entry], dir: &str) -> Vec<Row> {
             packed,
             method: "",
             encrypted: false,
+            mtime: None,
+            crc32: 0,
             count,
         })
         .collect();

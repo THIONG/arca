@@ -10,7 +10,7 @@ crate level. A malformed archive produces an error, never memory corruption.
 
 ```sh
 cargo build --release      # binary at target/release/arca
-cargo test --workspace     # 51 tests
+cargo test --workspace     # 56 tests
 bash interop.sh            # the phase acceptance criterion
 ```
 
@@ -302,6 +302,11 @@ jumping blindly:
 The mouse picks the same way a file list does: click for one, Ctrl+click to add
 or drop one, Shift+click for everything in between, and press on the list and
 drag for a rectangle that takes what it touches.
+
+Right clicking a row offers what can be done to it, and right clicking the
+header offers the columns: size, packed, method, saved, modified and CRC32, on
+or off, remembered between runs. Name is not on that list, since a column of
+nothing but sizes would be a strange thing to allow.
 
 **Ctrl+V is not there, and neither is Ctrl+C onto the clipboard as files.**
 Pasting means adding to an archive that already exists, which the writer cannot
