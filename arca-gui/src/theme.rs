@@ -1,0 +1,227 @@
+//! How Arca looks.
+//!
+//! Kept apart from the window because it is a different kind of decision. The
+//! rest of the crate is about what happens when you press something; this is
+//! about what it looks like before you do, and mixing the two means neither can
+//! be changed without reading the other.
+//!
+//! The palette comes out of `brand/BRAND.md`: night blue, #05060A at one end of
+//! the gradient and #1B2A4A at the other. Neither is usable as an accent on its
+//! own -- one is nearly black, the other disappears into a dark panel -- so the
+//! accent is that same hue carried up in lightness until it reads against both
+//! grounds, and the greys are tinted towards it rather than being neutral. That
+//! is what stops a dark window from looking like a screenshot of a terminal.
+
+use eframe::egui::{self, Color32, Rounding, Stroke, Visuals};
+
+const fn rgb(v: u32) -> Color32 {
+    Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+
+// The brand hue, lifted until it carries white text on a dark ground.
+const ACCENT_DARK: Color32 = rgb(0x3D6FD6);
+// The same hue taken the other way for a light ground, where the accent has to
+// sit behind dark text instead of in front of it.
+const ACCENT_LIGHT: Color32 = rgb(0x2A55B8);
+
+// Corners. Small enough to read as a finish rather than as a shape.
+const R_WIDGET: f32 = 4.0;
+const R_WINDOW: f32 = 8.0;
+
+pub fn dark() -> Visuals {
+    let mut v = Visuals::dark();
+    v.panel_fill = rgb(0x14161D);
+    v.window_fill = rgb(0x1A1D26);
+    v.extreme_bg_color = rgb(0x0E1015);
+    v.code_bg_color = rgb(0x0E1015);
+    // Only just off the panel. A stripe you can name the colour of is a stripe
+    // that competes with the selection.
+    v.faint_bg_color = rgb(0x191C24);
+    v.window_stroke = Stroke::new(1.0_f32, rgb(0x2A2F3D));
+    v.selection.bg_fill = rgb(0x2D5CB8);
+    // Not an outline colour, whatever the name says: egui_extras reads this and
+    // makes it the text colour of a picked row. A pale blue here left the sizes
+    // and dates on a selected row dimmer than on an unpicked one, which is the
+    // wrong way round.
+    v.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
+    v.hyperlink_color = rgb(0x6E9BEA);
+    v.warn_fg_color = rgb(0xE0A85C);
+    v.error_fg_color = rgb(0xE06C6C);
+
+    let w = &mut v.widgets;
+    // noninteractive.fg_stroke is the body text of the whole window, not a
+    // disabled colour: egui reads `text_color()` straight out of it.
+    w.noninteractive.bg_fill = rgb(0x1A1D26);
+    w.noninteractive.weak_bg_fill = rgb(0x1A1D26);
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, rgb(0x21252E));
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, rgb(0xD9DEE8));
+
+    w.inactive.bg_fill = rgb(0x242833);
+    w.inactive.weak_bg_fill = rgb(0x242833);
+    w.inactive.bg_stroke = Stroke::new(1.0_f32, rgb(0x30364a));
+    w.inactive.fg_stroke = Stroke::new(1.0_f32, rgb(0xD9DEE8));
+
+    w.hovered.bg_fill = rgb(0x2E3444);
+    w.hovered.weak_bg_fill = rgb(0x2E3444);
+    w.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT_DARK);
+    w.hovered.fg_stroke = Stroke::new(1.0_f32, rgb(0xF2F4F8));
+
+    // `active` is the pressed state and also where egui takes `strong` text
+    // from, so its foreground has to be the brightest thing here rather than
+    // whatever happens to look right on a pressed button.
+    w.active.bg_fill = ACCENT_DARK;
+    w.active.weak_bg_fill = ACCENT_DARK;
+    w.active.bg_stroke = Stroke::new(1.0_f32, rgb(0x6E9BEA));
+    w.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+
+    w.open.bg_fill = rgb(0x2E3444);
+    w.open.weak_bg_fill = rgb(0x2E3444);
+    w.open.bg_stroke = Stroke::new(1.0_f32, rgb(0x30364A));
+    w.open.fg_stroke = Stroke::new(1.0_f32, rgb(0xD9DEE8));
+
+    round(&mut v);
+    v
+}
+
+pub fn light() -> Visuals {
+    let mut v = Visuals::light();
+    v.panel_fill = rgb(0xF2F4F8);
+    v.window_fill = rgb(0xFFFFFF);
+    v.extreme_bg_color = rgb(0xFFFFFF);
+    v.code_bg_color = rgb(0xF2F4F8);
+    v.faint_bg_color = rgb(0xE9EDF4);
+    v.window_stroke = Stroke::new(1.0_f32, rgb(0xD2D8E4));
+    // Pale, because egui paints this behind text that keeps its own colour: a
+    // saturated blue here would leave a selected row unreadable.
+    v.selection.bg_fill = rgb(0xCBDCF7);
+    // The text of a picked row, as above. Dark, because the fill is pale.
+    v.selection.stroke = Stroke::new(1.0_f32, rgb(0x10141B));
+    v.hyperlink_color = ACCENT_LIGHT;
+    v.warn_fg_color = rgb(0xA1660D);
+    v.error_fg_color = rgb(0xC03A3A);
+
+    let w = &mut v.widgets;
+    w.noninteractive.bg_fill = rgb(0xFFFFFF);
+    w.noninteractive.weak_bg_fill = rgb(0xFFFFFF);
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, rgb(0xE3E7EF));
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, rgb(0x1B2129));
+
+    w.inactive.bg_fill = rgb(0xFFFFFF);
+    w.inactive.weak_bg_fill = rgb(0xFFFFFF);
+    w.inactive.bg_stroke = Stroke::new(1.0_f32, rgb(0xCFD6E2));
+    w.inactive.fg_stroke = Stroke::new(1.0_f32, rgb(0x1B2129));
+
+    w.hovered.bg_fill = rgb(0xEDF2FB);
+    w.hovered.weak_bg_fill = rgb(0xEDF2FB);
+    w.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT_LIGHT);
+    w.hovered.fg_stroke = Stroke::new(1.0_f32, rgb(0x10141B));
+
+    // A pale tint rather than the accent itself: this is also `strong` text,
+    // and strong text has to stay dark on a white window.
+    w.active.bg_fill = rgb(0xD8E3F8);
+    w.active.weak_bg_fill = rgb(0xD8E3F8);
+    w.active.bg_stroke = Stroke::new(1.0_f32, ACCENT_LIGHT);
+    w.active.fg_stroke = Stroke::new(1.0_f32, rgb(0x10141B));
+
+    w.open.bg_fill = rgb(0xEDF2FB);
+    w.open.weak_bg_fill = rgb(0xEDF2FB);
+    w.open.bg_stroke = Stroke::new(1.0_f32, rgb(0xCFD6E2));
+    w.open.fg_stroke = Stroke::new(1.0_f32, rgb(0x1B2129));
+
+    round(&mut v);
+    v
+}
+
+fn round(v: &mut Visuals) {
+    for s in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        s.rounding = Rounding::same(R_WIDGET);
+        // egui grows a widget by a pixel when the pointer is over it. On a row
+        // in a table that reads as a twitch, and the colour already says it.
+        s.expansion = 0.0;
+    }
+    v.window_rounding = Rounding::same(R_WINDOW);
+    v.menu_rounding = Rounding::same(R_WINDOW);
+}
+
+/// The colour that marks the row the keyboard is on.
+///
+/// Deliberately not `selection.stroke`, which would be the obvious place: that
+/// one is spoken for as the text colour of a picked row. Where the keyboard is
+/// and what is picked are two different things and they need two colours, or
+/// moving the cursor onto a picked row makes both of them disappear.
+pub fn cursor(v: &Visuals) -> Stroke {
+    let color = if v.dark_mode {
+        rgb(0x7FA6F0)
+    } else {
+        ACCENT_LIGHT
+    };
+    Stroke::new(1.0_f32, color)
+}
+
+/// Sizes and spacing, which are the same whichever way the theme goes.
+pub fn style(style: &mut egui::Style) {
+    use egui::{FontFamily, FontId, TextStyle};
+
+    style.text_styles = [
+        (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
+        (TextStyle::Button, FontId::new(13.5, FontFamily::Proportional)),
+        (TextStyle::Heading, FontId::new(18.0, FontFamily::Proportional)),
+        // The columns of numbers and dates. Slightly smaller than the body:
+        // a monospace face at the same size always looks a size bigger.
+        (TextStyle::Monospace, FontId::new(12.5, FontFamily::Monospace)),
+    ]
+    .into();
+
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.menu_margin = egui::Margin::same(6.0);
+    style.spacing.window_margin = egui::Margin::same(12.0);
+    style.spacing.interact_size.y = 24.0;
+    // Wide enough to grab a column edge without hitting the text beside it.
+    style.interaction.resize_grab_radius_side = 6.0;
+}
+
+/// The letters the rest of the desktop is written in.
+///
+/// egui ships Ubuntu-Light and Hack. They are good fonts and they look like
+/// nothing else on Windows: a window sitting next to the Explorer that does not
+/// use the Explorer's letters reads as foreign before you have looked at
+/// anything in it. Whatever is missing falls back to what egui brought, so a
+/// machine without these still gets a window.
+#[cfg(windows)]
+pub fn fonts() -> egui::FontDefinitions {
+    let mut defs = egui::FontDefinitions::default();
+    let dir = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("C:\\Windows"))
+        .join("Fonts");
+    for (name, file, family) in [
+        ("segoe-ui", "segoeui.ttf", egui::FontFamily::Proportional),
+        ("consolas", "consola.ttf", egui::FontFamily::Monospace),
+    ] {
+        let Ok(bytes) = std::fs::read(dir.join(file)) else {
+            continue;
+        };
+        defs.font_data
+            .insert(name.to_owned(), egui::FontData::from_owned(bytes));
+        // In front of what is already there, not instead of it: the fallbacks
+        // are what draws a glyph these two have not got.
+        defs.families
+            .entry(family)
+            .or_default()
+            .insert(0, name.to_owned());
+    }
+    defs
+}
+
+#[cfg(not(windows))]
+pub fn fonts() -> egui::FontDefinitions {
+    egui::FontDefinitions::default()
+}

@@ -1022,7 +1022,47 @@ pub fn rewrite_password(
     new: Option<&str>,
     notify: &dyn Fn(usize, usize, &str),
 ) -> Result<u64> {
-    rewrite(archive, out, current, new, &|_| true, notify)
+    rewrite(archive, out, current, new, &|_| true, &[], notify)
+}
+
+/// A file on disk waiting to go into an archive: where to read it from, the
+/// name it takes inside, and how it should be compressed. The codec travels
+/// with the file rather than sitting in the call so a paste can use whatever
+/// the window is set to without the rewrite having to know about it.
+pub struct Addition {
+    pub source: std::path::PathBuf,
+    pub name: String,
+    pub codec: Codec,
+    pub level: Level,
+}
+
+/// Writes a copy of `archive` at `out` with `extra` added to it.
+///
+/// Built again rather than appended to for the same reason as
+/// [`remove_entries`]: the central directory sits at the end and records where
+/// every entry starts, so growing an archive in place still means writing that
+/// directory out afresh. What is already in there is copied through without
+/// going near a compressor; only the new files are compressed. A new file whose
+/// name is already taken replaces the entry that had it, which is what dropping
+/// something into a folder that already holds it means everywhere else.
+pub fn add_entries(
+    archive: &std::path::Path,
+    out: &std::path::Path,
+    password: Option<&str>,
+    extra: &[Addition],
+    notify: &dyn Fn(usize, usize, &str),
+) -> Result<u64> {
+    let taken: std::collections::HashSet<&str> =
+        extra.iter().map(|a| a.name.as_str()).collect();
+    rewrite(
+        archive,
+        out,
+        password,
+        password,
+        &|e| !taken.contains(e.name.as_str()),
+        extra,
+        notify,
+    )
 }
 
 /// Writes a copy of `archive` at `out` without the entries `keep` turns down.
@@ -1039,7 +1079,7 @@ pub fn remove_entries(
     keep: &dyn Fn(&Entry) -> bool,
     notify: &dyn Fn(usize, usize, &str),
 ) -> Result<u64> {
-    rewrite(archive, out, password, password, keep, notify)
+    rewrite(archive, out, password, password, keep, &[], notify)
 }
 
 fn rewrite(
@@ -1048,6 +1088,7 @@ fn rewrite(
     current: Option<&str>,
     new: Option<&str>,
     keep: &dyn Fn(&Entry) -> bool,
+    extra: &[Addition],
     notify: &dyn Fn(usize, usize, &str),
 ) -> Result<u64> {
     use std::fs::File;
@@ -1059,7 +1100,7 @@ fn rewrite(
         .filter(|e| keep(e))
         .cloned()
         .collect();
-    let total = entries.len();
+    let total = entries.len() + extra.len();
     let mut w = ZipWriter::new(BufWriter::with_capacity(STREAM_BUF, File::create(out)?));
     let mut bytes = 0u64;
 
@@ -1078,6 +1119,21 @@ fn rewrite(
             copy_compressed(&mut src, e, sink, current)
         })?;
         bytes += e.size;
+    }
+
+    // The new ones last, so copying what was already there stays one straight
+    // pass over the source file instead of one interleaved with compression.
+    for (i, a) in extra.iter().enumerate() {
+        notify(entries.len() + i, total, &a.name);
+        let meta = std::fs::metadata(&a.source)?;
+        let mtime = meta.modified().ok().and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs() as i64)
+        });
+        let f = BufReader::with_capacity(STREAM_BUF, File::open(&a.source)?);
+        w.add_with_password(&a.name, f, a.codec, a.level, mtime, new)?;
+        bytes += meta.len();
     }
     w.finish()?.flush()?;
 
@@ -1578,6 +1634,57 @@ mod tests {
             !s.contains('\u{FFFD}'),
             "CP437 has no gaps: no replacement character should appear"
         );
+    }
+
+    // Pasting into an archive rewrites it, so what was already inside has to
+    // come back out unharmed, and a name that was already taken has to end up
+    // pointing at the new bytes rather than appearing twice.
+    #[test]
+    fn adding_entries_keeps_the_old_ones_and_replaces_by_name() {
+        let room = std::env::temp_dir().join(format!("arca-add-{}", std::process::id()));
+        std::fs::create_dir_all(&room).unwrap();
+
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        for name in ["keep.txt", "replace.txt"] {
+            let body = format!("original {name} ").repeat(40).into_bytes();
+            w.add(name, &body[..], Codec::Deflate, Level::Normal, None).unwrap();
+        }
+        let archive = room.join("a.zip");
+        std::fs::write(&archive, w.finish().unwrap().into_inner()).unwrap();
+
+        let fresh = room.join("fresh.bin");
+        std::fs::write(&fresh, b"brand new bytes".repeat(50)).unwrap();
+        let extra = [
+            Addition {
+                source: fresh.clone(),
+                name: "replace.txt".into(),
+                codec: Codec::Deflate,
+                level: Level::Normal,
+            },
+            Addition {
+                source: fresh.clone(),
+                name: "sub/added.bin".into(),
+                codec: Codec::Store,
+                level: Level::Store,
+            },
+        ];
+        let out = room.join("b.zip");
+        add_entries(&archive, &out, None, &extra, &|_, _, _| {}).unwrap();
+
+        let mut a = ZipArchive::open(std::fs::File::open(&out).unwrap()).unwrap();
+        let names: Vec<String> = a.entries().iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, ["keep.txt", "replace.txt", "sub/added.bin"]);
+
+        let mut got = Vec::new();
+        a.extract_to(0, &mut got).unwrap();
+        assert_eq!(got, "original keep.txt ".repeat(40).into_bytes());
+        for i in [1, 2] {
+            let mut got = Vec::new();
+            a.extract_to(i, &mut got).unwrap();
+            assert_eq!(got, b"brand new bytes".repeat(50), "entry {i}");
+        }
+
+        std::fs::remove_dir_all(&room).unwrap();
     }
 
     #[test]

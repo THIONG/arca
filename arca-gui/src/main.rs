@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod clipboard;
 mod i18n;
+mod theme;
 mod tree;
 
 use arca_core::{Codec, Entry, Level};
@@ -22,7 +24,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
 
 const BUF: usize = 256 * 1024;
-const ROW_HEIGHT: f32 = 20.0;
+const ROW_HEIGHT: f32 = 23.0;
 const ICON_PNG: &[u8] = include_bytes!("../../brand/arca-256.png");
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -761,6 +763,18 @@ enum Job {
         level: Level,
         password: Option<String>,
     },
+    // Putting files in. Same rebuild as Delete, and for the same reason: the
+    // central directory is at the end of the file.
+    Add {
+        archive: PathBuf,
+        inputs: Vec<PathBuf>,
+        // Where inside the archive they land, which is the folder the window is
+        // showing. Empty means the root.
+        dir: String,
+        codec: Codec,
+        level: Level,
+        password: Option<String>,
+    },
 }
 
 enum Startup {
@@ -988,6 +1002,51 @@ fn run_job_blocking(
                 ],
             ))
         }
+        // Same care as Delete and the password rewrite: built alongside, read
+        // back in full, and only then moved over the original.
+        Job::Add {
+            archive,
+            inputs,
+            dir,
+            codec,
+            level,
+            password,
+        } => {
+            if detect(&archive) != Some(Format::Zip) {
+                return Err(s.only_zip_can_change.to_string());
+            }
+            if inputs.is_empty() {
+                return Err(s.nothing_to_do.to_string());
+            }
+            let extra: Vec<arca_zip::Addition> = collect_files(&inputs)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|(source, name)| arca_zip::Addition {
+                    source,
+                    name: format!("{dir}{name}"),
+                    codec,
+                    level,
+                })
+                .collect();
+            if extra.is_empty() {
+                return Err(s.nothing_to_do.to_string());
+            }
+            let temp = archive.with_file_name(format!(
+                "{}.arca-new",
+                archive
+                    .file_name()
+                    .map(|x| x.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            ));
+            let n = extra.len();
+            let done = arca_zip::add_entries(&archive, &temp, password.as_deref(), &extra, notify);
+            if let Err(e) = done {
+                let _ = fs::remove_file(&temp);
+                return Err(e.to_string());
+            }
+            fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
+            Ok(fill(s.added, &[("n", &n.to_string())]))
+        }
     }
 }
 
@@ -1155,9 +1214,19 @@ struct Arca {
     // Names waiting on a yes before they are taken out of the archive. There
     // is no undo, so this one asks.
     confirm_delete: Option<Vec<String>>,
+    // An archive dropped onto an open archive, which is two reasonable things
+    // at once and so gets asked about rather than guessed at.
+    confirm_drop: Option<Vec<PathBuf>>,
     // Set when the cursor moves by keyboard, so the table can scroll it into
     // view on the next frame and then forget about it.
     scroll_to_cursor: bool,
+    // The folder the last Ctrl+C or Ctrl+X extracted into. The clipboard is
+    // holding paths inside it, so it stays until the next copy replaces it and
+    // makes those paths meaningless anyway.
+    clip_dir: Option<PathBuf>,
+    // What the last Ctrl+X put on the clipboard, so those rows can show it. The
+    // archive is not touched: see `copy_to_clipboard`.
+    cut_names: HashSet<String>,
 }
 
 impl Arca {
@@ -1204,6 +1273,9 @@ impl Arca {
             band_base: Vec::new(),
             confirm_delete: None,
             scroll_to_cursor: false,
+            clip_dir: None,
+            cut_names: HashSet::new(),
+            confirm_drop: None,
         }
     }
 
@@ -1327,6 +1399,8 @@ impl Arca {
 
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
         self.archive_password = None;
+        // Whatever was cut belonged to the listing being replaced.
+        self.cut_names.clear();
         let ctx2 = ctx.clone();
         self.spawn(ctx, 0, move |tx| {
             let m = match list_entries(&path) {
@@ -1360,14 +1434,20 @@ impl Arca {
             Job::Password { .. } => s.changing_password.to_string(),
             Job::Delete { .. } => s.deleting.to_string(),
             Job::Compress { .. } => s.compressing.to_string(),
+            Job::Add { .. } => s.adding.to_string(),
         };
-        self.close_when_done =
-            !matches!(job, Job::Test(_) | Job::Password { .. } | Job::Delete { .. });
+        self.close_when_done = !matches!(
+            job,
+            Job::Test(_) | Job::Password { .. } | Job::Delete { .. } | Job::Add { .. }
+        );
         // The file on disk is about to change, so the listing has to be redone.
         if let Job::Password { archive, new, .. } = &job {
             self.after_password = Some((archive.clone(), new.clone()));
         }
         if let Job::Delete { archive, password, .. } = &job {
+            self.after_password = Some((archive.clone(), password.clone()));
+        }
+        if let Job::Add { archive, password, .. } = &job {
             self.after_password = Some((archive.clone(), password.clone()));
         }
 
@@ -1401,7 +1481,14 @@ impl Arca {
                             self.archive_password = None;
                             self.waiting_on_password = Some(Pending::OpenArchive);
                         }
-                        self.checked = vec![true; v.len()];
+                        // Nothing picked to begin with. It used to be
+                        // everything, which was invisible while the ticks were
+                        // the only sign of it; now that a picked row is painted
+                        // it would open as a wall of blue, and "everything is
+                        // selected" is not what a list means when you open it.
+                        // The buttons that work on the whole archive never
+                        // looked at the ticks anyway.
+                        self.checked = vec![false; v.len()];
                         self.entries = v;
                         if let Some(f) = detect(&path) {
                             self.format = f;
@@ -1625,20 +1712,337 @@ impl Arca {
             .collect()
     }
 
+    // The top of what is ticked. A folder with every one of its entries ticked
+    // stands for all of them, so a copy hands the clipboard one folder instead
+    // of the fifteen hundred files inside it, and the Explorer pastes a folder
+    // rather than a heap of loose files.
+    fn selected_roots(&self) -> Vec<String> {
+        let names: Vec<String> = self
+            .entries
+            .iter()
+            .map(|e| e.name.replace('\\', "/"))
+            .collect();
+        // Whether everything under a prefix is ticked, worked out once per
+        // prefix: the same ancestors come round again for every file in a
+        // folder, and there can be thousands of them.
+        let mut whole: HashMap<String, bool> = HashMap::new();
+        let mut roots: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for (i, full) in names.iter().enumerate() {
+            if !self.checked.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let trimmed = full.trim_end_matches('/');
+            let mut root = trimmed.to_string();
+            // Shortest ancestor first: the outermost folder that is ticked all
+            // the way down is the one that was meant.
+            let mut at = 0usize;
+            while let Some(cut) = trimmed[at..].find('/') {
+                at += cut + 1;
+                let prefix = &trimmed[..at];
+                let all = *whole.entry(prefix.to_string()).or_insert_with(|| {
+                    names
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, n)| n.starts_with(prefix))
+                        .all(|(j, _)| self.checked.get(j).copied().unwrap_or(false))
+                });
+                if all {
+                    root = prefix.trim_end_matches('/').to_string();
+                    break;
+                }
+            }
+            if seen.insert(root.clone()) {
+                roots.push(root);
+            }
+        }
+        roots
+    }
+
+    // Ctrl+C and Ctrl+X. The clipboard carries paths, not archive entries, so
+    // what is picked is extracted into a folder of its own under the temporary
+    // directory first and those paths are what the shell is handed.
+    //
+    // A cut marks the rows and asks the shell to move rather than copy, which
+    // is what empties the temporary folder afterwards. It does not take the
+    // entries out of the archive: nothing tells this window whether the paste
+    // ever happened, and removing them on the guess that it did would lose them
+    // for good the moment somebody changed their mind.
+    fn copy_to_clipboard(&mut self, ctx: &egui::Context, cut: bool) {
+        let s: &'static Strings = self.s();
+        let Some(archive) = self.archive.clone() else {
+            return;
+        };
+        let roots = self.selected_roots();
+        if roots.is_empty() {
+            return;
+        }
+        // A folder of its own per copy, so the paths already on the clipboard
+        // never end up pointing at something a later copy overwrote.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir()
+            .join("Arca")
+            .join(format!("clip-{stamp:x}"));
+        let previous = self.clip_dir.replace(dir.clone());
+        self.cut_names = if cut {
+            self.selected_names().into_iter().collect()
+        } else {
+            HashSet::new()
+        };
+
+        let wanted = self.checked.clone();
+        let total = wanted.iter().filter(|b| **b).count();
+        let pw = self.archive_password.clone();
+        self.close_when_done = false;
+        let ctx2 = ctx.clone();
+        self.spawn(ctx, total, move |tx| {
+            let notify = |i: usize, n: usize, name: &str| {
+                let _ = tx.send(Message::Progress(i, n, name.to_string()));
+                ctx2.request_repaint();
+            };
+            // A folder nobody has seen yet has nothing in it to overwrite, so
+            // there is no question to put on screen.
+            let ask = |_: &Path| Answer::Replace;
+            let outcome = extract(&archive, &dir, &wanted, &notify, &ask, pw.as_deref())
+                .map_err(|e| e.to_string())
+                .and_then(|_| {
+                    let paths: Vec<PathBuf> = roots
+                        .iter()
+                        .filter_map(|r| arca_core::safe_name(r).ok())
+                        .map(|r| dir.join(r))
+                        .collect();
+                    clipboard::set_files(&paths, cut).map(|()| paths.len())
+                });
+            // Only once the new list is on the clipboard: until that moment the
+            // old paths are still what a paste would reach for.
+            if let Some(old) = previous {
+                let _ = fs::remove_dir_all(old);
+            }
+            let _ = tx.send(match outcome {
+                Ok(n) => Message::Done(fill(
+                    if cut {
+                        s.cut_to_clipboard
+                    } else {
+                        s.copied_to_clipboard
+                    },
+                    &[("n", &n.to_string())],
+                )),
+                Err(why) => Message::Failed(fill(s.clipboard_failed, &[("why", &why)])),
+            });
+            ctx2.request_repaint();
+        });
+    }
+
+    // Ctrl+V: whatever files the shell is holding, into the folder on screen.
+    fn paste_from_clipboard(&mut self, ctx: &egui::Context) {
+        let Some(archive) = self.archive.clone() else {
+            return;
+        };
+        let here = fs::canonicalize(&archive).unwrap_or_else(|_| archive.clone());
+        // Pasting the archive into itself would have the rewrite reading the
+        // file it is replacing.
+        let inputs: Vec<PathBuf> = clipboard::files()
+            .into_iter()
+            .filter(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()) != here)
+            .collect();
+        if inputs.is_empty() {
+            self.notice = self.s().clipboard_empty.to_string();
+            self.error = true;
+            return;
+        }
+        self.add_files(ctx, inputs);
+    }
+
+    // Files from anywhere outside into the folder the window is showing. Both
+    // the paste and the drop end here so they cannot answer the same question
+    // two different ways.
+    fn add_files(&mut self, ctx: &egui::Context, inputs: Vec<PathBuf>) {
+        let Some(archive) = self.archive.clone() else {
+            return;
+        };
+        self.run_job(
+            ctx,
+            Job::Add {
+                archive,
+                inputs,
+                dir: self.current_dir.clone(),
+                codec: self.codec,
+                level: self.level,
+                password: self.archive_password.clone(),
+            },
+        );
+    }
+
+    // What a drop means depends on what the window is already showing. With
+    // nothing open there is only one thing it can be, and that is what it has
+    // always done: open it. With an archive open, dropping a file on it means
+    // putting the file inside, which is what every other archiver does and what
+    // opening a second archive over the first never was.
+    //
+    // The exception is dropping an archive onto an archive, which is honestly
+    // both, so it asks instead of picking one and being wrong half the time.
+    fn dropped(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        self.notice.clear();
+        self.error = false;
+        let open_first = |me: &mut Self, paths: Vec<PathBuf>| {
+            if let Some(p) = paths.into_iter().next() {
+                me.open(ctx, p);
+            }
+        };
+        let Some(archive) = self.archive.clone() else {
+            open_first(self, paths);
+            return;
+        };
+        let all_archives = paths.iter().all(|p| detect(p).is_some());
+        // Only a .zip can be added to in place. With a .tar open there is
+        // nothing to weigh up: an archive opens, and anything else has to say
+        // why it cannot go in rather than quietly do nothing.
+        if detect(&archive) != Some(Format::Zip) {
+            if all_archives {
+                open_first(self, paths);
+            } else {
+                self.notice = self.s().only_zip_can_change.to_string();
+                self.error = true;
+            }
+            return;
+        }
+        if all_archives {
+            self.confirm_drop = Some(paths);
+            return;
+        }
+        self.add_files(ctx, paths);
+    }
+
+    // A drop used to mean one thing and now means another, so while something
+    // is held over the window it says which. Guessing in silence is what made
+    // the old behaviour surprising in the first place.
+    fn drop_hint(&self, ctx: &egui::Context) {
+        if !matches!(self.view, View::Browse)
+            || self.busy
+            || ctx.input(|i| i.raw.hovered_files.is_empty())
+        {
+            return;
+        }
+        let s = self.s();
+        let text = match &self.archive {
+            Some(a) if detect(a) == Some(Format::Zip) => fill(
+                s.drop_to_add,
+                &[(
+                    "name",
+                    &a.file_name()
+                        .map(|x| x.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                )],
+            ),
+            _ => s.drop_here.to_string(),
+        };
+        let screen = ctx.screen_rect();
+        let p = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("drop_hint"),
+        ));
+        p.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(170));
+        p.text(
+            screen.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::proportional(17.0),
+            egui::Color32::WHITE,
+        );
+    }
+
+    fn confirm_drop_window(&mut self, ctx: &egui::Context) {
+        let Some(paths) = self.confirm_drop.clone() else {
+            return;
+        };
+        let s = self.s();
+        let into = self
+            .archive
+            .as_ref()
+            .and_then(|a| a.file_name())
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut open_it = false;
+        let mut add_it = false;
+        let mut cancel = false;
+        egui::Window::new(s.drop_title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.label(fill(s.drop_question, &[("name", &into)]));
+                ui.add_space(6.0);
+                ui.weak(s.dropped_word);
+                for p in paths.iter().take(8) {
+                    ui.weak(format!(
+                        "  {}",
+                        p.file_name()
+                            .map(|x| x.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    ));
+                }
+                if paths.len() > 8 {
+                    ui.weak(format!("  … {}", paths.len() - 8));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    // Opening first: it is what the window used to do, so it is
+                    // the answer somebody pressing Enter out of habit expects.
+                    if ui.button(s.open_word).clicked() {
+                        open_it = true;
+                    }
+                    if ui.button(s.add_to_archive).clicked() {
+                        add_it = true;
+                    }
+                    if ui.button(s.cancel).clicked() {
+                        cancel = true;
+                    }
+                });
+                ui.add_space(4.0);
+            });
+        if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.confirm_drop = None;
+        }
+        if open_it {
+            self.confirm_drop = None;
+            if let Some(p) = paths.into_iter().next() {
+                self.open(ctx, p);
+            }
+        } else if add_it {
+            self.confirm_drop = None;
+            self.add_files(ctx, paths);
+        }
+    }
+
     // Windows shortcuts that mean something here. The ones that would need the
     // archive to grow a feature it has not got are left out rather than made to
     // look present and do nothing.
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if !matches!(self.view, View::Browse) || self.busy || self.confirm_delete.is_some() {
+        if !matches!(self.view, View::Browse)
+            || self.busy
+            || self.confirm_delete.is_some()
+            || self.confirm_drop.is_some()
+        {
             return;
         }
         let typing = ctx.memory(|m| m.focused().is_some());
-        let (ctrl, o, e, c, n, f, f5, del) = ctx.input(|i| {
+        let (ctrl, shift, o, e, c, x, v, n, f, f5, del) = ctx.input(|i| {
             (
                 i.modifiers.command,
+                i.modifiers.shift,
                 i.key_pressed(egui::Key::O),
                 i.key_pressed(egui::Key::E),
                 i.key_pressed(egui::Key::C),
+                i.key_pressed(egui::Key::X),
+                i.key_pressed(egui::Key::V),
                 i.key_pressed(egui::Key::N),
                 i.key_pressed(egui::Key::F),
                 i.key_pressed(egui::Key::F5),
@@ -1690,14 +2094,30 @@ impl Arca {
             // filter is the whole of "find".
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("filter")));
         }
+        // Cut, copy and paste belong to the filter box while it has the
+        // keyboard: that is a text field, and taking its Ctrl+V away to add
+        // files to the archive would be the last thing anybody expected.
+        if typing {
+            return;
+        }
         if c {
-            // The names, as text. Putting the files themselves on the clipboard
-            // is a different job: it needs a data object the shell can pull
-            // bytes out of on demand, and that is not written.
-            let names = self.selected_names();
-            if !names.is_empty() {
-                ctx.copy_text(names.join("\r\n"));
+            // Plain Ctrl+C is what it is everywhere else: the files, ready to
+            // paste into a folder. The names as text move to Ctrl+Shift+C,
+            // which is also all a platform without a file clipboard can offer.
+            if shift || !clipboard::AVAILABLE {
+                let names = self.selected_names();
+                if !names.is_empty() {
+                    ctx.copy_text(names.join("\r\n"));
+                }
+            } else {
+                self.copy_to_clipboard(ctx, false);
             }
+        }
+        if x && clipboard::AVAILABLE {
+            self.copy_to_clipboard(ctx, true);
+        }
+        if v && clipboard::AVAILABLE && self.archive.is_some() {
+            self.paste_from_clipboard(ctx);
         }
     }
 
@@ -2161,7 +2581,7 @@ impl Arca {
         &mut self,
         ui: &mut egui::Ui,
         visible: &[Row],
-        row_rects: &[egui::Rect],
+        row_rects: &[(usize, egui::Rect)],
         body_area: egui::Rect,
     ) {
         let (down, origin, now, ctrl) = ui.input(|i| {
@@ -2204,9 +2624,14 @@ impl Arca {
 
         let band = egui::Rect::from_two_pos(start, here);
         self.checked.clone_from(&self.band_base);
-        for (row, rect) in visible.iter().zip(row_rects) {
+        // By the index the row carried, not by position in this list: the table
+        // only builds the rows on screen, so pairing them off in order picked
+        // the wrong ones as soon as the list had been scrolled.
+        for (idx, rect) in row_rects {
             if rect.intersects(band) {
-                self.set_checked(row, true);
+                if let Some(row) = visible.get(*idx) {
+                    self.set_checked(row, true);
+                }
             }
         }
 
@@ -2477,10 +2902,17 @@ impl Arca {
         // while the table still holds it.
         let wants_extract = std::cell::Cell::new(false);
         let wants_delete = std::cell::Cell::new(false);
-        let wants_copy = std::cell::Cell::new(false);
+        let wants_copy_names = std::cell::Cell::new(false);
+        let wants_clip: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
+        let wants_paste = std::cell::Cell::new(false);
         let wants_select_all = std::cell::Cell::new(false);
         let picked = std::cell::Cell::new(false);
-        let mut row_rects: Vec<egui::Rect> = Vec::with_capacity(visible.len());
+        // The row the cursor is on, painted after the table: the highlight now
+        // belongs to the ticks, so the cursor needs a mark of its own.
+        let cursor_rect: std::cell::Cell<Option<egui::Rect>> = std::cell::Cell::new(None);
+        // Paired with the index they came from. `body.rows` only builds the
+        // ones on screen, so after any scrolling these do not start at nought.
+        let mut row_rects: Vec<(usize, egui::Rect)> = Vec::with_capacity(visible.len());
         // Taken before the table draws, so it covers the empty space under the
         // last row too: a band has to be able to start down there.
         let body_area = ui.available_rect_before_wrap();
@@ -2517,7 +2949,7 @@ impl Arca {
             .column(Column::initial(300.0).at_least(140.0))
             .columns(Column::initial(95.0).at_least(60.0), shown.len().saturating_sub(1))
             .column(Column::remainder().at_least(60.0))
-            .header(22.0, |mut h| {
+            .header(26.0, |mut h| {
                 // Right clicking anywhere along the header offers the list of
                 // columns, which is where both WinRAR and NanaZip keep it.
                 // A Cell because every header cell hands the same menu to
@@ -2555,7 +2987,12 @@ impl Arca {
                 body.rows(ROW_HEIGHT, visible.len(), |mut row| {
                     let idx = row.index();
                     let r = &visible[idx];
-                    row.set_selected(self.cursor == Some(idx));
+                    // Ticked is selected, and selected is what gets painted, the
+                    // way WinRAR and the Explorer do it. Highlighting only the
+                    // row the keyboard was on said nothing about what the
+                    // buttons were going to act on.
+                    row.set_selected(self.is_checked(r));
+                    let cut = self.cut_names.contains(&r.path) || r.entry.is_some_and(|i| self.cut_names.contains(&self.entries[i].name));
                     let mut flag = self.is_checked(r);
                     row.col(|ui| {
                         if ui.checkbox(&mut flag, "").changed() {
@@ -2578,6 +3015,9 @@ impl Arca {
                         } else {
                             egui::RichText::new(&r.label)
                         };
+                        // Faded while it is on the clipboard as a cut, which is
+                        // the only sign the Explorer gives either.
+                        let text = if cut { text.weak() } else { text };
                         ui.add(egui::Label::new(text).selectable(false).truncate());
                     });
                     for which in &shown {
@@ -2644,8 +3084,34 @@ impl Arca {
                             ui.close_menu();
                         }
                         ui.separator();
-                        if ui.button(format!("{}	Ctrl+C", s.copy_names)).clicked() {
-                            wants_copy.set(true);
+                        // Only where the shell has somewhere to paste them.
+                        // Offering a copy that no other window can take would
+                        // be worse than not offering one.
+                        if clipboard::AVAILABLE {
+                            if ui.button(format!("{}	Ctrl+C", s.copy_word)).clicked() {
+                                wants_clip.set(Some(false));
+                                ui.close_menu();
+                            }
+                            if ui.button(format!("{}	Ctrl+X", s.cut_word)).clicked() {
+                                wants_clip.set(Some(true));
+                                ui.close_menu();
+                            }
+                            // Always offered rather than greyed out by looking:
+                            // the clipboard is one global lock, and opening it
+                            // on every frame the menu is up to find out what is
+                            // in it would be taking it from whoever else wants
+                            // it. An empty one says so in the status bar.
+                            if ui.button(format!("{}	Ctrl+V", s.paste_word)).clicked() {
+                                wants_paste.set(true);
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                        }
+                        if ui
+                            .button(format!("{}	Ctrl+Shift+C", s.copy_names))
+                            .clicked()
+                        {
+                            wants_copy_names.set(true);
                             ui.close_menu();
                         }
                         if ui.button(format!("{}	Ctrl+A", s.select_all)).clicked() {
@@ -2659,9 +3125,12 @@ impl Arca {
                     if resp.clicked() {
                         clicked = Some(idx);
                     }
-                    row_rects.push(resp.rect);
+                    row_rects.push((idx, resp.rect));
                     if resp.double_clicked() {
                         opened = Some(idx);
+                    }
+                    if self.cursor == Some(idx) {
+                        cursor_rect.set(Some(resp.rect));
                     }
                     // Only when the keyboard moved it: doing this every frame
                     // would fight the scroll wheel.
@@ -2726,7 +3195,7 @@ impl Arca {
                 self.set_checked(r, true);
             }
         }
-        if wants_copy.get() {
+        if wants_copy_names.get() {
             let names = self.selected_names();
             if !names.is_empty() {
                 ui.ctx().copy_text(names.join("
@@ -2742,6 +3211,21 @@ impl Arca {
         if wants_extract.get() {
             let ctx = ui.ctx().clone();
             self.ask_extract(&ctx, true);
+        }
+        if let Some(cut) = wants_clip.get() {
+            let ctx = ui.ctx().clone();
+            self.copy_to_clipboard(&ctx, cut);
+        }
+        if wants_paste.get() {
+            let ctx = ui.ctx().clone();
+            self.paste_from_clipboard(&ctx);
+        }
+
+        // A thin outline where the keyboard is, over the fill that says what is
+        // ticked. Two different things, so they cannot share the one colour.
+        if let Some(rect) = cursor_rect.get() {
+            ui.painter()
+                .rect_stroke(rect.shrink(0.5), 0.0, theme::cursor(ui.visuals()));
         }
 
         self.rubber_band(ui, &visible, &row_rects, body_area);
@@ -2800,7 +3284,15 @@ impl eframe::App for Arca {
             }
         }
 
-        if matches!(self.view, View::Browse) {
+        // Not while something is running or a window is waiting on an answer:
+        // a drop that lands then would be acting on a state that is about to
+        // change under it.
+        if matches!(self.view, View::Browse)
+            && !self.busy
+            && self.confirm_delete.is_none()
+            && self.confirm_drop.is_none()
+            && self.waiting_on_password.is_none()
+        {
             let dropped: Vec<PathBuf> = ctx.input(|i| {
                 i.raw
                     .dropped_files
@@ -2808,12 +3300,7 @@ impl eframe::App for Arca {
                     .filter_map(|f| f.path.clone())
                     .collect()
             });
-            if let Some(p) = dropped.into_iter().next() {
-                if !self.busy {
-                    self.notice.clear();
-                    self.open(ctx, p);
-                }
-            }
+            self.dropped(ctx, dropped);
         }
 
         if self.busy {
@@ -2842,6 +3329,7 @@ impl eframe::App for Arca {
                 self.conflict_window(&ctx2);
                 self.password_window(&ctx2);
                 self.confirm_delete_window(&ctx2);
+                self.confirm_drop_window(&ctx2);
                 // An exact height with the content centred inside it. Padding
                 // above and below looked symmetrical in the source and was not
                 // on screen: the text sat high in the bar.
@@ -2895,6 +3383,7 @@ impl eframe::App for Arca {
                     }
                     self.table(ui);
                 });
+                self.drop_hint(&ctx2);
             }
         }
     }
@@ -2929,10 +3418,12 @@ fn main() -> eframe::Result<()> {
         "Arca",
         options,
         Box::new(move |cc| {
-            let mut style = (*cc.egui_ctx.style()).clone();
-            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-            style.spacing.button_padding = egui::vec2(8.0, 4.0);
-            cc.egui_ctx.set_style(style);
+            cc.egui_ctx.set_fonts(theme::fonts());
+            // Both, not just the one in use: the setting can be changed while
+            // the window is open, and egui keeps a style per theme.
+            cc.egui_ctx.set_visuals_of(egui::Theme::Dark, theme::dark());
+            cc.egui_ctx.set_visuals_of(egui::Theme::Light, theme::light());
+            cc.egui_ctx.all_styles_mut(theme::style);
             cc.egui_ctx.set_theme(settings.theme);
 
             let mut app = Arca::new(settings);

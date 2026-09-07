@@ -129,6 +129,19 @@ pub struct Strings {
     pub forward: &'static str,
     pub opening: &'static str,
     pub opened_with_system: &'static str,
+    pub copy_word: &'static str,
+    pub cut_word: &'static str,
+    pub paste_word: &'static str,
+    pub copied_to_clipboard: &'static str,
+    pub cut_to_clipboard: &'static str,
+    pub clipboard_failed: &'static str,
+    pub adding: &'static str,
+    pub added: &'static str,
+    pub clipboard_empty: &'static str,
+    pub drop_title: &'static str,
+    pub drop_question: &'static str,
+    pub dropped_word: &'static str,
+    pub drop_to_add: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -224,6 +237,19 @@ const EN: Strings = Strings {
     forward: "Forward",
     opening: "Opening",
     opened_with_system: "Opened {name}",
+    copy_word: "Copy",
+    cut_word: "Cut",
+    paste_word: "Paste",
+    copied_to_clipboard: "{n} on the clipboard, ready to paste",
+    cut_to_clipboard: "{n} cut, ready to paste",
+    clipboard_failed: "the clipboard would not take it: {why}",
+    adding: "Adding to the archive",
+    added: "{n} added",
+    clipboard_empty: "there are no files on the clipboard",
+    drop_title: "That is an archive too",
+    drop_question: "Open it instead, or put it inside {name}?",
+    dropped_word: "Dropped:",
+    drop_to_add: "Let go to add it to {name}",
 };
 
 const ES: Strings = Strings {
@@ -319,6 +345,19 @@ const ES: Strings = Strings {
     forward: "Adelante",
     opening: "Abriendo",
     opened_with_system: "Abierto {name}",
+    copy_word: "Copiar",
+    cut_word: "Cortar",
+    paste_word: "Pegar",
+    copied_to_clipboard: "{n} en el portapapeles, listo para pegar",
+    cut_to_clipboard: "{n} cortado, listo para pegar",
+    clipboard_failed: "el portapapeles no lo aceptó: {why}",
+    adding: "Añadiendo al archivo",
+    added: "{n} dentro",
+    clipboard_empty: "no hay archivos en el portapapeles",
+    drop_title: "Eso también es un comprimido",
+    drop_question: "¿Lo abro, o lo meto dentro de {name}?",
+    dropped_word: "Soltado:",
+    drop_to_add: "Suelta para añadirlo a {name}",
 };
 
 pub fn strings(l: Lang) -> &'static Strings {
