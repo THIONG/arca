@@ -527,6 +527,12 @@ enum Job {
         password: Option<String>,
     },
     Test(PathBuf),
+    // Rewriting an archive with a different password, or with none.
+    Password {
+        archive: PathBuf,
+        current: Option<String>,
+        new: Option<String>,
+    },
     Compress {
         out: PathBuf,
         inputs: Vec<PathBuf>,
@@ -659,6 +665,45 @@ fn run_job_blocking(
                 ))
             }
         }
+        // Built next to the original and read back in full before it replaces
+        // it. The archive is the only copy of what is inside it.
+        Job::Password {
+            archive,
+            current,
+            new,
+        } => {
+            let temp = archive.with_file_name(format!(
+                "{}.arca-new",
+                archive
+                    .file_name()
+                    .map(|x| x.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            ));
+            let done = arca_zip::rewrite_password(
+                &archive,
+                &temp,
+                current.as_deref(),
+                new.as_deref(),
+                notify,
+            );
+            if let Err(e) = done {
+                let _ = fs::remove_file(&temp);
+                return Err(e.to_string());
+            }
+            fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
+            let name = archive
+                .file_name()
+                .map(|x| x.to_string_lossy().to_string())
+                .unwrap_or_default();
+            Ok(fill(
+                if new.is_some() {
+                    s.password_set
+                } else {
+                    s.password_removed
+                },
+                &[("name", &name)],
+            ))
+        }
         Job::Compress {
             out,
             inputs,
@@ -711,9 +756,14 @@ enum Message {
 
 // What the password window is standing in front of: a job the context menu
 // handed us, or an encrypted archive just opened in the window.
+// Which blank the password window is filling in. They are not the same
+// question: one needs the password the archive already has, the other the one it
+// is about to get.
 enum Pending {
-    Job(Box<Job>),
+    Extract(Box<Job>),
     OpenArchive,
+    CurrentPassword(Box<Job>),
+    NewPassword(Box<Job>),
 }
 
 enum View {
@@ -760,6 +810,9 @@ struct Arca {
     // Held for the archive currently open in the window, so extracting from it
     // does not ask again for every button press.
     archive_password: Option<String>,
+    // Where to look again once a password job has rewritten the archive, and the
+    // password it now carries.
+    after_password: Option<(PathBuf, Option<String>)>,
 }
 
 impl Arca {
@@ -797,6 +850,7 @@ impl Arca {
             show_password: false,
             add_password: String::new(),
             archive_password: None,
+            after_password: None,
         }
     }
 
@@ -915,6 +969,7 @@ impl Arca {
     }
 
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.archive_password = None;
         let ctx2 = ctx.clone();
         self.spawn(ctx, 0, move |tx| {
             let m = match list_entries(&path) {
@@ -933,7 +988,7 @@ impl Arca {
         if let Job::Extract { archives, password: None, .. } = &job {
             if archives.iter().any(|a| is_encrypted(a)) {
                 self.password_input.clear();
-                self.waiting_on_password = Some(Pending::Job(Box::new(job)));
+                self.waiting_on_password = Some(Pending::Extract(Box::new(job)));
                 self.view = View::Running;
                 self.title = self.s().extracting.to_string();
                 ctx.request_repaint();
@@ -945,9 +1000,14 @@ impl Arca {
         self.title = match &job {
             Job::Extract { .. } => s.extracting.to_string(),
             Job::Test(_) => s.testing.to_string(),
+            Job::Password { .. } => s.changing_password.to_string(),
             Job::Compress { .. } => s.compressing.to_string(),
         };
-        self.close_when_done = !matches!(job, Job::Test(_));
+        self.close_when_done = !matches!(job, Job::Test(_) | Job::Password { .. });
+        // The file on disk is about to change, so the listing has to be redone.
+        if let Job::Password { archive, new, .. } = &job {
+            self.after_password = Some((archive.clone(), new.clone()));
+        }
 
         let (reply_tx, reply_rx) = channel::<Answer>();
         self.replies = Some(reply_tx);
@@ -974,7 +1034,7 @@ impl Arca {
             while let Ok(m) = rx.try_recv() {
                 match m {
                     Message::Listing(path, v) => {
-                        if v.iter().any(|e| e.encrypted) {
+                        if v.iter().any(|e| e.encrypted) && self.archive_password.is_none() {
                             self.password_input.clear();
                             self.archive_password = None;
                             self.waiting_on_password = Some(Pending::OpenArchive);
@@ -1016,6 +1076,18 @@ impl Arca {
             self.channel = None;
             if !self.entries.is_empty() && self.notice.is_empty() {
                 self.notice = self.summary();
+            }
+        }
+        // The archive on disk is not the one that was listed any more. Reopen it
+        // with the password it now carries, so the browse view shows the new
+        // state and does not ask for a password it was just handed.
+        if finished_ok {
+            if let Some((path, pw)) = self.after_password.take() {
+                let notice = std::mem::take(&mut self.notice);
+                self.open(ctx, path);
+                self.archive_password = pw;
+                self.notice = notice;
+                self.view = View::Browse;
             }
         }
         if finished_ok && self.close_when_done && matches!(self.view, View::Running) {
@@ -1180,24 +1252,29 @@ impl Arca {
             return;
         }
         let s = self.s();
+        let setting = matches!(self.waiting_on_password, Some(Pending::NewPassword(_)));
         let mut go = false;
         let mut cancel = false;
-        egui::Window::new(s.password_needed)
+        egui::Window::new(if setting { s.set_password } else { s.password_needed })
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.add_space(6.0);
-                ui.label(s.password_hint);
+                ui.label(if setting { s.new_password } else { s.password_hint });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
+                    // Asked before the field is built. The text edit swallows
+                    // Enter, and asking it afterwards never sees the key, so
+                    // the window could only be dismissed with the mouse.
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let field = ui.add(
                         egui::TextEdit::singleline(&mut self.password_input)
                             .password(!self.show_password)
                             .desired_width(240.0),
                     );
                     field.request_focus();
-                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if enter {
                         go = true;
                     }
                     ui.checkbox(&mut self.show_password, s.show_password);
@@ -1215,7 +1292,7 @@ impl Arca {
             });
 
         if cancel {
-            let was_job = matches!(self.waiting_on_password, Some(Pending::Job(_)));
+            let was_job = matches!(self.waiting_on_password, Some(Pending::Extract(_)));
             self.waiting_on_password = None;
             self.password_input.clear();
             if was_job {
@@ -1226,12 +1303,23 @@ impl Arca {
         if go && !self.password_input.is_empty() {
             let given = std::mem::take(&mut self.password_input);
             match self.waiting_on_password.take() {
-                Some(Pending::Job(job)) => {
+                Some(Pending::Extract(job)) => {
                     if let Job::Extract { archives, dest, .. } = *job {
                         self.run_job(ctx, Job::Extract { archives, dest, password: Some(given) });
                     }
                 }
+                Some(Pending::CurrentPassword(job)) => {
+                    if let Job::Password { archive, new, .. } = *job {
+                        self.archive_password = Some(given.clone());
+                        self.run_job(ctx, Job::Password { archive, current: Some(given), new });
+                    }
+                }
                 Some(Pending::OpenArchive) => self.archive_password = Some(given),
+                Some(Pending::NewPassword(job)) => {
+                    if let Job::Password { archive, current, .. } = *job {
+                        self.run_job(ctx, Job::Password { archive, current, new: Some(given) });
+                    }
+                }
                 None => {}
             }
         }
@@ -1296,7 +1384,11 @@ impl Arca {
         let s = self.s();
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(!self.busy, |ui| {
+            // The password window is not modal on its own, so the toolbar behind it
+            // has to be shut off: a click there would run with a password that
+            // has not been given yet.
+            let idle = !self.busy && self.waiting_on_password.is_none();
+            ui.add_enabled_ui(idle, |ui| {
                 if ui.button(s.open).clicked() {
                     if let Some(p) = rfd::FileDialog::new()
                         .add_filter("Archives", &["zip", "tar", "gz", "tgz"])
@@ -1331,6 +1423,40 @@ impl Arca {
                     .clicked()
                 {
                     self.ask_extract(ctx, true);
+                }
+                // Only .zip has anywhere to keep a password.
+                if has && self.format == Format::Zip {
+                    ui.separator();
+                    let encrypted = self.entries.iter().any(|e| e.encrypted);
+                    let archive = self.archive.clone().unwrap_or_default();
+                    if encrypted {
+                        if ui.button(s.remove_password).clicked() {
+                            let job = Job::Password {
+                                archive,
+                                current: self.archive_password.clone(),
+                                new: None,
+                            };
+                            // Cancelling the question when the archive opened
+                            // leaves us without it, so ask again instead of
+                            // failing halfway through the rewrite.
+                            match self.archive_password {
+                                Some(_) => self.run_job(ctx, job),
+                                None => {
+                                    self.password_input.clear();
+                                    self.waiting_on_password =
+                                        Some(Pending::CurrentPassword(Box::new(job)));
+                                }
+                            }
+                        }
+                    } else if ui.button(s.set_password).clicked() {
+                        self.password_input.clear();
+                        self.waiting_on_password =
+                            Some(Pending::NewPassword(Box::new(Job::Password {
+                                archive,
+                                current: None,
+                                new: None,
+                            })));
+                    }
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

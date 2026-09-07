@@ -186,6 +186,66 @@ pub fn extract_entry_with<R: Read + Seek, W: Write>(
     dest: W,
     password: Option<&str>,
 ) -> Result<u64> {
+    let (crc_val, written) = extract_inner(source, e, dest, password)?;
+
+    // AE-2 stores a zero CRC on purpose, and the HMAC has already spoken for
+    // the contents. AE-1 keeps the real one, so a non-zero value still gets
+    // checked either way.
+    if !(e.encrypted && e.crc32 == 0) && crc_val != e.crc32 {
+        return Err(Error::Integrity { name: e.name.clone(), expected: e.crc32, found: crc_val });
+    }
+    if written != e.size {
+        return Err(Error::Format(format!(
+            "'{}': expected {} bytes but produced {written}",
+            e.name, e.size
+        )));
+    }
+    Ok(written)
+}
+
+// An AE-2 entry carries no CRC of its own, so rewriting it as a plain entry
+// means working the checksum out first, and the only way to do that is to
+// decompress the whole thing. Nothing is kept: it goes straight to a sink.
+pub fn checksum_entry<R: Read + Seek>(
+    source: &mut R,
+    e: &Entry,
+    password: Option<&str>,
+) -> Result<u32> {
+    Ok(extract_inner(source, e, io::sink(), password)?.0)
+}
+
+// Decrypts without decompressing, which is what changing a password comes down
+// to. WinZip AES encrypts the already compressed bytes, so taking the
+// encryption off gives back the exact deflate stream that was there before:
+// there is nothing to compress again.
+pub fn copy_compressed<R: Read + Seek, W: Write + ?Sized>(
+    source: &mut R,
+    e: &Entry,
+    dest: &mut W,
+    password: Option<&str>,
+) -> Result<u64> {
+    let mut bounded = open_data(source, e)?;
+    if !e.encrypted {
+        return Ok(io::copy(&mut bounded, dest)?);
+    }
+    let (keys, cipher_len) = unlock(&mut bounded, e, password)?;
+    let mut reader = aes::AesReader::new(&mut bounded, &keys, cipher_len)?;
+    let n = io::copy(&mut reader, dest)?;
+    let computed = reader.finish()?;
+    let mut auth = [0u8; aes::AUTH_CODE];
+    bounded.read_exact(&mut auth)?;
+    if !aes::auth_matches(&computed, &auth) {
+        return Err(Error::Tampered { name: e.name.clone() });
+    }
+    Ok(n)
+}
+
+// Reads the local header, checks it agrees with the central directory, and
+// hands back a reader stopped at the end of this entry's data.
+fn open_data<'a, R: Read + Seek>(
+    source: &'a mut R,
+    e: &Entry,
+) -> Result<io::Take<&'a mut R>> {
     source.seek(SeekFrom::Start(e.offset))?;
     let mut lfh = [0u8; LFH_FIXED];
     source.read_exact(&mut lfh)?;
@@ -210,33 +270,52 @@ pub fn extract_entry_with<R: Read + Seek, W: Write>(
 
     let data_start = e.offset + LFH_FIXED as u64 + n_len + x_len;
     source.seek(SeekFrom::Start(data_start))?;
-    let mut bounded = source.take(e.compressed_size);
+    Ok(source.take(e.compressed_size))
+}
 
+// Eats the salt and the verifier off the front of the entry and returns the
+// keys, plus how many bytes of ciphertext follow before the authentication
+// code. A wrong password stops here, before anything is decrypted.
+fn unlock<R: Read>(
+    bounded: &mut R,
+    e: &Entry,
+    password: Option<&str>,
+) -> Result<(aes::Keys, u64)> {
+    let pw = password.ok_or_else(|| {
+        Error::Unsupported(format!("'{}' is encrypted and needs a password", e.name))
+    })?;
+    let cipher_len = e
+        .compressed_size
+        .checked_sub(aes::OVERHEAD as u64)
+        .ok_or_else(|| {
+            Error::Format(format!(
+                "'{}': {} bytes, shorter than its own AES header",
+                e.name, e.compressed_size
+            ))
+        })?;
+    let mut salt = [0u8; aes::SALT_256];
+    bounded.read_exact(&mut salt)?;
+    let mut given = [0u8; aes::VERIFIER];
+    bounded.read_exact(&mut given)?;
+
+    let keys = aes::derive(pw, &salt);
+    if !aes::verifier_matches(&keys, &given) {
+        return Err(Error::Format(format!("'{}': wrong password", e.name)));
+    }
+    Ok((keys, cipher_len))
+}
+
+fn extract_inner<R: Read + Seek, W: Write>(
+    source: &mut R,
+    e: &Entry,
+    dest: W,
+    password: Option<&str>,
+) -> Result<(u32, u64)> {
+    let mut bounded = open_data(source, e)?;
     let mut cw = CrcWriter::new(dest);
 
     if e.encrypted {
-        let pw = password.ok_or_else(|| {
-            Error::Unsupported(format!("'{}' is encrypted and needs a password", e.name))
-        })?;
-        let cipher_len = e
-            .compressed_size
-            .checked_sub(aes::OVERHEAD as u64)
-            .ok_or_else(|| {
-                Error::Format(format!(
-                    "'{}': {} bytes, shorter than its own AES header",
-                    e.name, e.compressed_size
-                ))
-            })?;
-        let mut salt = [0u8; aes::SALT_256];
-        bounded.read_exact(&mut salt)?;
-        let mut given = [0u8; aes::VERIFIER];
-        bounded.read_exact(&mut given)?;
-
-        let keys = aes::derive(pw, &salt);
-        if !aes::verifier_matches(&keys, &given) {
-            return Err(Error::Format(format!("'{}': wrong password", e.name)));
-        }
-
+        let (keys, cipher_len) = unlock(&mut bounded, e, password)?;
         let reader = aes::AesReader::new(&mut bounded, &keys, cipher_len)?;
         let reader = decompress_into(reader, e.method, &mut cw)?;
         let computed = reader.finish()?;
@@ -255,20 +334,7 @@ pub fn extract_entry_with<R: Read + Seek, W: Write>(
     }
 
     let (_, crc_val, written) = cw.finalize();
-
-    // AE-2 stores a zero CRC on purpose, and the HMAC has already spoken for
-    // the contents. AE-1 keeps the real one, so a non-zero value still gets
-    // checked either way.
-    if !(e.encrypted && e.crc32 == 0) && crc_val != e.crc32 {
-        return Err(Error::Integrity { name: e.name.clone(), expected: e.crc32, found: crc_val });
-    }
-    if written != e.size {
-        return Err(Error::Format(format!(
-            "'{}': expected {} bytes but produced {written}",
-            e.name, e.size
-        )));
-    }
-    Ok(written)
+    Ok((crc_val, written))
 }
 
 // Hands the reader back afterwards, which is what lets the encrypted path get
@@ -575,6 +641,54 @@ impl<W: Write + Seek> ZipWriter<W> {
         mtime: Option<i64>,
     ) -> Result<()> {
         self.put_block(name_str, sealed, 0, uncompressed, method_code, mtime, true)
+    }
+
+    // Writes an entry whose compressed bytes come from somewhere else, straight
+    // through, with whatever encryption is asked for now rather than whatever it
+    // had before. `body` is handed the sink and streams into it; nothing is held
+    // in memory, so a password can be taken off a large archive without it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_entry<F>(
+        &mut self,
+        name_str: &str,
+        crc_val: u32,
+        uncompressed: u64,
+        method_code: Method,
+        mtime: Option<i64>,
+        password: Option<&str>,
+        body: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut dyn Write) -> Result<u64>,
+    {
+        let (date_val, time_val) = arca_core::unix_to_dos(mtime.unwrap_or(0));
+        let name_bytes = check_name(name_str)?;
+        let offset = self.pos;
+        let aes_extra = password.map(|_| aes::extra_field(method_code.code()));
+        let stored_code = if aes_extra.is_some() { aes::METHOD_AE } else { method_code.code() };
+        self.write_lfh(&name_bytes, stored_code, date_val, time_val, aes_extra.as_deref())?;
+        let extra_offset = offset + LFH_FIXED as u64 + name_bytes.len() as u64;
+        let extra_len = EXTRA_Z64 + aes_extra.as_ref().map_or(0, |x| x.len());
+
+        let (comp_size, stored_crc) = match password {
+            None => (body(&mut self.out)?, crc_val),
+            Some(pw) => {
+                let salt = aes::random_salt()?;
+                let keys = aes::derive(pw, &salt);
+                self.out.write_all(&salt)?;
+                self.out.write_all(&aes::verifier_of(&keys))?;
+                let mut sink = aes::AesWriter::new(&mut self.out, &keys)?;
+                body(&mut sink)?;
+                let (_, auth, written) = sink.finish();
+                self.out.write_all(&auth)?;
+                (aes::OVERHEAD as u64 + written, 0)
+            }
+        };
+
+        self.close_entry(
+            name_bytes, offset, extra_offset, extra_len, stored_crc, comp_size, uncompressed,
+            method_code, date_val, time_val, name_str.ends_with('/'), password.is_some(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -890,6 +1004,61 @@ fn available_threads() -> u32 {
     std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1)
 }
 
+// Writes a copy of `archive` at `out` carrying a different password, or none.
+//
+// Nothing is compressed again. WinZip AES encrypts the already compressed
+// bytes, so the deflate stream comes back out of the decryption exactly as it
+// went in and is written straight through. What that costs instead is the
+// checksum: an AE-2 entry stores a zero CRC, so the entry has to be decompressed
+// once to work out the real one before it can be written as a plain entry.
+//
+// The copy is read back in full before this returns. Replacing an archive in
+// place destroys the only copy of the data, and the caller can only make that
+// safe if it knows the new file is sound first.
+pub fn rewrite_password(
+    archive: &std::path::Path,
+    out: &std::path::Path,
+    current: Option<&str>,
+    new: Option<&str>,
+    notify: &dyn Fn(usize, usize, &str),
+) -> Result<u64> {
+    use std::fs::File;
+    use std::io::{BufReader, BufWriter};
+
+    let entries = ZipArchive::open(File::open(archive)?)?.entries().to_vec();
+    let total = entries.len();
+    let mut w = ZipWriter::new(BufWriter::with_capacity(STREAM_BUF, File::create(out)?));
+    let mut bytes = 0u64;
+
+    for (i, e) in entries.iter().enumerate() {
+        notify(i, total, &e.name);
+        // Directories hold nothing, and no other tool encrypts them either.
+        let pw = if e.is_dir { None } else { new };
+        let crc = if e.encrypted && e.crc32 == 0 {
+            let mut src = BufReader::with_capacity(STREAM_BUF, File::open(archive)?);
+            checksum_entry(&mut src, e, current)?
+        } else {
+            e.crc32
+        };
+        let mut src = BufReader::with_capacity(STREAM_BUF, File::open(archive)?);
+        w.copy_entry(&e.name, crc, e.size, e.method, e.mtime, pw, |sink| {
+            copy_compressed(&mut src, e, sink, current)
+        })?;
+        bytes += e.size;
+    }
+    w.finish()?.flush()?;
+
+    let mut check = ZipArchive::open(File::open(out)?)?;
+    for i in 0..check.len() {
+        if check.entries()[i].is_dir {
+            continue;
+        }
+        check.extract_to_with(i, io::sink(), new)?;
+    }
+    notify(total, total, "");
+    Ok(bytes)
+}
+
 // Wraps an already compressed block the way an encrypted entry sits on disk:
 // salt, password verifier, ciphertext and authentication code. Kept apart from
 // the writer so it can run on whatever thread compressed the block.
@@ -1056,6 +1225,98 @@ mod tests {
             a.extract_to_with(0, &mut out, Some(pw)).unwrap();
             assert_eq!(out, body, "{pw}");
         }
+    }
+
+    // The same three steps the CLI's `password` command takes, in memory: work
+    // out the checksum, stream the compressed bytes through, write them back
+    // under whatever encryption is wanted now.
+    fn rewrite(buf: &[u8], current: Option<&str>, new: Option<&str>) -> Vec<u8> {
+        let entries = ZipArchive::open(IoCursor::new(buf.to_vec()))
+            .unwrap()
+            .entries()
+            .to_vec();
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        for e in &entries {
+            let crc = if e.encrypted && e.crc32 == 0 {
+                let mut src = IoCursor::new(buf.to_vec());
+                checksum_entry(&mut src, e, current).unwrap()
+            } else {
+                e.crc32
+            };
+            let mut src = IoCursor::new(buf.to_vec());
+            w.copy_entry(&e.name, crc, e.size, e.method, e.mtime, new, |sink| {
+                copy_compressed(&mut src, e, sink, current)
+            })
+            .unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    fn only_entry(buf: &[u8], password: Option<&str>) -> (Vec<u8>, bool, u64) {
+        let mut a = ZipArchive::open(IoCursor::new(buf.to_vec())).unwrap();
+        let encrypted = a.entries()[0].encrypted;
+        let packed = a.entries()[0].compressed_size;
+        let mut out = Vec::new();
+        a.extract_to_with(0, &mut out, password).unwrap();
+        (out, encrypted, packed)
+    }
+
+    #[test]
+    fn taking_the_password_off_keeps_the_contents() {
+        let body = b"something worth keeping ".repeat(400);
+        let encrypted = encrypted_archive("hunter2", Codec::Deflate, &body);
+        let plain = rewrite(&encrypted, Some("hunter2"), None);
+
+        let (out, still_encrypted, packed) = only_entry(&plain, None);
+        assert_eq!(out, body);
+        assert!(!still_encrypted, "it should not be encrypted any more");
+        // The compressed stream came through untouched: only the AES wrapper
+        // went away, and that is exactly its own overhead.
+        let before = ZipArchive::open(IoCursor::new(encrypted)).unwrap().entries()[0]
+            .compressed_size;
+        assert_eq!(packed, before - aes::OVERHEAD as u64);
+    }
+
+    #[test]
+    fn putting_a_password_on_a_plain_archive() {
+        let body = b"plain to begin with ".repeat(300);
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        w.add("secret.txt", &body[..], Codec::Deflate, Level::Normal, None).unwrap();
+        let plain = w.finish().unwrap().into_inner();
+
+        let encrypted = rewrite(&plain, None, Some("nueva"));
+        let (out, is_encrypted, _) = only_entry(&encrypted, Some("nueva"));
+        assert_eq!(out, body);
+        assert!(is_encrypted);
+
+        let mut a = ZipArchive::open(IoCursor::new(encrypted)).unwrap();
+        assert!(
+            a.extract_to(0, &mut Vec::new()).is_err(),
+            "it must not open without the password"
+        );
+    }
+
+    #[test]
+    fn changing_the_password_locks_out_the_old_one() {
+        let body = b"contents".repeat(100);
+        let first = encrypted_archive("old", Codec::Deflate, &body);
+        let second = rewrite(&first, Some("old"), Some("new"));
+
+        let (out, _, _) = only_entry(&second, Some("new"));
+        assert_eq!(out, body);
+        let mut a = ZipArchive::open(IoCursor::new(second)).unwrap();
+        assert!(a.extract_to_with(0, &mut Vec::new(), Some("old")).is_err());
+    }
+
+    #[test]
+    fn a_wrong_password_stops_the_rewrite_before_it_writes() {
+        let buf = encrypted_archive("right", Codec::Deflate, b"payload");
+        let entries = ZipArchive::open(IoCursor::new(buf.clone())).unwrap().entries().to_vec();
+        let mut src = IoCursor::new(buf);
+        let mut sink = Vec::new();
+        let r = copy_compressed(&mut src, &entries[0], &mut sink, Some("wrong"));
+        assert!(r.is_err(), "{r:?}");
+        assert!(sink.is_empty(), "nothing may come out for a wrong password");
     }
 
     #[test]

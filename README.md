@@ -10,7 +10,7 @@ a nivel de crate. Un archivo malformado produce un error, nunca corrupción de m
 
 ```sh
 cargo build --release      # binario en target/release/arca
-cargo test --workspace     # 41 pruebas
+cargo test --workspace     # 45 pruebas
 bash interop.sh            # criterio de aceptación de la fase
 ```
 
@@ -33,6 +33,9 @@ arca list copia.zip --time
 arca extract copia.zip -o destino/
 arca extract copia.zip -o destino/ -p clave     # archivo cifrado
 arca extract copia.zip -o destino/ -j 8        # hilos; 0 = todos los núcleos
+arca password copia.zip -p clave                 # le quita la contraseña
+arca password copia.zip --new clave              # se la pone
+arca password copia.zip -p vieja --new nueva     # se la cambia
 arca test copia.zip                              # verifica CRC sin escribir en disco
 arca bench copia.zip                             # mide los requisitos R1 y R2
 ```
@@ -154,13 +157,37 @@ arca extract secreto.zip -o destino/ -p "una clave"
 En la interfaz gráfica hay un campo de contraseña al crear, y al abrir un archivo
 cifrado la ventana la pide antes de extraer.
 
+### Cambiar la contraseña de un archivo que ya existe
+
+```sh
+arca password secreto.zip -p "una clave"                   # se la quita
+arca password normal.zip --new "una clave"                 # se la pone
+arca password secreto.zip -p "vieja" --new "nueva"         # se la cambia
+arca password secreto.zip -p "una clave" -o limpio.zip     # sin tocar el original
+```
+
+No se vuelve a comprimir nada. AES cifra los bytes ya comprimidos, así que
+quitarle el cifrado devuelve exactamente el mismo flujo deflate que había: sale
+tal cual, y el tamaño comprimido no cambia. Lo que sí cuesta es el CRC, porque
+una entrada AE-2 lo guarda a cero y hay que descomprimirla una vez para
+calcularlo antes de poder escribirla sin cifrar.
+
+Reemplazar en el sitio destruye la única copia de los datos, así que el archivo
+nuevo se construye al lado, se lee entero para comprobar que está bien, y solo
+entonces se mueve encima. Si algo falla, el original se queda como estaba y no
+queda ningún temporal.
+
+En la interfaz gráfica es un botón en la barra: **Quitar contraseña** si el
+archivo abierto está cifrado, **Poner contraseña…** si no lo está.
+
 ## Interoperabilidad
 
-`interop.sh` comprueba 27 casos verificando el SHA-256 del contenido:
+`interop.sh` comprueba 34 casos verificando el SHA-256 del contenido:
 
 - Lo que escribe Arca lo leen `unzip`, `tar` y 7-Zip, en los cuatro niveles
 - Lo que escriben `zip`, `tar` y 7-Zip lo lee Arca sin perder un byte
 - Un archivo cifrado con AES-256 por Arca lo abre 7-Zip, y al revés
+- Poner y quitar la contraseña de un archivo ya hecho, propio o de 7-Zip
 - Un byte alterado se detecta por CRC, o por el HMAC si está cifrado
 - Una entrada con `../../` se rechaza en vez de escribir fuera del destino
 

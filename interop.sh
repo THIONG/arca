@@ -93,14 +93,49 @@ printf '\x5A' | dd of=out/enc-bad.zip bs=1 seek=90 conv=notrunc 2>/dev/null
 $ARCA test out/enc-bad.zip -p "$PW" >/dev/null 2>&1 && ko "altered ciphertext went unnoticed" || ok "altered ciphertext fails its authentication code"
 
 echo
-echo "D) Corruption detection"
+echo "D) Adding and removing the password of an existing archive"
+cp out/enc.zip out/off.zip
+$ARCA password out/off.zip -p "$PW" >/dev/null 2>&1
+7z t out/off.zip >/dev/null 2>&1 && ok "7-Zip opens it with no password at all" || ko "7-Zip still asks for a password"
+rm -rf y; mkdir y
+7z x -y -o"y" out/off.zip >/dev/null 2>&1
+H=$(cd y/src && find . -type f|sort|xargs sha256sum|sha256sum|cut -d' ' -f1)
+[ "$H" = "$REF" ] && ok "taking the password off keeps every byte" || ko "content changed when the password came off"
+
+# The same, starting from an archive 7-Zip encrypted.
+cp out/enc7.zip out/off7.zip
+$ARCA password out/off7.zip -p "$PW" >/dev/null 2>&1
+rm -rf y; mkdir y
+$ARCA extract out/off7.zip -o y >/dev/null 2>&1
+H=$(cd y/src && find . -type f|sort|xargs sha256sum|sha256sum|cut -d' ' -f1)
+[ "$H" = "$REF" ] && ok "the password comes off a 7-Zip archive too" || ko "7-Zip archive broke when the password came off"
+
+# And back on, on an archive that never had one.
+cp out/a-normal.zip out/on.zip
+$ARCA password out/on.zip --new "$PW" >/dev/null 2>&1
+7z t out/on.zip >/dev/null 2>&1 && ko "it opened without the password that was just set" || ok "without the password it no longer opens"
+rm -rf y; mkdir y
+7z x -y -p"$PW" -o"y" out/on.zip >/dev/null 2>&1
+H=$(cd y/src && find . -type f|sort|xargs sha256sum|sha256sum|cut -d' ' -f1)
+[ "$H" = "$REF" ] && ok "7-Zip opens what Arca has just encrypted" || ko "7-Zip cannot read the archive Arca encrypted"
+
+# The archive is the only copy of the data. A wrong password must not touch it.
+cp out/enc.zip out/keep.zip
+BEFORE=$(sha256sum out/keep.zip | cut -d' ' -f1)
+$ARCA password out/keep.zip -p "not the password" >/dev/null 2>&1
+AFTER=$(sha256sum out/keep.zip | cut -d' ' -f1)
+[ "$BEFORE" = "$AFTER" ] && ok "a wrong password leaves the archive untouched" || ko "THE ARCHIVE WAS DAMAGED BY A WRONG PASSWORD"
+ls out/*.arca-new >/dev/null 2>&1 && ko "a half written temporary file was left behind" || ok "no temporary file left behind"
+
+echo
+echo "E) Corruption detection"
 cp out/a-normal.zip out/corrupt.zip
 printf '\xDE\xAD' | dd of=out/corrupt.zip bs=1 seek=200 conv=notrunc 2>/dev/null
 $ARCA test out/corrupt.zip >/dev/null 2>&1 && ko "corrupt zip not detected" || ok "corruption detected, exits with an error"
 $ARCA test out/a-normal.zip >/dev/null 2>&1 && ok "accepts the intact archive" || ko "rejects a valid archive"
 
 echo
-echo "E) Security: Zip Slip"
+echo "F) Security: Zip Slip"
 python3 - <<'PY'
 import zipfile
 z=zipfile.ZipFile('/tmp/interop/out/slip.zip','w')

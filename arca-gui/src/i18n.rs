@@ -108,6 +108,12 @@ pub struct Strings {
     pub password_needed: &'static str,
     pub password_hint: &'static str,
     pub show_password: &'static str,
+    pub set_password: &'static str,
+    pub remove_password: &'static str,
+    pub new_password: &'static str,
+    pub password_set: &'static str,
+    pub password_removed: &'static str,
+    pub changing_password: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -182,6 +188,12 @@ const EN: Strings = Strings {
     password_needed: "This archive is encrypted",
     password_hint: "Type the password to open it",
     show_password: "Show",
+    set_password: "Set password…",
+    remove_password: "Remove password",
+    new_password: "Password to protect the archive with",
+    password_set: "{name} is now encrypted with AES-256",
+    password_removed: "{name} is no longer encrypted",
+    changing_password: "Rewriting the archive",
 };
 
 const ES: Strings = Strings {
@@ -256,6 +268,12 @@ const ES: Strings = Strings {
     password_needed: "Este archivo está cifrado",
     password_hint: "Escribe la contraseña para abrirlo",
     show_password: "Ver",
+    set_password: "Poner contraseña…",
+    remove_password: "Quitar contraseña",
+    new_password: "Contraseña con la que proteger el archivo",
+    password_set: "{name} queda cifrado con AES-256",
+    password_removed: "{name} ya no está cifrado",
+    changing_password: "Reescribiendo el archivo",
 };
 
 pub fn strings(l: Lang) -> &'static Strings {

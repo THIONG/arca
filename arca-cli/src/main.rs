@@ -75,6 +75,21 @@ enum Cmd {
         #[arg(short = 'p', long, help = "Password of an AES-256 encrypted archive")]
         password: Option<String>,
     },
+    #[command(
+        about = "Add, change or remove the password of an existing archive",
+        long_about = "Rewrites the archive with a different password, or with none.\n\nThe entries are not compressed again: WinZip AES encrypts the already\ncompressed bytes, so taking the encryption off gives back the same stream\nthat was there before."
+    )]
+    Password {
+        #[arg(help = "Archive to rewrite (.zip)")]
+        archive: PathBuf,
+        #[arg(short = 'p', long, help = "Current password, if the archive has one")]
+        password: Option<String>,
+        #[arg(long, help = "New password. Leave it out to remove the encryption")]
+        new: Option<String>,
+        #[arg(short = 'o', long,
+              help = "Write here instead of replacing the archive in place")]
+        out: Option<PathBuf>,
+    },
     #[command(about = "Measure the R1 and R2 performance requirements")]
     Bench {
         #[arg(help = "Archive to measure against")]
@@ -170,6 +185,12 @@ fn run(cli: Cli) -> Result<()> {
             password,
         } => extract(&archive, &dest, on_conflict, threads, password.as_deref()),
         Cmd::Test { archive, password } => test_archive(&archive, password.as_deref()),
+        Cmd::Password {
+            archive,
+            password,
+            new,
+            out,
+        } => change_password(&archive, out.as_deref(), password.as_deref(), new.as_deref()),
         Cmd::Bench { archive } => bench(&archive),
     }
 }
@@ -549,6 +570,70 @@ fn extract(
     println!(
         "{n} files, {} written in {:.3} s",
         human(bytes),
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+// Rewrites the archive with a different password, or with none. The entries go
+// through decrypted but still compressed, so nothing is compressed again and
+// the sizes come out identical to the ones that went in.
+//
+// Replacing in place is the destructive case, and there is only one copy of the
+// data. So the new archive is built next to the old one, verified end to end,
+// and only then moved over it. Any failure leaves the original untouched.
+fn change_password(
+    archive: &Path,
+    out: Option<&Path>,
+    current: Option<&str>,
+    new: Option<&str>,
+) -> Result<()> {
+    if detect(archive)? != Format::Zip {
+        return Err(Error::Unsupported(
+            "only .zip carries encryption; .tar and .tar.gz have nowhere to put it".into(),
+        ));
+    }
+    let entries = ZipArchive::open(File::open(archive)?)?.entries().to_vec();
+    let was_encrypted = entries.iter().any(|e| e.encrypted);
+    if !was_encrypted && new.is_none() {
+        return Err(Error::Format(format!(
+            "'{}' has no password to remove",
+            archive.display()
+        )));
+    }
+    if !was_encrypted && current.is_some() {
+        return Err(Error::Format(format!(
+            "'{}' is not encrypted, so there is no current password",
+            archive.display()
+        )));
+    }
+
+    let target = out.unwrap_or(archive);
+    let temp = target.with_file_name(format!(
+        "{}.arca-new",
+        target.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+    ));
+    let t0 = Instant::now();
+
+    let bytes = match arca_zip::rewrite_password(archive, &temp, current, new, &|_, _, _| {}) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = fs::remove_file(&temp);
+            return Err(e);
+        }
+    };
+
+    fs::rename(&temp, target)?;
+    println!(
+        "{}: {} entries, {} {} in {:.3} s",
+        target.display(),
+        entries.len(),
+        human(bytes),
+        if new.is_some() {
+            "now encrypted with AES-256"
+        } else {
+            "no longer encrypted"
+        },
         t0.elapsed().as_secs_f64()
     );
     Ok(())
