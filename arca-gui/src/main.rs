@@ -2770,7 +2770,12 @@ impl Arca {
             )
         });
 
-        if !down {
+        // Something else has the pointer: the handle that resizes a column, or
+        // the scroll bar. Both are drawn over the list rather than beside it, so
+        // a press on either lands inside the rows and used to start a band as
+        // well as doing its own job. A row only senses clicks and can never be
+        // the thing being dragged, so this cannot turn off what it is for.
+        if !down || ui.ctx().dragged_id().is_some() {
             self.band = None;
             self.band_anchor = None;
             self.band_scroll = None;
@@ -2813,7 +2818,11 @@ impl Arca {
         };
         // A click is a drag of no distance. Under this it is left alone, so
         // clicking a row still means clicking a row.
-        if (here - start).length() < 4.0 {
+        //
+        // Further than egui waits before calling a drag a drag, on purpose: a
+        // band that appeared first would flash over the rows for the pixel or
+        // two between the two thresholds every time a column was resized.
+        if (here - start).length() < 10.0 {
             return;
         }
 
