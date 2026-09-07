@@ -6,7 +6,7 @@ members = ["arca-core", "arca-zip", "arca-tar", "arca-cli", "arca-gui", "arca-ic
 exclude = ["windows/arca-shell"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
