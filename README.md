@@ -122,6 +122,84 @@ takes 0.128 s (`arca test bench.zip`). 97 % of the time goes into creating files
 on NTFS, not into decompressing. 7-Zip takes the same 4.6 s because it hits the
 same wall.
 
+### Against NanaZip, on an archive big enough to hurt
+
+The corpus above is small enough to sit in the operating system's write cache,
+which flatters everybody. This one does not: a 3.13 GB `.zip` holding 1513
+files that unpack to 6.28 GB, all deflate, with 13 entries over 100 MB and the
+five largest adding up to 2.77 GB. Windows 11, 16 cores, NanaZip 7.0.1832, and
+a Kingston A400 — a DRAM-less SATA SSD.
+
+First, decompression on its own. Both tools read every entry, check every CRC
+and write nothing, so the disk is out of the picture. Both run on one core:
+
+| | Wall | CPU | Cores |
+|---|---|---|---|
+| **Arca** | **13.2 s** | 13.2 s | 1.0 |
+| NanaZip | 25.9 s | 25.9 s | 1.0 |
+
+```
+arca test big.zip
+NanaZipC t big.zip
+```
+
+Same work, same one core, no disk: **the deflate decoder is 2× faster**. Three
+runs each landed within 0.3 s.
+
+Then the whole job, writing all 6.28 GB out. Run A B B A so that whatever the
+disk does over time cannot favour either side, with a plain 6 GB sequential
+write before and after as a control:
+
+| Order | | Time |
+|---|---|---|
+| 1st | **Arca** | **21.9 s** |
+| 2nd | NanaZip | 49.0 s |
+| 3rd | NanaZip | 68.0 s |
+| 4th | **Arca** | **28.0 s** |
+
+```
+arca extract big.zip -o out
+NanaZipC x -y -o"out" big.zip
+```
+
+The control says why the order matters: the disk sustained **327 MB/s before
+the four runs and 90 MB/s after them**. Arca took the first slot and the last,
+so it ran on both the freshest and the most worn disk; NanaZip got the two in
+between. Arca's *worst* run still beats NanaZip's *best*.
+
+### Why Arca wins here, and it is not the disk
+
+Measuring processor time during a real extraction separates the two possible
+explanations. Its own pair of runs, so the wall times need not match the table
+above; what matters is the shape:
+
+| | Wall | CPU | Cores |
+|---|---|---|---|
+| **Arca** | **19.4 s** | 22.0 s | 1.1 |
+| NanaZip | 31.6 s | 30.1 s | 1.0 |
+
+Arca is not winning by spreading the work wider: it uses 1.1 cores against 1.0.
+What the table shows instead is that NanaZip's wall time and its processor time
+are the same number, which is what a program looks like when its own CPU is the
+limit — the disk never gets to be its problem. Arca burns more CPU than wall
+clock, so decompression is happening while bytes are going out, and the wall
+clock settles against the disk: 6.28 GB in 21.9 s is 294 MB/s, against a
+measured ceiling of 327 MB/s.
+
+So the faster decoder is the cause and saturating the disk is the consequence,
+not the other way round. It also means this machine shows Arca at its worst:
+those 16 threads are mostly parked waiting for writes, and on a drive that
+could take the bytes faster the gap would open up, because Arca's limit would
+move and NanaZip's would not.
+
+**On measuring this at all:** an ordered sweep over thread counts on this drive
+produced a clean, convincing and completely false result — 1 thread looking
+twice as fast as 16 — because the drive degrades as a run goes on and "more
+threads" was really "later in the run". Re-running alternating, 16 threads beat
+1 thread in all three rounds. Any benchmark here that writes several GB has to
+alternate the arms and check the disk before and after, or it measures the SSD's
+mood.
+
 **A note on Zstandard in ZIP:** it is method 93, registered in the specification
 but not yet read by classic `unzip`. That is why `-c auto` uses deflate in a
 `.zip`: a zip exists so that anything can open it. Zstandard is asked for by
