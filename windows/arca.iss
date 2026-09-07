@@ -174,10 +174,13 @@ var
   Path, Text: string;
 begin
   Path := ExpandConstant('{app}\AppxManifest.xml');
-  if LoadStringFromFile(Path, Text) then
+  // Through code page 65001 and not LoadStringFromFile, which hands back an
+  // AnsiString: the manifest carries 26 bytes of UTF-8 in its Spanish
+  // description, and a round trip through the ANSI code page would eat them.
+  if LoadStringFromFileInCP(Path, Text, 65001) then
   begin
     StringChangeEx(Text, 'Version="0.0.0.0"', 'Version="{#Version}.0"', True);
-    SaveStringToFile(Path, Text, False);
+    SaveStringToFileInCP(Path, Text, 65001, False);
   end;
 end;
 

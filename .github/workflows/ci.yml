@@ -61,6 +61,25 @@ jobs:
           cargo test
           cargo clippy --release --all-targets -- -D warnings
 
+      # The installer used to be compiled for the first time during a release,
+      # which is where two breakages were found: once a wrong path to the DLL,
+      # once Pascal that did not compile. Neither was visible until a tag had
+      # already been pushed. It is built here now, on every push, with the same
+      # arguments the release uses.
+      - name: Windows installer
+        shell: bash
+        run: |
+          set -eu
+          cargo build --release --target x86_64-pc-windows-msvc
+          cargo build --release --target x86_64-pc-windows-msvc \
+            --manifest-path windows/arca-shell/Cargo.toml
+          ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          test -f "$ISCC" || choco install innosetup -y --no-progress
+          BIN='//DBinDir=..\target\x86_64-pc-windows-msvc\release'
+          SHELL_DIR='//DShellDir=arca-shell\target\x86_64-pc-windows-msvc\release'
+          "$ISCC" //DVersion=0.0.0 "$BIN" "$SHELL_DIR" windows/arca.iss
+          test -f dist/arca-setup-0.0.0-x86_64.exe
+
   macos:
     name: Build on macOS
     runs-on: macos-latest
