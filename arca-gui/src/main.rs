@@ -963,6 +963,13 @@ struct Arca {
     // whatever was ahead, the way a browser does.
     history: Vec<String>,
     here: usize,
+    // The row the keyboard is on. Everything the arrows, Enter and Space do
+    // hangs off this, and there was no such thing before: the table had
+    // checkboxes but no cursor. None means nothing is focused yet.
+    cursor: Option<usize>,
+    // Set when the cursor moves by keyboard, so the table can scroll it into
+    // view on the next frame and then forget about it.
+    scroll_to_cursor: bool,
 }
 
 impl Arca {
@@ -1003,6 +1010,8 @@ impl Arca {
             after_password: None,
             history: vec![String::new()],
             here: 0,
+            cursor: None,
+            scroll_to_cursor: false,
         }
     }
 
@@ -1839,6 +1848,77 @@ impl Arca {
         });
     }
 
+    // Everything the keyboard does to the list, in one place. `rows` is what is
+    // on screen right now, which is what the arrows should walk: filtering or
+    // changing folder changes the list under the cursor, so it is clamped here
+    // rather than tracked separately.
+    fn keyboard(&mut self, ctx: &egui::Context, rows: &[Row]) {
+        if rows.is_empty() {
+            self.cursor = None;
+            return;
+        }
+        // A text box has the keyboard: the filter field, or a dialog. Arrows
+        // and Space belong to it, not to the list.
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+
+        let last = rows.len() - 1;
+        let page = 12usize;
+        let mut moved = None;
+        let mut enter = false;
+        let mut space = false;
+        let mut up_level = false;
+
+        ctx.input(|i| {
+            let at = self.cursor.unwrap_or(0);
+            for (key, to) in [
+                (egui::Key::ArrowDown, (at + 1).min(last)),
+                (egui::Key::ArrowUp, at.saturating_sub(1)),
+                (egui::Key::PageDown, (at + page).min(last)),
+                (egui::Key::PageUp, at.saturating_sub(page)),
+                (egui::Key::Home, 0),
+                (egui::Key::End, last),
+            ] {
+                if i.key_pressed(key) {
+                    // The first press only lands the cursor somewhere visible
+                    // instead of jumping a row from nowhere.
+                    moved = Some(if self.cursor.is_none() { 0 } else { to });
+                }
+            }
+            enter = i.key_pressed(egui::Key::Enter);
+            space = i.key_pressed(egui::Key::Space);
+            up_level = i.key_pressed(egui::Key::Backspace);
+        });
+
+        if let Some(to) = moved {
+            self.cursor = Some(to);
+            self.scroll_to_cursor = true;
+        }
+
+        if up_level && !self.current_dir.is_empty() {
+            let parent = parent_of(&self.current_dir);
+            self.go_to(parent);
+            return;
+        }
+
+        let Some(at) = self.cursor else { return };
+        let Some(row) = rows.get(at) else { return };
+
+        if space {
+            let value = !self.is_checked(row);
+            self.set_checked(row, value);
+        }
+        if enter {
+            if row.is_dir {
+                let path = row.path.clone();
+                self.go_to(path);
+            } else if let Some(i) = row.entry {
+                self.open_file(ctx, i);
+            }
+        }
+    }
+
     // Going somewhere new drops whatever was ahead in the history, the way a
     // browser does. Re-entering the folder already showing is not a move.
     fn go_to(&mut self, path: String) {
@@ -1889,6 +1969,12 @@ impl Arca {
     fn table(&mut self, ui: &mut egui::Ui) {
         let s = self.s();
         let visible = self.visible_rows();
+        // Before the table is drawn, so a move this frame is painted this
+        // frame rather than one behind.
+        self.keyboard(ui.ctx(), &visible);
+        if self.cursor.is_some_and(|c| c >= visible.len()) {
+            self.cursor = if visible.is_empty() { None } else { Some(visible.len() - 1) };
+        }
 
         ui.horizontal(|ui| {
             if ui.small_button(s.check_all).clicked() {
@@ -1916,6 +2002,7 @@ impl Arca {
         let mut requested: Option<SortColumn> = None;
         let mut toggle: Option<(usize, bool)> = None;
         let mut opened: Option<usize> = None;
+        let mut moved_cursor: Option<usize> = None;
         let order = self.order;
         let hint = s.sort_hint;
         let head = |ui: &mut egui::Ui, text: &str, col: SortColumn| -> bool {
@@ -1982,6 +2069,7 @@ impl Arca {
                 body.rows(ROW_HEIGHT, visible.len(), |mut row| {
                     let idx = row.index();
                     let r = &visible[idx];
+                    row.set_selected(self.cursor == Some(idx));
                     let mut flag = self.is_checked(r);
                     row.col(|ui| {
                         if ui.checkbox(&mut flag, "").changed() {
@@ -2024,16 +2112,22 @@ impl Arca {
                     if resp.hovered() {
                         resp.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
+                    if resp.clicked() {
+                        moved_cursor = Some(idx);
+                    }
                     if resp.double_clicked() {
                         opened = Some(idx);
+                    }
+                    // Only when the keyboard moved it: doing this every frame
+                    // would fight the scroll wheel.
+                    if self.scroll_to_cursor && self.cursor == Some(idx) {
+                        resp.scroll_to_me(Some(egui::Align::Center));
                     }
                 });
             });
 
         if let Some((index, value)) = toggle {
-            let target = &visible[index];
-            let path = target.path.clone();
-            let entry = target.entry;
+            let (path, entry) = (visible[index].path.clone(), visible[index].entry);
             match entry {
                 Some(i) => self.checked[i] = value,
                 None => {
@@ -2042,6 +2136,10 @@ impl Arca {
                     }
                 }
             }
+        }
+        self.scroll_to_cursor = false;
+        if let Some(index) = moved_cursor {
+            self.cursor = Some(index);
         }
         if let Some(index) = opened {
             let target = &visible[index];

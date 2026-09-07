@@ -271,6 +271,22 @@ The mouse back and forward buttons move through where you have been, and so do
 Alt+Left and Alt+Right. The three arrows on the toolbar do the same thing, plus
 one level up.
 
+The list can be driven without a mouse at all. The keys act on the highlighted
+row, and the first arrow press puts that highlight on the first row rather than
+jumping blindly:
+
+| | |
+|---|---|
+| ↑ ↓ · PageUp PageDown · Home End | move through the list |
+| Enter | go into the folder, or open the file |
+| Backspace | up one level |
+| Space | tick or untick the row |
+| Alt+← Alt+→ | back and forward |
+
+While the filter box or a dialog has the keyboard, none of these apply: the
+typing belongs there. The window also declares itself through AccessKit, so
+Narrator and NVDA can read it.
+
 Right clicking an archive in the Explorer opens the window with a progress bar
 rather than running the command line with no console: an extraction that fails,
 or that finds a file already there, now says so instead of doing nothing.
