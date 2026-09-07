@@ -25,6 +25,9 @@ use std::time::Instant;
 
 const BUF: usize = 256 * 1024;
 const ROW_HEIGHT: f32 = 23.0;
+// A second click on the same row within this opens it. Half a second, which is
+// what Windows uses for the same gesture by default.
+const DOUBLE_CLICK: f64 = 0.5;
 const ICON_PNG: &[u8] = include_bytes!("../../brand/arca-256.png");
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -1250,6 +1253,9 @@ struct Arca {
     // screen, because the list moves while the drag is happening.
     band_anchor: Option<usize>,
     band_scroll: Option<f32>,
+    // The last row a left click landed on, and when. What tells a second click
+    // on the same row from the first one of a new pair.
+    last_click: Option<(usize, f64)>,
     // Names waiting on a yes before they are taken out of the archive. There
     // is no undo, so this one asks.
     confirm_delete: Option<Vec<String>>,
@@ -1317,6 +1323,7 @@ impl Arca {
             confirm_drop: None,
             band_anchor: None,
             band_scroll: None,
+            last_click: None,
         }
     }
 
@@ -2958,6 +2965,8 @@ impl Arca {
     fn clear_picked(&mut self) {
         self.checked.iter_mut().for_each(|c| *c = false);
         self.cursor = None;
+        // A row number means something else in the folder now on screen.
+        self.last_click = None;
     }
 
     fn can_go_back(&self) -> bool {
@@ -3033,6 +3042,10 @@ impl Arca {
         let mut toggle: Option<(usize, bool)> = None;
         let mut opened: Option<usize> = None;
         let mut clicked: Option<usize> = None;
+        // Only the left button, and only from a row. The row menu also fills in
+        // `clicked` so that right clicking something picks it, and a right
+        // click is not half of a double click.
+        let mut left_click: Option<usize> = None;
         let columns = self.settings.columns;
         // The ones on, in the order they are drawn. The header, the cells and
         // the column widths all walk this same list, so they cannot drift.
@@ -3314,11 +3327,9 @@ impl Arca {
                     });
                     if resp.clicked() {
                         clicked = Some(idx);
+                        left_click = Some(idx);
                     }
                     row_rects.push((idx, resp.rect));
-                    if resp.double_clicked() {
-                        opened = Some(idx);
-                    }
                     if self.cursor == Some(idx) {
                         cursor_rect.set(Some(resp.rect));
                     }
@@ -3378,6 +3389,25 @@ impl Arca {
                 self.set_checked(&target, true);
             }
             self.cursor = Some(index);
+        }
+
+        // Opening keeps its own count of clicks rather than asking egui whether
+        // this was a double one. egui counts by time alone, and never counts
+        // back down to two: after a double click the next one is a triple, and
+        // so is the one after that, so opening a second folder straight after
+        // the first did nothing until you had waited long enough for the run to
+        // lapse. This count starts again every time something opens, so one
+        // folder after another works at whatever speed they are clicked.
+        if let Some(index) = left_click {
+            let (now, plain) = ui.input(|i| (i.time, !i.modifiers.command && !i.modifiers.shift));
+            let again = plain
+                && self
+                    .last_click
+                    .is_some_and(|(i, t)| i == index && now - t < DOUBLE_CLICK);
+            self.last_click = if again { None } else { Some((index, now)) };
+            if again {
+                opened = Some(index);
+            }
         }
 
         if wants_select_all.get() {
