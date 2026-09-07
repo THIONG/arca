@@ -25,7 +25,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
 
 const BUF: usize = 256 * 1024;
-const ROW_HEIGHT: f32 = 23.0;
+const ROW_HEIGHT: f32 = 29.0;
 // A second click on the same row within this opens it. Half a second, which is
 // what Windows uses for the same gesture by default.
 const DOUBLE_CLICK: f64 = 0.5;
@@ -1211,6 +1211,18 @@ enum View {
     Browse,
     Add,
     Running,
+}
+
+// What the overflow button on the toolbar was asked for. A value rather than a
+// closure because the menu draws while the toolbar still holds `self`.
+#[derive(Clone, Copy)]
+enum More {
+    Test,
+    All,
+    Invert,
+    None_,
+    Settings,
+    Shortcuts,
 }
 
 struct Arca {
@@ -2621,11 +2633,6 @@ impl Arca {
                 self.ask_extract(ctx, true);
             }
             ui.separator();
-            if tool_button(ui, glyphs::Glyph::Test, "", has, s.test_word).clicked() {
-                if let Some(archive) = self.archive.clone() {
-                    self.run_job(ctx, Job::Test(archive));
-                }
-            }
             // Only a .zip has anywhere to keep a password.
             let zip = has && self.format == Format::Zip;
             let encrypted = self.entries.iter().any(|e| e.encrypted);
@@ -2639,7 +2646,7 @@ impl Arca {
             } else {
                 s.set_password
             };
-            if tool_button(ui, glyph, "", zip, tip).clicked() {
+            if tool_button(ui, glyph, s.password_word, zip, tip).clicked() {
                 let archive = self.archive.clone().unwrap_or_default();
                 if encrypted {
                     let job = Job::Password {
@@ -2668,18 +2675,79 @@ impl Arca {
                         })));
                 }
             }
+            // Everything that did not fit, behind one button. That is how a
+            // command bar stays coherent: every button on it says what it does,
+            // and the ones there is no room to name go here rather than
+            // becoming a row of unexplained pictures.
+            let mut wants = None;
+            let more = tool_button(ui, glyphs::Glyph::More, s.more_word, idle, "");
+            let more_id = egui::Id::new("arca-more-menu");
+            if more.clicked() {
+                ui.memory_mut(|m| m.toggle_popup(more_id));
+            }
+            egui::popup_below_widget(
+                ui,
+                more_id,
+                &more,
+                egui::PopupCloseBehavior::CloseOnClick,
+                |ui| {
+                    ui.set_min_width(215.0);
+                    if ui
+                        .add_enabled(has, egui::Button::new(format!("{}\tCtrl+T", s.test_word)))
+                        .clicked()
+                    {
+                        wants = Some(More::Test);
+                    }
+                    ui.separator();
+                    if ui.button(format!("{}\tCtrl+A", s.select_all)).clicked() {
+                        wants = Some(More::All);
+                    }
+                    if ui.button(format!("{}\tCtrl+I", s.invert_selection)).clicked() {
+                        wants = Some(More::Invert);
+                    }
+                    if ui.button(format!("{}\tEsc", s.clear_selection)).clicked() {
+                        wants = Some(More::None_);
+                    }
+                    ui.separator();
+                    if ui.button(s.settings).clicked() {
+                        wants = Some(More::Settings);
+                    }
+                    if ui.button(format!("{}\tF1", s.shortcuts_title)).clicked() {
+                        wants = Some(More::Shortcuts);
+                    }
+                },
+            );
+            match wants {
+                Some(More::Test) => {
+                    if let Some(archive) = self.archive.clone() {
+                        self.run_job(ctx, Job::Test(archive));
+                    }
+                }
+                Some(More::All) => {
+                    let rows = self.visible_rows();
+                    for r in &rows {
+                        self.set_checked(r, true);
+                    }
+                }
+                Some(More::Invert) => {
+                    let rows = self.visible_rows();
+                    let flipped: Vec<bool> = rows.iter().map(|r| !self.is_checked(r)).collect();
+                    for (r, on) in rows.iter().zip(flipped) {
+                        self.set_checked(r, on);
+                    }
+                }
+                Some(More::None_) => self.clear_picked(),
+                Some(More::Settings) => self.show_settings = true,
+                Some(More::Shortcuts) => self.show_shortcuts = true,
+                None => {}
+            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if tool_button(ui, glyphs::Glyph::Settings, "", idle, s.settings).clicked() {
-                    self.show_settings = true;
-                }
-                if tool_button(ui, glyphs::Glyph::Help, "", true, s.shortcuts_title).clicked() {
-                    self.show_shortcuts = true;
-                }
                 ui.add(
                     egui::TextEdit::singleline(&mut self.filter)
                         .id(egui::Id::new("filter"))
                         .hint_text(s.filter_hint)
-                        .desired_width(180.0),
+                        .desired_width(200.0),
                 );
             });
         });
@@ -2697,13 +2765,8 @@ impl Arca {
                 let parent = parent_of(&self.current_dir);
                 self.go_to(parent);
             }
-            ui.separator();
-            let here = if self.current_dir.is_empty() {
-                "/".to_string()
-            } else {
-                format!("/{}", self.current_dir)
-            };
-            ui.label(egui::RichText::new(here).monospace());
+            ui.add_space(4.0);
+            self.breadcrumb(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.archive.is_some() {
                     let n = self.checked.iter().filter(|b| **b).count();
@@ -2717,21 +2780,67 @@ impl Arca {
                         ))
                         .weak(),
                     );
-                    ui.separator();
-                    if tool_button(ui, glyphs::Glyph::UncheckAll, "", true, s.uncheck_all).clicked()
-                    {
-                        self.checked.iter_mut().for_each(|c| *c = false);
-                    }
-                    if tool_button(ui, glyphs::Glyph::CheckAll, "", true, s.check_all).clicked() {
-                        let rows = self.visible_rows();
-                        for r in &rows {
-                            self.set_checked(r, true);
-                        }
-                    }
                 }
             });
         });
         ui.add_space(6.0);
+    }
+
+    // Where you are, as the folders you walked through rather than as one line
+    // of text with slashes in it. Each one takes you back to that level, which
+    // is three clicks the Up arrow used to be needed for.
+    fn breadcrumb(&mut self, ui: &mut egui::Ui) {
+        if self.archive.is_none() {
+            return;
+        }
+        let here = self.current_dir.clone();
+        let mut go: Option<String> = None;
+        egui::Frame::none()
+            .fill(ui.visuals().window_fill)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .rounding(egui::Rounding::same(5.0))
+            .inner_margin(egui::Margin::symmetric(9.0, 3.0))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                let root = self
+                    .archive
+                    .as_ref()
+                    .and_then(|a| a.file_name())
+                    .map(|x| x.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let mut crumbs: Vec<(String, String)> = vec![(root, String::new())];
+                let mut walked = String::new();
+                for part in here.split('/').filter(|p| !p.is_empty()) {
+                    walked.push_str(part);
+                    walked.push('/');
+                    crumbs.push((part.to_string(), walked.clone()));
+                }
+                let last = crumbs.len() - 1;
+                for (i, (name, path)) in crumbs.into_iter().enumerate() {
+                    if i > 0 {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new("›").weak()).selectable(false),
+                        );
+                    }
+                    // The one you are on is not a way to anywhere.
+                    if i == last {
+                        ui.add(egui::Label::new(egui::RichText::new(name).strong()).selectable(false));
+                    } else if ui
+                        .add(
+                            egui::Label::new(egui::RichText::new(name).weak())
+                                .selectable(false)
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        go = Some(path);
+                    }
+                }
+            });
+        if let Some(path) = go {
+            self.go_to(path);
+        }
     }
 
     // Everything the keyboard does, in one place. There was nowhere to find
@@ -3402,7 +3511,6 @@ impl Arca {
 
 
         let mut requested: Option<SortColumn> = None;
-        let mut toggle: Option<(usize, bool)> = None;
         let mut opened: Option<usize> = None;
         let mut clicked: Option<usize> = None;
         // Only the left button, and only from a row. The row menu also fills in
@@ -3466,8 +3574,17 @@ impl Arca {
                 .on_hover_text(hint)
         };
 
+        // The rules the table draws between its columns run the whole height of
+        // the list, which turns a file list into a spreadsheet. They are drawn
+        // in this colour, so making it nothing inside the table removes them
+        // and leaves the separators outside it alone. What is left is enough:
+        // the header names the columns and the numbers line up under them.
+        ui.style_mut().visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+
         let mut builder = TableBuilder::new(ui)
-            .striped(true)
+            // Stripes, ticks and a highlight were three ways of saying the same
+            // thing. What is picked is painted; the rest is left quiet.
+            .striped(false)
             .resizable(true)
             // Without this the cells only sense hovering, and row.response()
             // would never report a double click.
@@ -3478,11 +3595,10 @@ impl Arca {
             // is the list scrolling up, so a downward selection ran upwards.
             .drag_to_scroll(false)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::exact(26.0))
             // Name first and wide, with the icon inside it. That is where the
             // Explorer and every archiver put it, and a separate icon column
             // only pushed the one thing you read away from its picture.
-            .column(Column::initial(300.0).at_least(140.0))
+            .column(Column::initial(320.0).at_least(140.0))
             .columns(Column::initial(95.0).at_least(60.0), shown.len().saturating_sub(1))
             .column(Column::remainder().at_least(60.0));
         // Set only while a selection drag has run off the end of the list, so
@@ -3492,7 +3608,7 @@ impl Arca {
         }
 
         let out = builder
-            .header(26.0, |mut h| {
+            .header(32.0, |mut h| {
                 // Right clicking anywhere along the header offers the list of
                 // columns, which is where both WinRAR and NanaZip keep it.
                 // A Cell because every header cell hands the same menu to
@@ -3508,21 +3624,6 @@ impl Arca {
                         }
                     }
                 };
-                // The tick column has no name to sort by, but it is still part
-                // of the header, so right clicking it offers the same list. Its
-                // own id for the same reason as the rest.
-                let mut corner = None;
-                h.col(|ui| {
-                    let cell = ui.max_rect();
-                    corner = Some(ui.interact(
-                        cell,
-                        egui::Id::new("arca-head-corner"),
-                        egui::Sense::click(),
-                    ));
-                });
-                if let Some(r) = corner {
-                    r.context_menu(|ui| menu(ui));
-                }
                 let mut resp = None;
                 h.col(|ui| resp = Some(head(ui, s.col_name, SortColumn::Name)));
                 if let Some(r) = resp {
@@ -3562,12 +3663,6 @@ impl Arca {
                         row.set_hovered(false);
                     }
                     let cut = self.cut_names.contains(&r.path) || r.entry.is_some_and(|i| self.cut_names.contains(&self.entries[i].name));
-                    let mut flag = self.is_checked(r);
-                    row.col(|ui| {
-                        if ui.checkbox(&mut flag, "").changed() {
-                            toggle = Some((idx, flag));
-                        }
-                    });
                     row.col(|ui| {
                         // The system icon when the desktop has one, and the
                         // drawn one when it does not, which is every platform
@@ -3704,17 +3799,6 @@ impl Arca {
                 });
             });
 
-        if let Some((index, value)) = toggle {
-            let (path, entry) = (visible[index].path.clone(), visible[index].entry);
-            match entry {
-                Some(i) => self.checked[i] = value,
-                None => {
-                    for i in entries_under(&self.entries, &path) {
-                        self.checked[i] = value;
-                    }
-                }
-            }
-        }
         self.icons = icons;
         self.scroll_to_cursor = false;
 
@@ -3974,7 +4058,19 @@ impl eframe::App for Arca {
                         });
                         return;
                     }
-                    self.table(ui);
+                    // The list as a card on the window rather than as the
+                    // window itself. It is what gives the rows an edge to end
+                    // against now that the stripes and the column rules are
+                    // gone, and it is how the Explorer separates its list from
+                    // its chrome.
+                    egui::Frame::none()
+                        .fill(ui.visuals().window_fill)
+                        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                        .rounding(egui::Rounding::same(8.0))
+                        .inner_margin(egui::Margin::symmetric(4.0, 2.0))
+                        .show(ui, |ui| {
+                            self.table(ui);
+                        });
                 });
                 self.drop_hint(&ctx2);
             }

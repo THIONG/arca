@@ -26,18 +26,11 @@ pub enum Glyph {
     ExtractAll,
     /// The same with a tick beside it: taking out what is picked.
     ExtractPicked,
-    /// A tick inside a frame: checking what is inside is intact.
-    Test,
     /// A padlock, shut or open, for putting a password on and taking it off.
     Locked,
     Unlocked,
-    /// A cogwheel.
-    Settings,
-    /// A ticked and an empty box, for the two buttons over the list.
-    CheckAll,
-    UncheckAll,
-    /// A question mark in a circle: the list of shortcuts.
-    Help,
+    /// A horizontal ellipsis: everything that did not fit on the bar.
+    More,
     /// The three that walk the folders.
     Back,
     Forward,
@@ -62,13 +55,9 @@ pub fn codepoint(glyph: Glyph) -> Option<char> {
         // An arrow coming down onto a line: out of the archive and onto the
         // disk. Both extract buttons share it; the words tell them apart.
         Glyph::ExtractAll | Glyph::ExtractPicked => '\u{E896}',
-        Glyph::Test => '\u{E721}',
         Glyph::Locked => '\u{E72E}',
         Glyph::Unlocked => '\u{E785}',
-        Glyph::Settings => '\u{E713}',
-        Glyph::CheckAll => '\u{E73A}',
-        Glyph::UncheckAll => '\u{E739}',
-        Glyph::Help => '\u{E9CE}',
+        Glyph::More => '\u{E712}',
         Glyph::Back => '\u{E72B}',
         Glyph::Forward => '\u{E72A}',
         Glyph::Up => '\u{E74A}',
@@ -85,8 +74,6 @@ pub fn draw(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) {
     let c = rect.center();
     let r = Rect::from_center_size(Pos2::new(c.x.round(), c.y.round()), Vec2::splat(SIZE));
     let (x0, y0, x1, y1) = (r.left(), r.top(), r.right(), r.bottom());
-    let w = r.width();
-    let h = r.height();
     let thin = 1.4;
 
     match glyph {
@@ -156,20 +143,6 @@ pub fn draw(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) {
                 Stroke::NONE,
             ));
         }
-        Glyph::Test => {
-            // A magnifying glass. It began as a frame with a tick in it and
-            // came out indistinguishable from the button that ticks everything,
-            // which is two buttons along.
-            let c = Pos2::new(x0 + 6.0, y0 + 6.0);
-            painter.circle_stroke(c, 4.6, Stroke::new(thin, color));
-            line(
-                painter,
-                Pos2::new(c.x + 3.4, c.y + 3.4),
-                Pos2::new(x1 - 1.5, y1 - 1.5),
-                color,
-                2.0,
-            );
-        }
         Glyph::Locked | Glyph::Unlocked => {
             // Outlined with a keyhole, not a filled slab: a solid body came out
             // as a blob with a wire over it. The shackle is a real arc rather
@@ -205,36 +178,9 @@ pub fn draw(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) {
                 Stroke::new(1.6_f32, color),
             ));
         }
-        Glyph::Settings => {
-            // A cog after all, but with the ring drawn. The first try was six
-            // spokes around a dot and read as an asterisk; what was missing was
-            // the wheel the teeth are supposed to be attached to.
-            let c = r.center();
-            let ring = w * 0.28;
-            let tooth = w * 0.40;
-            painter.circle_stroke(c, ring, Stroke::new(thin, color));
-            painter.circle_filled(c, w * 0.09, color);
-            for k in 0..6 {
-                let a = std::f32::consts::TAU * (k as f32) / 6.0;
-                let (sn, cs) = a.sin_cos();
-                painter.line_segment(
-                    [
-                        Pos2::new(c.x + cs * (ring - 0.4), c.y + sn * (ring - 0.4)),
-                        Pos2::new(c.x + cs * tooth, c.y + sn * tooth),
-                    ],
-                    Stroke::new(2.4_f32, color),
-                );
-            }
-        }
-        Glyph::CheckAll | Glyph::UncheckAll => {
-            let body = Rect::from_min_max(
-                Pos2::new(x0 + 1.5, y0 + 1.5),
-                Pos2::new(x1 - 1.5, y1 - 1.5),
-            );
-            painter.rect_stroke(body, 2.0, Stroke::new(thin, color));
-            if matches!(glyph, Glyph::CheckAll) {
-                line(painter, Pos2::new(x0 + 4.0, r.center().y), Pos2::new(x0 + 6.5, y1 - 4.5), color, thin);
-                line(painter, Pos2::new(x0 + 6.5, y1 - 4.5), Pos2::new(x1 - 4.0, y0 + 4.5), color, thin);
+        Glyph::More => {
+            for k in [-1.0_f32, 0.0, 1.0] {
+                painter.circle_filled(Pos2::new(r.center().x + k * 4.6, r.center().y), 1.35, color);
             }
         }
         Glyph::Back | Glyph::Forward | Glyph::Up => {
@@ -258,15 +204,6 @@ pub fn draw(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) {
                 ],
             };
             painter.add(egui::Shape::convex_polygon(p.to_vec(), color, Stroke::NONE));
-        }
-        Glyph::Help => {
-            painter.circle_stroke(r.center(), h * 0.42, Stroke::new(thin, color));
-            let c = r.center();
-            // The hook of a question mark, then its dot.
-            line(painter, Pos2::new(c.x - 2.2, c.y - 2.0), Pos2::new(c.x + 0.6, c.y - 3.2), color, thin);
-            line(painter, Pos2::new(c.x + 0.6, c.y - 3.2), Pos2::new(c.x + 1.8, c.y - 0.6), color, thin);
-            line(painter, Pos2::new(c.x + 1.8, c.y - 0.6), Pos2::new(c.x, c.y + 1.2), color, thin);
-            painter.circle_filled(Pos2::new(c.x, c.y + 3.4), 0.9, color);
         }
     }
 }
