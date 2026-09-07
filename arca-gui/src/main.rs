@@ -1293,6 +1293,10 @@ struct Arca {
     // Whether the window had the keyboard last frame. Getting it back is when a
     // paste elsewhere has had its chance to happen.
     was_focused: bool,
+    // Set for work that says nothing while it runs. Copying to the clipboard is
+    // the only such job: it is over before a bar has finished appearing, and a
+    // bar that flashes past says less than nothing.
+    quiet: bool,
 }
 
 impl Arca {
@@ -1348,6 +1352,7 @@ impl Arca {
             cut_armed: None,
             cut_pending: None,
             was_focused: true,
+            quiet: false,
         }
     }
 
@@ -1457,6 +1462,7 @@ impl Arca {
         let (tx, rx) = channel();
         self.channel = Some(rx);
         self.busy = true;
+        self.quiet = false;
         self.error = false;
         self.done_count = 0;
         self.total_count = total;
@@ -1606,6 +1612,7 @@ impl Arca {
         }
         if close {
             self.channel = None;
+            self.quiet = false;
             if !self.entries.is_empty() && self.notice.is_empty() {
                 self.notice = self.summary();
             }
@@ -1933,6 +1940,9 @@ impl Arca {
             });
             ctx2.request_repaint();
         });
+        // After `spawn`, which clears it: this is the one job that runs without
+        // saying so.
+        self.quiet = true;
     }
 
     // Whether the cut waiting on a paste has had it.
@@ -3703,7 +3713,7 @@ impl eframe::App for Arca {
                     .exact_height(30.0)
                     .show(ctx, |ui| {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    if self.busy {
+                    if self.busy && !self.quiet {
                         let f = if self.total_count == 0 {
                             0.0
                         } else {
