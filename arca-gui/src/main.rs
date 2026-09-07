@@ -1171,6 +1171,21 @@ enum Message {
     Progress(usize, usize, String),
     Done(String),
     Failed(String),
+    // A cut reached the clipboard in one piece. Sent before Done, and only
+    // then, so a cut that failed halfway never leaves the window waiting to
+    // take entries out of an archive on the strength of it.
+    CutReady,
+}
+
+// What a cut is waiting on. The entries stay in the archive until the paste
+// actually happens, and this is what says which ones and how to tell.
+struct Cut {
+    archive: PathBuf,
+    // The extracted copies handed to the shell. A paste with the move effect
+    // takes them out of the temporary folder, and their absence is the only
+    // sign Windows gives that it happened.
+    paths: Vec<PathBuf>,
+    names: Vec<String>,
 }
 
 // What the password window is standing in front of: a job the context menu
@@ -1269,9 +1284,15 @@ struct Arca {
     // holding paths inside it, so it stays until the next copy replaces it and
     // makes those paths meaningless anyway.
     clip_dir: Option<PathBuf>,
-    // What the last Ctrl+X put on the clipboard, so those rows can show it. The
-    // archive is not touched: see `copy_to_clipboard`.
+    // What the last Ctrl+X put on the clipboard, so those rows can show it.
     cut_names: HashSet<String>,
+    // Made ready before the extraction runs and armed only when it says the
+    // clipboard took it, which is what `Message::CutReady` reports.
+    cut_armed: Option<Cut>,
+    cut_pending: Option<Cut>,
+    // Whether the window had the keyboard last frame. Getting it back is when a
+    // paste elsewhere has had its chance to happen.
+    was_focused: bool,
 }
 
 impl Arca {
@@ -1324,6 +1345,9 @@ impl Arca {
             band_anchor: None,
             band_scroll: None,
             last_click: None,
+            cut_armed: None,
+            cut_pending: None,
+            was_focused: true,
         }
     }
 
@@ -1451,6 +1475,8 @@ impl Arca {
         // whatever the status bar was saying: the summary of the archive being
         // closed sat there over the one that had just opened.
         self.cut_names.clear();
+        self.cut_armed = None;
+        self.cut_pending = None;
         self.notice.clear();
         self.error = false;
         let ctx2 = ctx.clone();
@@ -1571,6 +1597,9 @@ impl Arca {
                         self.error = true;
                         self.busy = false;
                         close = true;
+                    }
+                    Message::CutReady => {
+                        self.cut_pending = self.cut_armed.take();
                     }
                 }
             }
@@ -1840,11 +1869,32 @@ impl Arca {
             .join("Arca")
             .join(format!("clip-{stamp:x}"));
         let previous = self.clip_dir.replace(dir.clone());
+        let names = self.selected_names();
+        // Before the old folder is thrown away further down: an earlier cut
+        // still waiting was watching for those files to disappear, and this is
+        // about to delete them itself.
+        self.cut_armed = None;
+        self.cut_pending = None;
         self.cut_names = if cut {
-            self.selected_names().into_iter().collect()
+            names.iter().cloned().collect()
         } else {
             HashSet::new()
         };
+        // Where each picked thing will land once extracted. Worked out here
+        // rather than in the thread because it is also what a pending cut has
+        // to watch, and only a .zip can have entries taken out of it in place.
+        let landed: Vec<PathBuf> = roots
+            .iter()
+            .filter_map(|r| arca_core::safe_name(r).ok())
+            .map(|r| dir.join(r))
+            .collect();
+        if cut && detect(&archive) == Some(Format::Zip) {
+            self.cut_armed = Some(Cut {
+                archive: archive.clone(),
+                paths: landed.clone(),
+                names,
+            });
+        }
 
         let wanted = self.checked.clone();
         let total = wanted.iter().filter(|b| **b).count();
@@ -1861,32 +1911,67 @@ impl Arca {
             let ask = |_: &Path| Answer::Replace;
             let outcome = extract(&archive, &dir, &wanted, &notify, &ask, pw.as_deref())
                 .map_err(|e| e.to_string())
-                .and_then(|_| {
-                    let paths: Vec<PathBuf> = roots
-                        .iter()
-                        .filter_map(|r| arca_core::safe_name(r).ok())
-                        .map(|r| dir.join(r))
-                        .collect();
-                    clipboard::set_files(&paths, cut).map(|()| paths.len())
-                });
+                .and_then(|_| clipboard::set_files(&landed, cut).map(|()| landed.len()));
             // Only once the new list is on the clipboard: until that moment the
             // old paths are still what a paste would reach for.
             if let Some(old) = previous {
                 let _ = fs::remove_dir_all(old);
             }
             let _ = tx.send(match outcome {
-                Ok(n) => Message::Done(fill(
+                Ok(n) => {
                     if cut {
-                        s.cut_to_clipboard
-                    } else {
-                        s.copied_to_clipboard
-                    },
-                    &[("n", &n.to_string())],
-                )),
+                        let _ = tx.send(Message::CutReady);
+                    }
+                    Message::Done(fill(
+                        if cut {
+                            s.cut_to_clipboard
+                        } else {
+                            s.copied_to_clipboard
+                        },
+                        &[("n", &n.to_string())],
+                    ))
+                }
                 Err(why) => Message::Failed(fill(s.clipboard_failed, &[("why", &why)])),
             });
             ctx2.request_repaint();
         });
+    }
+
+    // Whether the cut waiting on a paste has had it.
+    //
+    // Windows never says. What it does instead, when the clipboard asked for a
+    // move rather than a copy, is take the files out of the folder they were
+    // handed over in, so their absence is the whole of the evidence. It is
+    // checked when the window gets the keyboard back, because pasting somewhere
+    // else means having gone somewhere else first.
+    //
+    // Only all of them counts. A cut that is half gone is more likely to be a
+    // paste still running than one that finished, and leaving the entries where
+    // they are costs nothing: they will still be there next time. Every way
+    // this can be wrong leaves the archive untouched, which is the side to be
+    // wrong on when there is no undo.
+    fn cut_landed(&mut self, ctx: &egui::Context) {
+        let Some(cut) = &self.cut_pending else {
+            return;
+        };
+        if self.busy || self.archive.as_ref() != Some(&cut.archive) {
+            return;
+        }
+        if cut.paths.iter().any(|p| p.exists()) {
+            return;
+        }
+        let Some(cut) = self.cut_pending.take() else {
+            return;
+        };
+        self.cut_names.clear();
+        self.run_job(
+            ctx,
+            Job::Delete {
+                archive: cut.archive,
+                names: cut.names,
+                password: self.archive_password.clone(),
+            },
+        );
     }
 
     // Ctrl+V: whatever files the shell is holding, into the folder on screen.
@@ -2086,21 +2171,67 @@ impl Arca {
             return;
         }
         let typing = ctx.memory(|m| m.focused().is_some());
-        let (ctrl, shift, o, e, c, x, v, n, f, f5, del) = ctx.input(|i| {
+        // Cut, copy and paste never arrive as key presses. egui's winit layer
+        // recognises those three shortcuts itself and turns them into events of
+        // their own, returning before the key is passed on, so watching for
+        // Ctrl+X was watching for something that is never sent: those three did
+        // nothing from the keyboard and only worked from the row menu.
+        //
+        // Cut and copy come back as events. Paste does not: that one is only
+        // sent when the clipboard has text in it, and a clipboard holding files
+        // has none, which is exactly the case here. What does still arrive is
+        // the key going back up, because the early return only covers the press
+        // -- so that is what a paste is recognised by.
+        let (ctrl, shift, o, e, n, f, f5, del, cut, copy, paste) = ctx.input(|i| {
             (
                 i.modifiers.command,
                 i.modifiers.shift,
                 i.key_pressed(egui::Key::O),
                 i.key_pressed(egui::Key::E),
-                i.key_pressed(egui::Key::C),
-                i.key_pressed(egui::Key::X),
-                i.key_pressed(egui::Key::V),
                 i.key_pressed(egui::Key::N),
                 i.key_pressed(egui::Key::F),
                 i.key_pressed(egui::Key::F5),
                 i.key_pressed(egui::Key::Delete),
+                i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
+                i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key {
+                            key: egui::Key::V,
+                            pressed: false,
+                            modifiers,
+                            ..
+                        } if modifiers.command
+                    )
+                }),
             )
         });
+
+        // These three carry their own modifier, so they do not wait behind the
+        // Ctrl check below. They do belong to the filter box while it has the
+        // keyboard: that is a text field and they mean something there.
+        if !typing {
+            if copy {
+                // Ctrl+Shift+C is the same event with shift held, which is
+                // where the names as text went; it is also all a platform
+                // without a file clipboard can offer.
+                if shift || !clipboard::AVAILABLE {
+                    let names = self.selected_names();
+                    if !names.is_empty() {
+                        ctx.copy_text(names.join("\r\n"));
+                    }
+                } else {
+                    self.copy_to_clipboard(ctx, false);
+                }
+            }
+            if cut && clipboard::AVAILABLE {
+                self.copy_to_clipboard(ctx, true);
+            }
+            if paste && clipboard::AVAILABLE && self.archive.is_some() {
+                self.paste_from_clipboard(ctx);
+            }
+        }
 
         if f5 && !typing {
             if let Some(p) = self.archive.clone() {
@@ -2145,31 +2276,6 @@ impl Arca {
             // Nothing else here is a text box, so handing the keyboard to the
             // filter is the whole of "find".
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("filter")));
-        }
-        // Cut, copy and paste belong to the filter box while it has the
-        // keyboard: that is a text field, and taking its Ctrl+V away to add
-        // files to the archive would be the last thing anybody expected.
-        if typing {
-            return;
-        }
-        if c {
-            // Plain Ctrl+C is what it is everywhere else: the files, ready to
-            // paste into a folder. The names as text move to Ctrl+Shift+C,
-            // which is also all a platform without a file clipboard can offer.
-            if shift || !clipboard::AVAILABLE {
-                let names = self.selected_names();
-                if !names.is_empty() {
-                    ctx.copy_text(names.join("\r\n"));
-                }
-            } else {
-                self.copy_to_clipboard(ctx, false);
-            }
-        }
-        if x && clipboard::AVAILABLE {
-            self.copy_to_clipboard(ctx, true);
-        }
-        if v && clipboard::AVAILABLE && self.archive.is_some() {
-            self.paste_from_clipboard(ctx);
         }
     }
 
@@ -3475,6 +3581,13 @@ impl Arca {
 impl eframe::App for Arca {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive(ctx);
+        // Getting the keyboard back is when whatever was done elsewhere has
+        // been done. Only on the change, not every frame it is focused.
+        let focused = ctx.input(|i| i.focused);
+        if focused && !self.was_focused && matches!(self.view, View::Browse) {
+            self.cut_landed(ctx);
+        }
+        self.was_focused = focused;
         self.shortcuts(ctx);
 
         // Escape backs out of whatever is on top, innermost first, the way it
