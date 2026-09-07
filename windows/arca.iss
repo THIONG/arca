@@ -172,15 +172,19 @@ end;
 procedure StampManifestVersion();
 var
   Path, Text: string;
+  Bytes: AnsiString;
 begin
   Path := ExpandConstant('{app}\AppxManifest.xml');
-  // Through code page 65001 and not LoadStringFromFile, which hands back an
-  // AnsiString: the manifest carries 26 bytes of UTF-8 in its Spanish
-  // description, and a round trip through the ANSI code page would eat them.
-  if LoadStringFromFileInCP(Path, Text, 65001) then
+  // LoadStringFromFile hands back the raw bytes and SaveStringToFile writes
+  // them straight back out; the two conversions in between go through the
+  // ANSI code page. That is lossless only while the manifest stays ASCII,
+  // which is why it says so at the top and why the CI checks it.
+  if LoadStringFromFile(Path, Bytes) then
   begin
+    Text := Bytes;
     StringChangeEx(Text, 'Version="0.0.0.0"', 'Version="{#Version}.0"', True);
-    SaveStringToFileInCP(Path, Text, 65001, False);
+    Bytes := Text;
+    SaveStringToFile(Path, Bytes, False);
   end;
 end;
 

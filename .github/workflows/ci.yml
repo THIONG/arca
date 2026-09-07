@@ -73,6 +73,13 @@ jobs:
           cargo build --release --target x86_64-pc-windows-msvc
           cargo build --release --target x86_64-pc-windows-msvc \
             --manifest-path windows/arca-shell/Cargo.toml
+          # The installer stamps the version into AppxManifest.xml with Inno's
+          # Pascal, whose strings go through the ANSI code page: lossless only
+          # while that file stays ASCII. It used to be Spanish with accents,
+          # and no amount of Pascal made that survive the round trip.
+          if LC_ALL=C grep -n '[^[:print:][:space:]]' windows/AppxManifest.xml; then
+            echo "AppxManifest.xml has non-ASCII bytes on those lines"; exit 1
+          fi
           ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
           test -f "$ISCC" || choco install innosetup -y --no-progress
           BIN='//DBinDir=..\target\x86_64-pc-windows-msvc\release'

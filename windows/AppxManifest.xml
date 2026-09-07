@@ -1,18 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Paquete MSIX disperso (sparse package).
+  Sparse MSIX package.
 
-  «Disperso» significa que la aplicación se instala como un programa normal en
-  la carpeta que tú elijas, y este paquete solo aporta la identidad que Windows
-   11 exige para registrar una entrada en el menú contextual. Es lo que hace
-  NanaZip y es la única vía admitida en Windows 11 sin escribir en el registro.
+  "Sparse" means the application installs like any normal program, into
+  whichever folder you choose, and this package only supplies the identity
+  Windows 11 demands before it will register a context menu entry. It is what
+  NanaZip does, and it is the only route Windows 11 supports without writing
+  to the registry.
 
-  Dos cosas que hay que cambiar antes de usarlo:
-    1. El CLSID de com:Class y de desktop5:ItemType debe coincidir, letra por
-       letra, con CLSID_ARCA en src/lib.rs.
-    2. El Publisher debe coincidir exactamente con el asunto del certificado
-       con el que firmes. Si no coinciden, la instalación falla con un error
-       que no explica el motivo.
+  Two things have to be changed before using it:
+    1. The CLSID in com:Class and in desktop5:ItemType must match, letter for
+       letter, CLSID_ARCA in arca-shell/src/lib.rs.
+    2. Publisher must match the subject of the certificate you sign with
+       exactly. When they differ, the install fails with an error that does
+       not say why.
+
+  Keep this file ASCII. The installer stamps the version into it through
+  Inno Setup's Pascal, whose string type goes through the ANSI code page, so
+  any accented byte in here would come back out mangled. The CI checks it.
 -->
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
@@ -30,31 +35,31 @@
        while 0.5.0 was shipping, and Windows believed it. -->
   <Identity
     Name="Arca.Archivador"
-    Publisher="CN=CAMBIAME"
+    Publisher="CN=CHANGEME"
     Version="0.0.0.0"
     ProcessorArchitecture="x64" />
 
   <Properties>
     <DisplayName>Arca</DisplayName>
-    <PublisherDisplayName>Proyecto Arca</PublisherDisplayName>
+    <PublisherDisplayName>Arca Project</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
-    <!-- Imprescindible para un paquete disperso: sin esto, Add-AppxPackage
-         -ExternalLocation falla con 0x80073D2E, que es justamente lo que hace
-         construir.ps1. Es lo que autoriza a que el .exe y la .dll vivan fuera
-         del paquete, en la carpeta de instalacion normal. -->
+    <!-- Required for a sparse package: without it, Add-AppxPackage
+         -ExternalLocation fails with 0x80073D2E, which is exactly what
+         build.ps1 does. This is what authorises the .exe and the .dll to
+         live outside the package, in the normal install folder. -->
     <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
   </Properties>
 
   <Dependencies>
-    <!-- 10.0.22000.0 es Windows 11: IExplorerCommand en el menú moderno
-         necesita esa versión como mínimo. -->
+    <!-- 10.0.22000.0 is Windows 11: IExplorerCommand in the modern menu
+         needs at least that version. -->
     <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0"
                         MaxVersionTested="10.0.26100.0" />
   </Dependencies>
 
   <Resources>
-    <Resource Language="es-ES" />
     <Resource Language="en-US" />
+    <Resource Language="es-ES" />
   </Resources>
 
   <Capabilities>
@@ -68,14 +73,14 @@
                  uap10:RuntimeBehavior="win32App">
       <uap:VisualElements
         DisplayName="Arca"
-        Description="Archivador rápido y seguro"
+        Description="Fast and safe archiver"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png"
         BackgroundColor="transparent"
         AppListEntry="none" />
 
       <Extensions>
-        <!-- La entrada del menú contextual de Windows 11 -->
+        <!-- The Windows 11 context menu entry -->
         <desktop4:Extension Category="windows.fileExplorerContextMenus">
           <desktop4:FileExplorerContextMenus>
             <desktop5:ItemType Type="*">
@@ -89,7 +94,7 @@
           </desktop4:FileExplorerContextMenus>
         </desktop4:Extension>
 
-        <!-- El servidor COM que implementa esa entrada -->
+        <!-- The COM server behind that entry -->
         <com:Extension Category="windows.comServer">
           <com:ComServer>
             <com:SurrogateServer DisplayName="Arca Shell">
