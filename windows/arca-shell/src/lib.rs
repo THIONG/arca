@@ -8,7 +8,8 @@ use windows::Win32::System::Registry::HKEY;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, InsertMenuW, HMENU, MF_BYPOSITION, MF_POPUP, MF_STRING,
+    AppendMenuW, CreatePopupMenu, InsertMenuW, HMENU, MF_BYPOSITION, MF_POPUP, MF_SEPARATOR,
+    MF_STRING,
 };
 
 const CLSID_ARCA: GUID = GUID::from_u128(0xe075ad96_f5bd_4bff_8c33_a29d05352efa);
@@ -277,6 +278,12 @@ impl IExplorerCommand_Impl for Item_Impl {
     }
 
     fn GetFlags(&self) -> Result<u32> {
+        // Opening is a different kind of act from the four that change
+        // something on disk, so it gets a line under it. WinRAR separates the
+        // same one.
+        if self.0 == Action::Open {
+            return Ok(ECF_SEPARATORAFTER.0 as u32);
+        }
         Ok(ECF_DEFAULT.0 as u32)
     }
 
@@ -490,6 +497,12 @@ impl IContextMenu_Impl for ClassicMenu_Impl {
                     (first_id + i as u32) as usize,
                     PCWSTR(text.as_ptr()),
                 )?;
+                // The line goes after Open, and carries no command id of its
+                // own: InvokeCommand indexes into the actions, and a separator
+                // that took an id would shift every one of them by one.
+                if *a == Action::Open {
+                    AppendMenuW(submenu, MF_SEPARATOR, 0, PCWSTR::null())?;
+                }
             }
             InsertMenuW(
                 menu,

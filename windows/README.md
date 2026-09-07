@@ -35,7 +35,7 @@ If the crate version is ever raised, that is the order worth looking in.
 | File | What it is |
 |---|---|
 | `arca-shell/src/lib.rs` | The DLL: `IExplorerCommand` and `IContextMenu`, with a submenu of five actions |
-| `AppxManifest.xml` | Sparse MSIX package giving the extension an identity |
+| `AppxManifest.xml` | Sparse MSIX package giving the extension an identity. Its `Version` is left at zeros and stamped at install time |
 | `arca.iss` | Inno Setup script that produces the installer |
 | `build.ps1` | Builds, packages and registers both menus for development |
 
@@ -97,7 +97,8 @@ Stop-Process -Name explorer -Force
 And the checklist:
 
 1. Right click a `.zip` → **Arca** appears with five options, "Open with Arca"
-   first, and "Extract to" and "Add to" naming what they would make
+   first and separated by a line, and "Extract to" and "Add to" naming what
+   they would make
 2. Right click a `.txt` → "Extract here" does **not** appear
 3. "Extract here" unpacks next to the archive, showing a progress window
 4. Select several files → "Add to" names the folder holding them and puts them
@@ -133,6 +134,18 @@ paths and launches `arca-gui.exe`; all the work on data of unknown origin
 happens in the child process, in the crates that forbid `unsafe`. Even if this
 extension had a memory bug, a malicious archive could not reach it, because it
 never opens one.
+
+## The package version is not the manifest's to decide
+
+Windows reads the version out of `AppxManifest.xml` and shows it under
+Installed apps. That number sat at `0.3.0.0` while 0.5.0 was shipping, so the
+system listed an old release that could not be uninstalled from there: a sparse
+package registered with `Add-AppxPackage -Register` only goes away with
+`Remove-AppxPackage`, whatever Settings offers.
+
+It is left at `0.0.0.0` in the file now, which is obviously wrong rather than
+quietly stale, and both `arca.iss` and `build.ps1` stamp the real version in
+before registering.
 
 ## What is missing
 

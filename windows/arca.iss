@@ -165,8 +165,25 @@ end;
 // a sparse MSIX package, which has to be registered through Add-AppxPackage.
 // It needs Developer Mode, so a failure here is not fatal; the classic menu
 // still works.
+// Windows takes the package version from the manifest and shows it in
+// Installed apps, so a fixed number there means every release looks like the
+// same old one. Stamped from the version this installer was built with, right
+// before registering.
+procedure StampManifestVersion();
+var
+  Path, Text: string;
+begin
+  Path := ExpandConstant('{app}\AppxManifest.xml');
+  if LoadStringFromFile(Path, Text) then
+  begin
+    StringChangeEx(Text, 'Version="0.0.0.0"', 'Version="{#Version}.0"', True);
+    SaveStringToFile(Path, Text, False);
+  end;
+end;
+
 procedure RegisterModernMenu();
 begin
+  StampManifestVersion();
   RunHidden('Add-AppxPackage -Register ''' + ExpandConstant('{app}\AppxManifest.xml') +
             ''' -ExternalLocation ''' + ExpandConstant('{app}') + ''' -ErrorAction SilentlyContinue');
 end;

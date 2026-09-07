@@ -83,7 +83,13 @@ Pop-Location
 New-Item -ItemType Directory -Force -Path $Dest, "$Dest\Assets" | Out-Null
 Copy-Item "$Root\target\x86_64-pc-windows-msvc\release\arca.exe" $Dest -Force
 Copy-Item "$PSScriptRoot\arca-shell\target\x86_64-pc-windows-msvc\release\arca_shell.dll" $Dest -Force
-Copy-Item "$PSScriptRoot\AppxManifest.xml" $Dest -Force
+# The manifest ships with its version at zeros and gets it stamped here, the
+# same as the installer does. Windows reads that number and shows it under
+# Installed apps, so a fixed one means every build looks like the same release.
+$Version = ((Get-Content (Join-Path $Root "Cargo.toml") |
+    Where-Object { $_ -match '^version' } | Select-Object -First 1) -split '"')[1]
+(Get-Content "$PSScriptRoot\AppxManifest.xml" -Raw).Replace('Version="0.0.0.0"', "Version=`"$Version.0`"") |
+    Set-Content "$Dest\AppxManifest.xml" -Encoding utf8
 
 # Real package icons now. These used to be 1x1 PNGs generated here just so the
 # manifest would validate; they come from the brand, in windows\assets.

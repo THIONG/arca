@@ -24,10 +24,14 @@
   xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
   IgnorableNamespaces="uap uap10 rescap com desktop4 desktop5">
 
+  <!-- Version is stamped at install time from the real one. Left as zeros
+       here so that a manifest nobody stamped is obviously wrong instead of
+       quietly claiming to be some release from months ago: this said 0.3.0.0
+       while 0.5.0 was shipping, and Windows believed it. -->
   <Identity
     Name="Arca.Archivador"
     Publisher="CN=CAMBIAME"
-    Version="0.3.0.0"
+    Version="0.0.0.0"
     ProcessorArchitecture="x64" />
 
   <Properties>
