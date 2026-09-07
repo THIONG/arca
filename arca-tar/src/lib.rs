@@ -133,6 +133,7 @@ impl<R: Read> TarReader<R> {
             is_dir,
             mtime: Some(mtime),
             offset: self.pos,
+            encrypted: false,
         };
         Ok(Some(TarEntry {
             entry,

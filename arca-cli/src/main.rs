@@ -1,6 +1,6 @@
 use arca_core::{Codec, Error, Level, Result};
 use arca_tar::{TarReader, TarWriter};
-use arca_zip::{compress_block, ZipArchive, ZipWriter};
+use arca_zip::{compress_block, seal_block, ZipArchive, ZipWriter};
 use rayon::prelude::*;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::HashSet;
@@ -42,6 +42,9 @@ enum Cmd {
         #[arg(short = 'j', long, default_value_t = 0,
               help = "Threads to use. 0 means every core")]
         threads: usize,
+        #[arg(short = 'p', long,
+              help = "Encrypt with AES-256. Other tools will ask for it to open the archive")]
+        password: Option<String>,
     },
     #[command(visible_alias = "l", about = "List the contents without extracting them")]
     List {
@@ -62,11 +65,15 @@ enum Cmd {
         #[arg(short = 'j', long, default_value_t = 0,
               help = "Threads to use. 0 means every core. Only .zip can go parallel")]
         threads: usize,
+        #[arg(short = 'p', long, help = "Password of an AES-256 encrypted archive")]
+        password: Option<String>,
     },
     #[command(visible_alias = "t", about = "Check integrity without writing to disk")]
     Test {
         #[arg(help = "Archive to check")]
         archive: PathBuf,
+        #[arg(short = 'p', long, help = "Password of an AES-256 encrypted archive")]
+        password: Option<String>,
     },
     #[command(about = "Measure the R1 and R2 performance requirements")]
     Bench {
@@ -152,15 +159,17 @@ fn run(cli: Cli) -> Result<()> {
             level,
             codec,
             threads,
-        } => create(&out, &inputs, level.into(), codec, threads),
+            password,
+        } => create(&out, &inputs, level.into(), codec, threads, password.as_deref()),
         Cmd::List { archive, time } => list(&archive, time),
         Cmd::Extract {
             archive,
             dest,
             on_conflict,
             threads,
-        } => extract(&archive, &dest, on_conflict, threads),
-        Cmd::Test { archive } => test_archive(&archive),
+            password,
+        } => extract(&archive, &dest, on_conflict, threads, password.as_deref()),
+        Cmd::Test { archive, password } => test_archive(&archive, password.as_deref()),
         Cmd::Bench { archive } => bench(&archive),
     }
 }
@@ -251,8 +260,14 @@ fn create(
     level: Level,
     codec_arg: CodecArg,
     requested_threads: usize,
+    password: Option<&str>,
 ) -> Result<()> {
     let format_kind = detect(out)?;
+    if password.is_some() && format_kind != Format::Zip {
+        return Err(Error::Unsupported(
+            "encryption only exists in .zip; .tar and .tar.gz have no place to put it".into(),
+        ));
+    }
     let codec = resolve_codec(codec_arg, format_kind);
     let threads = resolve_threads(requested_threads);
     let raw_list = collect_files(inputs)?;
@@ -283,22 +298,31 @@ fn create(
                 if batch.len() == 1 && files[batch[0]].2 > cap {
                     let (path, name, _, mt) = &files[batch[0]];
                     let entrada = BufReader::with_capacity(BUF, File::open(path)?);
-                    w.add(name, entrada, codec, level, Some(*mt))?;
+                    w.add_with_password(name, entrada, codec, level, Some(*mt), password)?;
                     continue;
                 }
+                // Sealing happens inside the worker on purpose: deriving the key
+                // is a thousand rounds of PBKDF2 per entry, and doing that back
+                // in the writer would put all of them on one thread.
                 let produced: Vec<Result<Block>> = pool.install(|| {
                     batch.par_iter()
                         .map(|&i| {
                             let data = fs::read(&files[i].0)?;
                             let (c, m, crc) = compress_block(&data, codec, level)?;
-                            Ok((i, c, m, crc))
+                            match password {
+                                Some(pw) => Ok((i, seal_block(&c, pw)?, m, crc)),
+                                None => Ok((i, c, m, crc)),
+                            }
                         })
                         .collect()
                 });
                 for h in produced {
                     let (i, c, m, crc) = h?;
                     let (_, name, size, mt) = &files[i];
-                    w.add_compressed(name, &c, crc, *size, m, Some(*mt))?;
+                    match password {
+                        Some(_) => w.add_sealed(name, &c, *size, m, Some(*mt))?,
+                        None => w.add_compressed(name, &c, crc, *size, m, Some(*mt))?,
+                    }
                 }
             }
             w.finish()?;
@@ -435,7 +459,13 @@ fn resolve_conflict(
 // so one thread per core can each open the file and decompress a different one.
 // A .tar is a single stream, and a .tar.gz a single gzip stream on top of it, so
 // there is nothing to split there and that branch stays sequential.
-fn extract(archive: &Path, dest: &Path, policy: OnConflict, requested_threads: usize) -> Result<()> {
+fn extract(
+    archive: &Path,
+    dest: &Path,
+    policy: OnConflict,
+    requested_threads: usize,
+    password: Option<&str>,
+) -> Result<()> {
     let format_kind = detect(archive)?;
     fs::create_dir_all(dest)?;
     let t0 = Instant::now();
@@ -476,7 +506,7 @@ fn extract(archive: &Path, dest: &Path, policy: OnConflict, requested_threads: u
                     .map(|(e, path)| {
                         let mut source = BufReader::with_capacity(BUF, File::open(archive)?);
                         let mut f = BufWriter::with_capacity(BUF, File::create(path)?);
-                        let w = arca_zip::extract_entry(&mut source, e, &mut f)?;
+                        let w = arca_zip::extract_entry_with(&mut source, e, &mut f, password)?;
                         f.flush()?;
                         Ok(w)
                     })
@@ -524,7 +554,7 @@ fn extract(archive: &Path, dest: &Path, policy: OnConflict, requested_threads: u
     Ok(())
 }
 
-fn test_archive(archive: &Path) -> Result<()> {
+fn test_archive(archive: &Path, password: Option<&str>) -> Result<()> {
     let format_kind = detect(archive)?;
     let t0 = Instant::now();
     let mut n = 0u64;
@@ -538,7 +568,7 @@ fn test_archive(archive: &Path) -> Result<()> {
                     continue;
                 }
                 let name = a.entries()[i].name.clone();
-                match a.extract_to(i, io::sink()) {
+                match a.extract_to_with(i, io::sink(), password) {
                     Ok(_) => n += 1,
                     Err(e) => {
                         eprintln!("  FALLO  {name}: {e}");

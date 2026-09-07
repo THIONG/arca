@@ -67,14 +67,40 @@ H=$(cd y/src && find . -type f|sort|xargs sha256sum|sha256sum|cut -d' ' -f1)
 [ "$H" = "$REF" ] && ok "Arca reads the zip created by 7-Zip" || ko "Arca fails on 7-Zip's zip"
 
 echo
-echo "C) Corruption detection"
+echo "C) AES-256, both directions"
+# ASCII on purpose: Git Bash mangles a non-ASCII argument on its way to a
+# native .exe, and 7-Zip cannot even create the archive. That is the shell, not
+# the format, so the non-ASCII case is covered by a Rust test instead.
+PW='una clave con espacios'
+$ARCA create out/enc.zip src -p "$PW" >/dev/null 2>&1
+7z t -p"$PW" out/enc.zip >/dev/null 2>&1 && ok "7-Zip verifies Arca's encrypted zip" || ko "7-Zip rejects Arca's encrypted zip"
+7z t -p"wrong" out/enc.zip >/dev/null 2>&1 && ko "7-Zip accepts a wrong password" || ok "7-Zip rejects the wrong password"
+rm -rf y; mkdir y
+7z x -y -p"$PW" -o"y" out/enc.zip >/dev/null 2>&1
+H=$(cd y/src && find . -type f|sort|xargs sha256sum|sha256sum|cut -d' ' -f1)
+[ "$H" = "$REF" ] && ok "7-Zip decrypts Arca's zip without losing a byte" || ko "7-Zip mis-decrypts Arca's zip"
+
+7z a -tzip -mem=AES256 -p"$PW" out/enc7.zip src >/dev/null 2>&1
+rm -rf y; mkdir y
+$ARCA extract out/enc7.zip -o y -p "$PW" >/dev/null 2>&1
+H=$(cd y/src && find . -type f|sort|xargs sha256sum|sha256sum|cut -d' ' -f1)
+[ "$H" = "$REF" ] && ok "Arca decrypts 7-Zip's AES-256 zip" || ko "Arca fails on 7-Zip's AES-256 zip"
+$ARCA test out/enc.zip -p "wrong" >/dev/null 2>&1 && ko "Arca accepts a wrong password" || ok "Arca rejects the wrong password"
+$ARCA test out/enc.zip >/dev/null 2>&1 && ko "Arca extracts without the password" || ok "Arca asks for the password"
+# A flipped byte in the ciphertext must fail the HMAC, not come out as content.
+cp out/enc.zip out/enc-bad.zip
+printf '\x5A' | dd of=out/enc-bad.zip bs=1 seek=90 conv=notrunc 2>/dev/null
+$ARCA test out/enc-bad.zip -p "$PW" >/dev/null 2>&1 && ko "altered ciphertext went unnoticed" || ok "altered ciphertext fails its authentication code"
+
+echo
+echo "D) Corruption detection"
 cp out/a-normal.zip out/corrupt.zip
 printf '\xDE\xAD' | dd of=out/corrupt.zip bs=1 seek=200 conv=notrunc 2>/dev/null
 $ARCA test out/corrupt.zip >/dev/null 2>&1 && ko "corrupt zip not detected" || ok "corruption detected, exits with an error"
 $ARCA test out/a-normal.zip >/dev/null 2>&1 && ok "accepts the intact archive" || ko "rejects a valid archive"
 
 echo
-echo "D) Security: Zip Slip"
+echo "E) Security: Zip Slip"
 python3 - <<'PY'
 import zipfile
 z=zipfile.ZipFile('/tmp/interop/out/slip.zip','w')

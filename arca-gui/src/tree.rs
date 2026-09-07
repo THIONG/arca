@@ -91,6 +91,7 @@ pub struct Row {
     pub size: u64,
     pub packed: u64,
     pub method: &'static str,
+    pub encrypted: bool,
     pub count: usize,
 }
 
@@ -134,6 +135,7 @@ pub fn children_of(entries: &[Entry], dir: &str) -> Vec<Row> {
                         size: e.size,
                         packed: e.compressed_size,
                         method: e.method.name(),
+                        encrypted: e.encrypted,
                         count: 0,
                     });
                 }
@@ -152,6 +154,7 @@ pub fn children_of(entries: &[Entry], dir: &str) -> Vec<Row> {
             size,
             packed,
             method: "",
+            encrypted: false,
             count,
         })
         .collect();
@@ -191,6 +194,7 @@ mod tests {
             is_dir,
             mtime: None,
             offset: 0,
+            encrypted: false,
         }
     }
 

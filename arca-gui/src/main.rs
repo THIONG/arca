@@ -198,6 +198,19 @@ fn list_entries(archive: &Path) -> arca_core::Result<Vec<Entry>> {
     }
 }
 
+// Only the central directory is read, which is a few kilobytes at the tail of
+// the file. A .tar has no encryption to look for.
+fn is_encrypted(archive: &Path) -> bool {
+    if detect(archive) != Some(Format::Zip) {
+        return false;
+    }
+    File::open(archive)
+        .ok()
+        .and_then(|f| ZipArchive::open(f).ok())
+        .map(|a| a.has_encrypted())
+        .unwrap_or(false)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Answer {
     Replace,
@@ -306,6 +319,7 @@ fn extract(
     wanted: &[bool],
     notify: &(dyn Fn(usize, usize, &str) + Sync),
     ask: &dyn Fn(&Path) -> Answer,
+    password: Option<&str>,
 ) -> arca_core::Result<u64> {
     let Some(format) = detect(archive) else {
         return Err(arca_core::Error::Unsupported("unknown format".into()));
@@ -335,7 +349,7 @@ fn extract(
                 .map(|(e, path)| {
                     let mut source = BufReader::with_capacity(BUF, File::open(archive)?);
                     let mut f = BufWriter::with_capacity(BUF, File::create(path)?);
-                    let w = arca_zip::extract_entry(&mut source, e, &mut f)?;
+                    let w = arca_zip::extract_entry_with(&mut source, e, &mut f, password)?;
                     f.flush()?;
                     notify(done.fetch_add(1, Ordering::Relaxed) + 1, total, &e.name);
                     Ok(w)
@@ -451,7 +465,13 @@ fn compress(
     codec: Codec,
     level: Level,
     notify: &(dyn Fn(usize, usize, &str) + Sync),
+    password: Option<&str>,
 ) -> arca_core::Result<(u64, u64)> {
+    if password.is_some() && format != Format::Zip {
+        return Err(arca_core::Error::Unsupported(
+            "encryption only exists in .zip".into(),
+        ));
+    }
     let files = collect_files(inputs)?;
     let total = files.len();
     let mut source_bytes = 0u64;
@@ -463,7 +483,7 @@ fn compress(
                 notify(i, total, name);
                 let meta = fs::metadata(path)?;
                 let f = BufReader::with_capacity(BUF, File::open(path)?);
-                w.add(name, f, codec, level, None)?;
+                w.add_with_password(name, f, codec, level, None, password)?;
                 source_bytes += meta.len();
             }
             w.finish()?;
@@ -504,6 +524,7 @@ enum Job {
     Extract {
         archives: Vec<PathBuf>,
         dest: Destination,
+        password: Option<String>,
     },
     Test(PathBuf),
     Compress {
@@ -512,6 +533,7 @@ enum Job {
         format: Format,
         codec: Codec,
         level: Level,
+        password: Option<String>,
     },
 }
 
@@ -555,10 +577,12 @@ fn parse_args() -> Startup {
         "--extract-here" if !rest.is_empty() => Startup::Run(Job::Extract {
             archives: rest,
             dest: Destination::Beside,
+            password: None,
         }),
         "--extract-to-folder" if !rest.is_empty() => Startup::Run(Job::Extract {
             archives: rest,
             dest: Destination::Subfolder,
+            password: None,
         }),
         "--test" if !rest.is_empty() => Startup::Run(Job::Test(rest[0].clone())),
         "--add" if !rest.is_empty() => Startup::Add(rest),
@@ -568,6 +592,7 @@ fn parse_args() -> Startup {
             format: Format::Zip,
             codec: Codec::Deflate,
             level: Level::Normal,
+            password: None,
         }),
         other if !other.starts_with("--") => Startup::Browse(Some(PathBuf::from(other))),
         _ => Startup::Browse(None),
@@ -589,7 +614,7 @@ fn run_job_blocking(
     ask: &dyn Fn(&Path) -> Answer,
 ) -> std::result::Result<String, String> {
     match job {
-        Job::Extract { archives, dest } => {
+        Job::Extract { archives, dest, password } => {
             if archives.is_empty() {
                 return Err(s.nothing_to_do.to_string());
             }
@@ -604,7 +629,8 @@ fn run_job_blocking(
                     Destination::Beside => base,
                     Destination::Subfolder => base.join(archive_stem(a)),
                 };
-                total += extract(a, &target, &[], notify, ask).map_err(|e| e.to_string())?;
+                total += extract(a, &target, &[], notify, ask, password.as_deref())
+                    .map_err(|e| e.to_string())?;
                 last = target;
             }
             Ok(fill(
@@ -639,12 +665,15 @@ fn run_job_blocking(
             format,
             codec,
             level,
+            password,
         } => {
             if inputs.is_empty() {
                 return Err(s.nothing_to_do.to_string());
             }
-            let (from, to) =
-                compress(&out, &inputs, format, codec, level, notify).map_err(|e| e.to_string())?;
+            let (from, to) = compress(
+                &out, &inputs, format, codec, level, notify, password.as_deref(),
+            )
+            .map_err(|e| e.to_string())?;
             let pct = if from == 0 {
                 0.0
             } else {
@@ -678,6 +707,13 @@ enum Message {
     Progress(usize, usize, String),
     Done(String),
     Failed(String),
+}
+
+// What the password window is standing in front of: a job the context menu
+// handed us, or an encrypted archive just opened in the window.
+enum Pending {
+    Job(Box<Job>),
+    OpenArchive,
 }
 
 enum View {
@@ -714,6 +750,16 @@ struct Arca {
     show_settings: bool,
     conflict: Option<String>,
     replies: Option<Sender<Answer>>,
+    // A job held back until the password window has an answer. Extraction asks
+    // once, before it starts, rather than per entry: every entry in a .zip is
+    // encrypted with the same password, and asking again per file is noise.
+    waiting_on_password: Option<Pending>,
+    password_input: String,
+    show_password: bool,
+    add_password: String,
+    // Held for the archive currently open in the window, so extracting from it
+    // does not ask again for every button press.
+    archive_password: Option<String>,
 }
 
 impl Arca {
@@ -746,6 +792,11 @@ impl Arca {
             show_settings: false,
             conflict: None,
             replies: None,
+            waiting_on_password: None,
+            password_input: String::new(),
+            show_password: false,
+            add_password: String::new(),
+            archive_password: None,
         }
     }
 
@@ -811,6 +862,7 @@ impl Arca {
                     size: e.size,
                     packed: e.compressed_size,
                     method: e.method.name(),
+                    encrypted: e.encrypted,
                     count: 0,
                 })
                 .collect()
@@ -874,7 +926,20 @@ impl Arca {
         });
     }
 
+    // Reading the central directory is enough to know whether the archive is
+    // encrypted, and costs nothing next to extracting it. Asking here, before
+    // any work starts, keeps the question on the window's own thread.
     fn run_job(&mut self, ctx: &egui::Context, job: Job) {
+        if let Job::Extract { archives, password: None, .. } = &job {
+            if archives.iter().any(|a| is_encrypted(a)) {
+                self.password_input.clear();
+                self.waiting_on_password = Some(Pending::Job(Box::new(job)));
+                self.view = View::Running;
+                self.title = self.s().extracting.to_string();
+                ctx.request_repaint();
+                return;
+            }
+        }
         let s: &'static Strings = self.s();
         self.view = View::Running;
         self.title = match &job {
@@ -909,6 +974,11 @@ impl Arca {
             while let Ok(m) = rx.try_recv() {
                 match m {
                     Message::Listing(path, v) => {
+                        if v.iter().any(|e| e.encrypted) {
+                            self.password_input.clear();
+                            self.archive_password = None;
+                            self.waiting_on_password = Some(Pending::OpenArchive);
+                        }
                         self.checked = vec![true; v.len()];
                         self.entries = v;
                         if let Some(f) = detect(&path) {
@@ -1084,6 +1154,7 @@ impl Arca {
             vec![true; self.entries.len()]
         };
         let total = wanted.iter().filter(|b| **b).count();
+        let pw = self.archive_password.clone();
         self.close_when_done = false;
         let (reply_tx, reply_rx) = channel::<Answer>();
         self.replies = Some(reply_tx);
@@ -1094,7 +1165,7 @@ impl Arca {
                 ctx2.request_repaint();
             };
             let ask = conflict_asker(tx, &ctx2, &reply_rx);
-            let _ = tx.send(match extract(&archive, &dest, &wanted, &notify, &ask) {
+            let _ = tx.send(match extract(&archive, &dest, &wanted, &notify, &ask, pw.as_deref()) {
                 Ok(bytes) => Message::Done(fill(
                     s.extracted_to,
                     &[("size", &human(bytes)), ("dest", &dest.display().to_string())],
@@ -1102,6 +1173,68 @@ impl Arca {
                 Err(e) => Message::Failed(e.to_string()),
             });
         });
+    }
+
+    fn password_window(&mut self, ctx: &egui::Context) {
+        if self.waiting_on_password.is_none() {
+            return;
+        }
+        let s = self.s();
+        let mut go = false;
+        let mut cancel = false;
+        egui::Window::new(s.password_needed)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.label(s.password_hint);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.password_input)
+                            .password(!self.show_password)
+                            .desired_width(240.0),
+                    );
+                    field.request_focus();
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        go = true;
+                    }
+                    ui.checkbox(&mut self.show_password, s.show_password);
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button(s.start).clicked() {
+                        go = true;
+                    }
+                    if ui.button(s.cancel).clicked() {
+                        cancel = true;
+                    }
+                });
+                ui.add_space(4.0);
+            });
+
+        if cancel {
+            let was_job = matches!(self.waiting_on_password, Some(Pending::Job(_)));
+            self.waiting_on_password = None;
+            self.password_input.clear();
+            if was_job {
+                self.view = View::Browse;
+            }
+            return;
+        }
+        if go && !self.password_input.is_empty() {
+            let given = std::mem::take(&mut self.password_input);
+            match self.waiting_on_password.take() {
+                Some(Pending::Job(job)) => {
+                    if let Job::Extract { archives, dest, .. } = *job {
+                        self.run_job(ctx, Job::Extract { archives, dest, password: Some(given) });
+                    }
+                }
+                Some(Pending::OpenArchive) => self.archive_password = Some(given),
+                None => {}
+            }
+        }
     }
 
     fn conflict_window(&mut self, ctx: &egui::Context) {
@@ -1274,6 +1407,20 @@ impl Arca {
         ui.add_space(6.0);
         self.format_row(ui);
         ui.add_space(6.0);
+        // Only .zip has anywhere to put encryption, so the field is not offered
+        // for the other two rather than accepted and quietly ignored.
+        if self.format == Format::Zip {
+            ui.horizontal(|ui| {
+                ui.label(s.password_optional);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.add_password)
+                        .password(!self.show_password)
+                        .desired_width(220.0),
+                );
+                ui.checkbox(&mut self.show_password, s.show_password);
+            });
+            ui.add_space(6.0);
+        }
         let count = self.pending_inputs.len();
         ui.label(format!(
             "{count} {}",
@@ -1302,6 +1449,11 @@ impl Arca {
                     format: self.format,
                     codec: self.codec,
                     level: self.level,
+                    password: if self.format == Format::Zip && !self.add_password.is_empty() {
+                        Some(self.add_password.clone())
+                    } else {
+                        None
+                    },
                 };
                 self.run_job(ctx, job);
             }
@@ -1487,6 +1639,8 @@ impl Arca {
                     row.col(|ui| {
                         if r.is_dir {
                             ui.weak(format!("{} {}", r.count, s.items_word));
+                        } else if r.encrypted {
+                            ui.label(format!("AES-256 {}", r.method));
                         } else {
                             ui.label(r.method);
                         }
@@ -1568,6 +1722,7 @@ impl eframe::App for Arca {
                     self.running_view(ui, &ctx2);
                 });
                 self.conflict_window(&ctx2);
+                self.password_window(&ctx2);
             }
             View::Add => {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -1580,6 +1735,7 @@ impl eframe::App for Arca {
                 });
                 self.settings_window(&ctx2);
                 self.conflict_window(&ctx2);
+                self.password_window(&ctx2);
                 egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
                     ui.add_space(5.0);
                     if self.busy {

@@ -18,6 +18,12 @@ pub enum Error {
         expected: u32,
         found: u32,
     },
+    // The AES authentication code did not match. Separate from Integrity
+    // because there is no CRC to report here: the HMAC is what failed, and
+    // the difference matters, since it also catches deliberate tampering.
+    Tampered {
+        name: String,
+    },
     Unsupported(String),
 }
 
@@ -34,6 +40,10 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "integrity failure in '{name}': expected CRC {expected:08x}, found {found:08x}"
+            ),
+            Error::Tampered { name } => write!(
+                f,
+                "'{name}' did not pass its authentication code: the archive was altered after it was encrypted"
             ),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
         }
@@ -127,6 +137,10 @@ pub struct Entry {
     pub is_dir: bool,
     pub mtime: Option<i64>,
     pub offset: u64,
+    // WinZip AES: the entry is encrypted and `method` holds the real compressor,
+    // read out of the 0x9901 extra field rather than the method field, which
+    // says 99 for every encrypted entry.
+    pub encrypted: bool,
 }
 
 impl Entry {

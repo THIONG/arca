@@ -146,12 +146,25 @@ impl<R: Read + Seek> ZipArchive<R> {
     }
 
     pub fn extract_to<W: Write>(&mut self, idx: usize, dest: W) -> Result<u64> {
+        self.extract_to_with(idx, dest, None)
+    }
+
+    pub fn extract_to_with<W: Write>(
+        &mut self,
+        idx: usize,
+        dest: W,
+        password: Option<&str>,
+    ) -> Result<u64> {
         let e = self
             .entries_list
             .get(idx)
             .ok_or_else(|| Error::Format(format!("no such entry: {idx}")))?
             .clone();
-        extract_entry(&mut self.source, &e, dest)
+        extract_entry_with(&mut self.source, &e, dest, password)
+    }
+
+    pub fn has_encrypted(&self) -> bool {
+        self.entries_list.iter().any(|e| e.encrypted)
     }
 }
 
@@ -163,6 +176,15 @@ pub fn extract_entry<R: Read + Seek, W: Write>(
     source: &mut R,
     e: &Entry,
     dest: W,
+) -> Result<u64> {
+    extract_entry_with(source, e, dest, None)
+}
+
+pub fn extract_entry_with<R: Read + Seek, W: Write>(
+    source: &mut R,
+    e: &Entry,
+    dest: W,
+    password: Option<&str>,
 ) -> Result<u64> {
     source.seek(SeekFrom::Start(e.offset))?;
     let mut lfh = [0u8; LFH_FIXED];
@@ -176,8 +198,11 @@ pub fn extract_entry<R: Read + Seek, W: Write>(
     }
     c.skip(2, "version")?;
     let flags = c.u16le("flags")?;
-    if flags & 1 != 0 {
-        return Err(Error::Unsupported(format!("'{}' is encrypted", e.name)));
+    if flags & 1 != 0 && !e.encrypted {
+        return Err(Error::Unsupported(format!(
+            "'{}' uses ZipCrypto, the old password scheme (only AES-256 is supported)",
+            e.name
+        )));
     }
     c.skip(18, "rest of the local header")?;
     let n_len = c.u16le("name length")? as u64;
@@ -185,37 +210,56 @@ pub fn extract_entry<R: Read + Seek, W: Write>(
 
     let data_start = e.offset + LFH_FIXED as u64 + n_len + x_len;
     source.seek(SeekFrom::Start(data_start))?;
-    let bounded = source.take(e.compressed_size);
+    let mut bounded = source.take(e.compressed_size);
 
     let mut cw = CrcWriter::new(dest);
-    match e.method {
-        Method::Store => {
-            let mut a = bounded;
-            io::copy(&mut a, &mut cw)?;
+
+    if e.encrypted {
+        let pw = password.ok_or_else(|| {
+            Error::Unsupported(format!("'{}' is encrypted and needs a password", e.name))
+        })?;
+        let cipher_len = e
+            .compressed_size
+            .checked_sub(aes::OVERHEAD as u64)
+            .ok_or_else(|| {
+                Error::Format(format!(
+                    "'{}': {} bytes, shorter than its own AES header",
+                    e.name, e.compressed_size
+                ))
+            })?;
+        let mut salt = [0u8; aes::SALT_256];
+        bounded.read_exact(&mut salt)?;
+        let mut given = [0u8; aes::VERIFIER];
+        bounded.read_exact(&mut given)?;
+
+        let keys = aes::derive(pw, &salt);
+        if !aes::verifier_matches(&keys, &given) {
+            return Err(Error::Format(format!("'{}': wrong password", e.name)));
         }
-        Method::Deflate => {
-            let mut dec = flate2::read::DeflateDecoder::new(bounded);
-            io::copy(&mut dec, &mut cw)?;
+
+        let reader = aes::AesReader::new(&mut bounded, &keys, cipher_len)?;
+        let reader = decompress_into(reader, e.method, &mut cw)?;
+        let computed = reader.finish()?;
+
+        // The authentication code sits after the ciphertext, so it can only be
+        // checked once everything has already been written out. Whoever called
+        // this must throw away what it wrote if this fails: the bytes came from
+        // a key that verified, but nothing so far proves they were not altered.
+        let mut auth = [0u8; aes::AUTH_CODE];
+        bounded.read_exact(&mut auth)?;
+        if !aes::auth_matches(&computed, &auth) {
+            return Err(Error::Tampered { name: e.name.clone() });
         }
-        Method::Zstd => {
-            #[cfg(feature = "codecs-native")]
-            {
-                let mut dec = zstd::stream::read::Decoder::new(bounded)
-                    .map_err(Error::Io)?;
-                io::copy(&mut dec, &mut cw)?;
-            }
-            #[cfg(not(feature = "codecs-native"))]
-            {
-                let _ = bounded;
-                return Err(Error::Unsupported(
-                    "'{}' uses Zstandard and this binary was built without it".into(),
-                ));
-            }
-        }
+    } else {
+        decompress_into(bounded, e.method, &mut cw)?;
     }
+
     let (_, crc_val, written) = cw.finalize();
 
-    if crc_val != e.crc32 {
+    // AE-2 stores a zero CRC on purpose, and the HMAC has already spoken for
+    // the contents. AE-1 keeps the real one, so a non-zero value still gets
+    // checked either way.
+    if !(e.encrypted && e.crc32 == 0) && crc_val != e.crc32 {
         return Err(Error::Integrity { name: e.name.clone(), expected: e.crc32, found: crc_val });
     }
     if written != e.size {
@@ -225,6 +269,43 @@ pub fn extract_entry<R: Read + Seek, W: Write>(
         )));
     }
     Ok(written)
+}
+
+// Hands the reader back afterwards, which is what lets the encrypted path get
+// its AES reader out to ask it for the authentication code. A decompressor may
+// stop before the end of its input, so the reader is not necessarily drained.
+fn decompress_into<Rd: Read, W: Write>(
+    src: Rd,
+    method_code: Method,
+    cw: &mut CrcWriter<W>,
+) -> Result<Rd> {
+    match method_code {
+        Method::Store => {
+            let mut a = src;
+            io::copy(&mut a, cw)?;
+            Ok(a)
+        }
+        Method::Deflate => {
+            let mut dec = flate2::read::DeflateDecoder::new(src);
+            io::copy(&mut dec, cw)?;
+            Ok(dec.into_inner())
+        }
+        Method::Zstd => {
+            #[cfg(feature = "codecs-native")]
+            {
+                let mut dec = zstd::stream::read::Decoder::new(src).map_err(Error::Io)?;
+                io::copy(&mut dec, cw)?;
+                Ok(dec.finish().into_inner())
+            }
+            #[cfg(not(feature = "codecs-native"))]
+            {
+                let _ = src;
+                Err(Error::Unsupported(
+                    "the entry uses Zstandard and this binary was built without it".into(),
+                ))
+            }
+        }
+    }
 }
 
 fn find_backwards(buf: &[u8], signature: u32) -> Option<usize> {
@@ -323,7 +404,34 @@ fn read_central_header(c: &mut Cursor<'_>) -> Result<Entry> {
         }
     }
 
-    let method = match method_code {
+    // Method 99 means WinZip AES, and the field no longer says how the entry
+    // was compressed: the real method lives in the 0x9901 extra field.
+    let encrypted = method_code == aes::METHOD_AE;
+    let real_code = if encrypted {
+        let info = aes::parse_extra(extra).ok_or_else(|| {
+            Error::Format("entry says AES but carries no 0x9901 extra field".into())
+        })?;
+        if info.strength != aes::STRENGTH_256 {
+            return Err(Error::Unsupported(format!(
+                "AES-{} (only AES-256 is supported)",
+                match info.strength {
+                    1 => "128",
+                    2 => "192",
+                    _ => "?",
+                }
+            )));
+        }
+        info.real_method
+    } else {
+        if flags & 1 != 0 {
+            return Err(Error::Unsupported(
+                "ZipCrypto, the old password scheme (only AES-256 is supported)".into(),
+            ));
+        }
+        method_code
+    };
+
+    let method = match real_code {
         0 => Method::Store,
         8 => Method::Deflate,
         93 => Method::Zstd,
@@ -350,6 +458,7 @@ fn read_central_header(c: &mut Cursor<'_>) -> Result<Entry> {
         is_dir,
         mtime: arca_core::dos_to_unix(date_val, time_val),
         offset,
+        encrypted,
     })
 }
 
@@ -363,6 +472,8 @@ struct Record {
     date_val: u16,
     time_val: u16,
     is_directory: bool,
+    encrypted: bool,
+    real_method: u16,
 }
 
 pub struct ZipWriter<W: Write + Seek> {
@@ -379,79 +490,64 @@ impl<W: Write + Seek> ZipWriter<W> {
     pub fn add<R: Read>(
         &mut self,
         name_str: &str,
+        data: R,
+        codec: Codec,
+        level: Level,
+        mtime: Option<i64>,
+    ) -> Result<()> {
+        self.add_with_password(name_str, data, codec, level, mtime, None)
+    }
+
+    // With a password the entry is compressed first and encrypted after, which
+    // is the order WinZip AES specifies: encrypting first would leave the
+    // compressor nothing to find. The method field then says 99 and the real
+    // compressor moves into the 0x9901 extra field.
+    pub fn add_with_password<R: Read>(
+        &mut self,
+        name_str: &str,
         mut data: R,
         codec: Codec,
         level: Level,
         mtime: Option<i64>,
+        password: Option<&str>,
     ) -> Result<()> {
         let (date_val, time_val) = arca_core::unix_to_dos(mtime.unwrap_or(0));
         let name_bytes = check_name(name_str)?;
         let method_code = method_of(codec);
         let offset = self.pos;
-        self.write_lfh(&name_bytes, method_code.code(), date_val, time_val)?;
+        let aes_extra = password.map(|_| aes::extra_field(method_code.code()));
+        let stored_code = if aes_extra.is_some() { aes::METHOD_AE } else { method_code.code() };
+        self.write_lfh(&name_bytes, stored_code, date_val, time_val, aes_extra.as_deref())?;
         let extra_offset = offset + LFH_FIXED as u64 + name_bytes.len() as u64;
+        let extra_len = EXTRA_Z64 + aes_extra.as_ref().map_or(0, |x| x.len());
 
         let mut hasher = crc32fast::Hasher::new();
-        let mut uncompressed: u64 = 0;
-        let comp_size: u64;
-        let mut buf = vec![0u8; STREAM_BUF];
 
-        match method_code {
-            Method::Store => {
-                loop {
-                    let n = data.read(&mut buf)?;
-                    if n == 0 { break; }
-                    hasher.update(&buf[..n]);
-                    self.out.write_all(&buf[..n])?;
-                    uncompressed += n as u64;
-                }
-                comp_size = uncompressed;
+        let (comp_size, uncompressed, crc_val) = match password {
+            None => {
+                let (_, comp, un) =
+                    compress_stream(&mut data, &mut self.out, method_code, level, &mut hasher)?;
+                (comp, un, hasher.finalize())
             }
-            Method::Deflate => {
-                let mut enc = DeflateEncoder::new(
-                    Counter::new(&mut self.out),
-                    Compression::new(level.to_flate2()),
-                );
-                loop {
-                    let n = data.read(&mut buf)?;
-                    if n == 0 { break; }
-                    hasher.update(&buf[..n]);
-                    enc.write_all(&buf[..n])?;
-                    uncompressed += n as u64;
-                }
-                comp_size = enc.finish()?.written;
+            Some(pw) => {
+                let salt = aes::random_salt()?;
+                let keys = aes::derive(pw, &salt);
+                self.out.write_all(&salt)?;
+                self.out.write_all(&aes::verifier_of(&keys))?;
+                let sink = aes::AesWriter::new(&mut self.out, &keys)?;
+                let (sink, cipher_len, un) =
+                    compress_stream(&mut data, sink, method_code, level, &mut hasher)?;
+                let (_, auth, _) = sink.finish();
+                self.out.write_all(&auth)?;
+                // AE-2 leaves the CRC field at zero on purpose: it would leak a
+                // checksum of the plaintext, and the HMAC already does the job.
+                (aes::OVERHEAD as u64 + cipher_len, un, 0)
             }
-            Method::Zstd => {
-                #[cfg(feature = "codecs-native")]
-                {
-                    let mut enc = zstd::stream::write::Encoder::new(
-                        Counter::new(&mut self.out),
-                        level.to_zstd(),
-                    )
-                    .map_err(Error::Io)?;
-                    let _ = enc.multithread(available_threads());
-                    loop {
-                        let n = data.read(&mut buf)?;
-                        if n == 0 { break; }
-                        hasher.update(&buf[..n]);
-                        enc.write_all(&buf[..n])?;
-                        uncompressed += n as u64;
-                    }
-                    comp_size = enc.finish().map_err(Error::Io)?.written;
-                }
-                #[cfg(not(feature = "codecs-native"))]
-                {
-                    return Err(Error::Unsupported(
-                        "this binary was built without Zstandard".into(),
-                    ));
-                }
-            }
-        }
+        };
 
-        let crc_val = hasher.finalize();
         self.close_entry(
-            name_bytes, offset, extra_offset, crc_val, comp_size, uncompressed, method_code, date_val, time_val,
-            name_str.ends_with('/'),
+            name_bytes, offset, extra_offset, extra_len, crc_val, comp_size, uncompressed,
+            method_code, date_val, time_val, name_str.ends_with('/'), aes_extra.is_some(),
         )
     }
 
@@ -464,15 +560,46 @@ impl<W: Write + Seek> ZipWriter<W> {
         method_code: Method,
         mtime: Option<i64>,
     ) -> Result<()> {
+        self.put_block(name_str, compressed, crc_val, uncompressed, method_code, mtime, false)
+    }
+
+    // Takes a block already through `seal_block`, so the key derivation, which
+    // is a thousand rounds of PBKDF2 per entry, happens wherever the caller
+    // compressed it. Doing it here would put every one of them on one thread.
+    pub fn add_sealed(
+        &mut self,
+        name_str: &str,
+        sealed: &[u8],
+        uncompressed: u64,
+        method_code: Method,
+        mtime: Option<i64>,
+    ) -> Result<()> {
+        self.put_block(name_str, sealed, 0, uncompressed, method_code, mtime, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn put_block(
+        &mut self,
+        name_str: &str,
+        body: &[u8],
+        crc_val: u32,
+        uncompressed: u64,
+        method_code: Method,
+        mtime: Option<i64>,
+        encrypted: bool,
+    ) -> Result<()> {
         let (date_val, time_val) = arca_core::unix_to_dos(mtime.unwrap_or(0));
         let name_bytes = check_name(name_str)?;
         let offset = self.pos;
-        self.write_lfh(&name_bytes, method_code.code(), date_val, time_val)?;
+        let aes_extra = encrypted.then(|| aes::extra_field(method_code.code()));
+        let stored_code = if encrypted { aes::METHOD_AE } else { method_code.code() };
+        self.write_lfh(&name_bytes, stored_code, date_val, time_val, aes_extra.as_deref())?;
         let extra_offset = offset + LFH_FIXED as u64 + name_bytes.len() as u64;
-        self.out.write_all(compressed)?;
+        let extra_len = EXTRA_Z64 + aes_extra.as_ref().map_or(0, |x| x.len());
+        self.out.write_all(body)?;
         self.close_entry(
-            name_bytes, offset, extra_offset, crc_val, compressed.len() as u64, uncompressed, method_code,
-            date_val, time_val, name_str.ends_with('/'),
+            name_bytes, offset, extra_offset, extra_len, crc_val, body.len() as u64, uncompressed,
+            method_code, date_val, time_val, name_str.ends_with('/'), encrypted,
         )
     }
 
@@ -482,6 +609,7 @@ impl<W: Write + Seek> ZipWriter<W> {
         name_bytes: Vec<u8>,
         offset: u64,
         extra_offset: u64,
+        extra_len: usize,
         crc_val: u32,
         comp_size: u64,
         uncompressed: u64,
@@ -489,8 +617,9 @@ impl<W: Write + Seek> ZipWriter<W> {
         date_val: u16,
         time_val: u16,
         is_directory: bool,
+        encrypted: bool,
     ) -> Result<()> {
-        let fin = extra_offset + EXTRA_Z64 as u64 + comp_size;
+        let fin = extra_offset + extra_len as u64 + comp_size;
         let sat_u = uncompressed >= 0xFFFF_FFFF;
         let sat_c = comp_size >= 0xFFFF_FFFF;
         self.out.seek(SeekFrom::Start(offset + 14))?;
@@ -510,19 +639,33 @@ impl<W: Write + Seek> ZipWriter<W> {
             comp_size,
             uncompressed,
             offset,
-            method_code: method_code.code(),
+            method_code: if encrypted { aes::METHOD_AE } else { method_code.code() },
             date_val,
             time_val,
             is_directory,
+            encrypted,
+            real_method: method_code.code(),
         });
         Ok(())
     }
 
-    fn write_lfh(&mut self, name_str: &[u8], method_code: u16, date_val: u16, time_val: u16) -> Result<()> {
-        let mut h = Vec::with_capacity(LFH_FIXED + name_str.len() + EXTRA_Z64);
+    // The Zip64 field goes first and keeps its fixed size, because close_entry
+    // seeks straight back to it to patch the sizes once they are known. The AES
+    // field, when there is one, goes after it so that offset stays put.
+    fn write_lfh(
+        &mut self,
+        name_str: &[u8],
+        method_code: u16,
+        date_val: u16,
+        time_val: u16,
+        aes_extra: Option<&[u8]>,
+    ) -> Result<()> {
+        let extra_len = EXTRA_Z64 + aes_extra.map_or(0, |x| x.len());
+        let flags: u16 = if aes_extra.is_some() { 0x0801 } else { 0x0800 };
+        let mut h = Vec::with_capacity(LFH_FIXED + name_str.len() + extra_len);
         h.extend_from_slice(&SIG_LFH.to_le_bytes());
         h.extend_from_slice(&45u16.to_le_bytes());
-        h.extend_from_slice(&(0x0800u16).to_le_bytes());
+        h.extend_from_slice(&flags.to_le_bytes());
         h.extend_from_slice(&method_code.to_le_bytes());
         h.extend_from_slice(&time_val.to_le_bytes());
         h.extend_from_slice(&date_val.to_le_bytes());
@@ -530,12 +673,15 @@ impl<W: Write + Seek> ZipWriter<W> {
         h.extend_from_slice(&0u32.to_le_bytes());
         h.extend_from_slice(&0u32.to_le_bytes());
         h.extend_from_slice(&(name_str.len() as u16).to_le_bytes());
-        h.extend_from_slice(&(EXTRA_Z64 as u16).to_le_bytes());
+        h.extend_from_slice(&(extra_len as u16).to_le_bytes());
         h.extend_from_slice(name_str);
         h.extend_from_slice(&0x0001u16.to_le_bytes());
         h.extend_from_slice(&16u16.to_le_bytes());
         h.extend_from_slice(&0u64.to_le_bytes());
         h.extend_from_slice(&0u64.to_le_bytes());
+        if let Some(x) = aes_extra {
+            h.extend_from_slice(x);
+        }
         self.out.write_all(&h)?;
         Ok(())
     }
@@ -566,12 +712,19 @@ impl<W: Write + Seek> ZipWriter<W> {
             } else {
                 Vec::new()
             };
+            // The reader looks the AES field up in the central directory, so it
+            // has to be here too and not only in the local header.
+            let mut extra = extra;
+            if r.encrypted {
+                extra.extend_from_slice(&aes::extra_field(r.real_method));
+            }
+            let flags: u16 = if r.encrypted { 0x0801 } else { 0x0800 };
 
             let mut h = Vec::with_capacity(CD_FIXED + r.name_str.len() + extra.len());
             h.extend_from_slice(&SIG_CD.to_le_bytes());
             h.extend_from_slice(&(0x031Eu16).to_le_bytes());
             h.extend_from_slice(&45u16.to_le_bytes());
-            h.extend_from_slice(&(0x0800u16).to_le_bytes());
+            h.extend_from_slice(&flags.to_le_bytes());
             h.extend_from_slice(&r.method_code.to_le_bytes());
             h.extend_from_slice(&r.time_val.to_le_bytes());
             h.extend_from_slice(&r.date_val.to_le_bytes());
@@ -653,6 +806,69 @@ impl<W: Write> Write for Counter<W> {
     }
 }
 
+// Pulls everything out of `data`, compresses it into `sink` and returns the
+// sink back along with how many bytes came out and how many went in. It is
+// generic over the sink so the same three arms serve a plain entry, where the
+// sink is the file, and an encrypted one, where it is the AES writer.
+fn compress_stream<R: Read, S: Write>(
+    data: &mut R,
+    sink: S,
+    method_code: Method,
+    level: Level,
+    hasher: &mut crc32fast::Hasher,
+) -> Result<(S, u64, u64)> {
+    let mut counter = Counter::new(sink);
+    let mut uncompressed = 0u64;
+    let mut buf = vec![0u8; STREAM_BUF];
+
+    match method_code {
+        Method::Store => loop {
+            let n = data.read(&mut buf)?;
+            if n == 0 { break; }
+            hasher.update(&buf[..n]);
+            counter.write_all(&buf[..n])?;
+            uncompressed += n as u64;
+        },
+        Method::Deflate => {
+            let mut enc = DeflateEncoder::new(counter, Compression::new(level.to_flate2()));
+            loop {
+                let n = data.read(&mut buf)?;
+                if n == 0 { break; }
+                hasher.update(&buf[..n]);
+                enc.write_all(&buf[..n])?;
+                uncompressed += n as u64;
+            }
+            counter = enc.finish()?;
+        }
+        Method::Zstd => {
+            #[cfg(feature = "codecs-native")]
+            {
+                let mut enc = zstd::stream::write::Encoder::new(counter, level.to_zstd())
+                    .map_err(Error::Io)?;
+                let _ = enc.multithread(available_threads());
+                loop {
+                    let n = data.read(&mut buf)?;
+                    if n == 0 { break; }
+                    hasher.update(&buf[..n]);
+                    enc.write_all(&buf[..n])?;
+                    uncompressed += n as u64;
+                }
+                counter = enc.finish().map_err(Error::Io)?;
+            }
+            #[cfg(not(feature = "codecs-native"))]
+            {
+                let _ = counter;
+                return Err(Error::Unsupported(
+                    "this binary was built without Zstandard".into(),
+                ));
+            }
+        }
+    }
+
+    let comp_size = counter.written;
+    Ok((counter.inner, comp_size, uncompressed))
+}
+
 fn check_name(name_str: &str) -> Result<Vec<u8>> {
     let b = name_str.as_bytes().to_vec();
     if b.len() > u16::MAX as usize {
@@ -672,6 +888,20 @@ fn method_of(c: Codec) -> Method {
 #[cfg(feature = "codecs-native")]
 fn available_threads() -> u32 {
     std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1)
+}
+
+// Wraps an already compressed block the way an encrypted entry sits on disk:
+// salt, password verifier, ciphertext and authentication code. Kept apart from
+// the writer so it can run on whatever thread compressed the block.
+pub fn seal_block(compressed: &[u8], password: &str) -> Result<Vec<u8>> {
+    let mut body = compressed.to_vec();
+    let (salt, verifier, auth) = aes::encrypt(password, &mut body)?;
+    let mut out = Vec::with_capacity(body.len() + aes::OVERHEAD);
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&verifier);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&auth);
+    Ok(out)
 }
 
 pub fn compress_block(data: &[u8], codec: Codec, level: Level) -> Result<(Vec<u8>, Method, u32)> {
@@ -785,6 +1015,121 @@ mod tests {
             let mut source = IoCursor::new(buf.clone());
             extract_entry(&mut source, e, &mut alone).unwrap();
             assert_eq!(through_archive, alone, "entry {i}");
+        }
+    }
+
+    fn encrypted_archive(password: &str, codec: Codec, body: &[u8]) -> Vec<u8> {
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        w.add_with_password("secret.txt", body, codec, Level::Normal, None, Some(password))
+            .unwrap();
+        w.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn encrypted_round_trip_for_every_codec() {
+        let body = b"the quick brown fox ".repeat(500);
+        let mut codecs = vec![Codec::Store, Codec::Deflate];
+        if cfg!(feature = "codecs-native") {
+            codecs.push(Codec::Zstd);
+        }
+        for codec in codecs {
+            let buf = encrypted_archive("hunter2", codec, &body);
+            let mut a = ZipArchive::open(IoCursor::new(buf)).unwrap();
+            assert!(a.has_encrypted());
+            assert_eq!(a.entries()[0].size, body.len() as u64);
+            let mut out = Vec::new();
+            a.extract_to_with(0, &mut out, Some("hunter2")).unwrap();
+            assert_eq!(out, body, "{codec:?}");
+        }
+    }
+
+    // The password goes into PBKDF2 as UTF-8, which is what every other tool
+    // does. interop.sh cannot check this because Git Bash mangles a non-ASCII
+    // argument before it reaches a native .exe.
+    #[test]
+    fn a_password_that_is_not_ascii_round_trips() {
+        let body = b"contenido".repeat(20);
+        for pw in ["contraseña", "пароль", "密码", "clave con espacios y ñ", "🔑"] {
+            let buf = encrypted_archive(pw, Codec::Deflate, &body);
+            let mut a = ZipArchive::open(IoCursor::new(buf)).unwrap();
+            let mut out = Vec::new();
+            a.extract_to_with(0, &mut out, Some(pw)).unwrap();
+            assert_eq!(out, body, "{pw}");
+        }
+    }
+
+    #[test]
+    fn the_bytes_on_disk_are_not_the_plaintext() {
+        let body = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_vec();
+        let buf = encrypted_archive("k", Codec::Store, &body);
+        assert!(
+            !buf.windows(body.len()).any(|w| w == &body[..]),
+            "the plaintext is still sitting in the archive"
+        );
+    }
+
+    #[test]
+    fn a_wrong_password_is_refused_before_anything_is_written() {
+        let buf = encrypted_archive("right", Codec::Deflate, b"payload");
+        let mut a = ZipArchive::open(IoCursor::new(buf)).unwrap();
+        let mut out = Vec::new();
+        let r = a.extract_to_with(0, &mut out, Some("wrong"));
+        assert!(r.is_err(), "{r:?}");
+        assert!(out.is_empty(), "nothing may be written for a wrong password");
+    }
+
+    #[test]
+    fn an_encrypted_entry_without_a_password_says_so() {
+        let buf = encrypted_archive("k", Codec::Deflate, b"payload");
+        let mut a = ZipArchive::open(IoCursor::new(buf)).unwrap();
+        let r = a.extract_to(0, &mut Vec::new());
+        assert!(matches!(r, Err(Error::Unsupported(_))), "{r:?}");
+    }
+
+    // Every byte of the ciphertext, flipped one at a time, has to be caught by
+    // the authentication code. The password is right in all of these, so the
+    // verifier waves them through and only the HMAC stands in the way.
+    #[test]
+    fn a_flipped_bit_anywhere_in_the_ciphertext_is_caught() {
+        let buf = encrypted_archive("k", Codec::Store, b"0123456789abcdefghij");
+        let first = LFH_FIXED + "secret.txt".len() + EXTRA_Z64 + 11;
+        for i in 0..20usize {
+            let mut bad = buf.clone();
+            bad[first + aes::SALT_256 + aes::VERIFIER + i] ^= 0x01;
+            let mut a = ZipArchive::open(IoCursor::new(bad)).unwrap();
+            let r = a.extract_to_with(0, &mut Vec::new(), Some("k"));
+            assert!(
+                matches!(r, Err(Error::Tampered { .. })),
+                "byte {i} went through unnoticed: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_entries_with_the_same_password_do_not_share_a_keystream() {
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        for n in ["a.txt", "b.txt"] {
+            w.add_with_password(n, &b"identical contents"[..], Codec::Store, Level::Store, None, Some("k"))
+                .unwrap();
+        }
+        let buf = w.finish().unwrap().into_inner();
+        let a = ZipArchive::open(IoCursor::new(buf.clone())).unwrap();
+        let one = &buf[a.entries()[0].offset as usize..][..80];
+        let two = &buf[a.entries()[1].offset as usize..][..80];
+        assert_ne!(one, two, "a repeated salt would leak that the two match");
+    }
+
+    #[test]
+    fn garbage_in_an_encrypted_entry_does_not_panic() {
+        let buf = encrypted_archive("k", Codec::Deflate, &b"content".repeat(100));
+        for seed in 0u64..300 {
+            let mut bad = buf.clone();
+            let i = (seed.wrapping_mul(2_654_435_761) as usize) % bad.len();
+            bad[i] ^= ((seed % 255) + 1) as u8;
+            if let Ok(mut a) = ZipArchive::open(IoCursor::new(bad)) {
+                let _ = a.extract_to_with(0, &mut Vec::new(), Some("k"));
+                let _ = a.extract_to_with(0, &mut Vec::new(), None);
+            }
         }
     }
 

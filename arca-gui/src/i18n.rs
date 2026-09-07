@@ -104,6 +104,10 @@ pub struct Strings {
     pub no_all: &'static str,
     pub rename: &'static str,
     pub rename_all: &'static str,
+    pub password_optional: &'static str,
+    pub password_needed: &'static str,
+    pub password_hint: &'static str,
+    pub show_password: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -174,6 +178,10 @@ const EN: Strings = Strings {
     no_all: "Skip all",
     rename: "Keep both",
     rename_all: "Keep both, always",
+    password_optional: "Password (optional, AES-256)",
+    password_needed: "This archive is encrypted",
+    password_hint: "Type the password to open it",
+    show_password: "Show",
 };
 
 const ES: Strings = Strings {
@@ -244,6 +252,10 @@ const ES: Strings = Strings {
     no_all: "Omitir todos",
     rename: "Conservar los dos",
     rename_all: "Conservar los dos, siempre",
+    password_optional: "Contraseña (opcional, AES-256)",
+    password_needed: "Este archivo está cifrado",
+    password_hint: "Escribe la contraseña para abrirlo",
+    show_password: "Ver",
 };
 
 pub fn strings(l: Lang) -> &'static Strings {

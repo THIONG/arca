@@ -108,11 +108,7 @@ pub fn decrypt(password: &str, body: &[u8]) -> Result<Vec<u8>> {
     mac.update(cipher_text);
     let tag = mac.finalize().into_bytes();
     if !constant_time_eq(auth, &tag[..AUTH_CODE]) {
-        return Err(Error::Integrity {
-            name: "encrypted entry".into(),
-            expected: 0,
-            found: 0,
-        });
+        return Err(Error::Tampered { name: "encrypted entry".into() });
     }
 
     let mut plain = cipher_text.to_vec();
@@ -208,6 +204,74 @@ pub fn verifier_of(keys: &Keys) -> [u8; VERIFIER] {
     keys.verifier
 }
 
+pub fn verifier_matches(keys: &Keys, given: &[u8]) -> bool {
+    constant_time_eq(&keys.verifier, given)
+}
+
+pub fn auth_matches(computed: &[u8; AUTH_CODE], given: &[u8]) -> bool {
+    constant_time_eq(computed, given)
+}
+
+// Decrypts as the bytes come off the disk, so the decompressor downstream never
+// waits for the whole entry to be in memory. The price is that the
+// authentication code can only be checked once everything has gone through: the
+// caller gets the plaintext first and the verdict after, and must treat what it
+// wrote as suspect until `finish` says otherwise.
+pub struct AesReader<R: std::io::Read> {
+    inner: R,
+    stream: Ctr,
+    mac: HmacSha1,
+    remaining: u64,
+}
+
+impl<R: std::io::Read> AesReader<R> {
+    pub fn new(inner: R, keys: &Keys, cipher_len: u64) -> Result<Self> {
+        Ok(AesReader {
+            inner,
+            stream: stream(&keys.cipher),
+            mac: <HmacSha1 as Mac>::new_from_slice(&keys.mac)
+                .map_err(|_| Error::Format("bad HMAC key length".into()))?,
+            remaining: cipher_len,
+        })
+    }
+
+    // A decompressor stops at the end of its own stream, which need not be the
+    // end of the ciphertext. Whatever is left still belongs under the MAC.
+    pub fn finish(mut self) -> Result<[u8; AUTH_CODE]> {
+        let mut skip = [0u8; 8192];
+        while self.remaining > 0 {
+            let want = skip.len().min(self.remaining as usize);
+            let n = self.inner.read(&mut skip[..want])?;
+            if n == 0 {
+                break;
+            }
+            self.mac.update(&skip[..n]);
+            self.remaining -= n as u64;
+        }
+        let tag = self.mac.finalize().into_bytes();
+        let mut auth = [0u8; AUTH_CODE];
+        auth.copy_from_slice(&tag[..AUTH_CODE]);
+        Ok(auth)
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for AesReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let want = buf.len().min(self.remaining as usize);
+        let n = self.inner.read(&mut buf[..want])?;
+        if n == 0 {
+            return Ok(0);
+        }
+        self.mac.update(&buf[..n]);
+        self.stream.apply_keystream(&mut buf[..n]);
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,7 +313,7 @@ mod tests {
         let middle = SALT_256 + VERIFIER + 3;
         body[middle] ^= 0xFF;
         assert!(
-            matches!(decrypt("key", &body), Err(Error::Integrity { .. })),
+            matches!(decrypt("key", &body), Err(Error::Tampered { .. })),
             "a flipped bit must not decrypt to plausible data"
         );
     }
