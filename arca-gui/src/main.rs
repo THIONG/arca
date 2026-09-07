@@ -69,6 +69,26 @@ fn detect(p: &Path) -> Option<Format> {
     }
 }
 
+// How many folders at the front of the path have to go behind the "…" for the
+// rest to fit in `room`. Drops from the front, because the folders you are
+// nearest are the ones worth seeing, and never drops the last one: the folder
+// you are standing in stays whatever its name costs, cut short if it must be.
+fn crumbs_hidden(sizes: &[f32], sep: f32, dots: f32, room: f32) -> usize {
+    let mut first = 0usize;
+    while first + 1 < sizes.len() {
+        let shown = sizes.len() - first;
+        let mut total: f32 = sizes[first..].iter().sum::<f32>() + sep * (shown - 1) as f32;
+        if first > 0 {
+            total += dots + sep;
+        }
+        if total <= room {
+            break;
+        }
+        first += 1;
+    }
+    first
+}
+
 // The row a height falls on, out of the ones the table drew this frame.
 //
 // The rows do not touch: there is a gap of the item spacing between one and the
@@ -2766,20 +2786,35 @@ impl Arca {
                 self.go_to(parent);
             }
             ui.add_space(4.0);
-            self.breadcrumb(ui);
+            // The count is measured and set aside before the path is drawn.
+            // Laid out the other way round, a deep path took the whole row and
+            // ran out over the top of it.
+            let tally = self.archive.is_some().then(|| {
+                let n = self.checked.iter().filter(|b| **b).count();
+                let shown = self.visible_rows().len();
+                format!(
+                    "{shown} {} {} · {n} {}",
+                    s.visible_of,
+                    self.entries.len(),
+                    s.checked
+                )
+            });
+            let keep = tally.as_ref().map_or(0.0, |t| {
+                ui.painter()
+                    .layout_no_wrap(
+                        t.clone(),
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        egui::Color32::PLACEHOLDER,
+                    )
+                    .size()
+                    .x
+                    + 16.0
+            });
+            let budget = (ui.available_width() - keep).max(140.0);
+            self.breadcrumb(ui, budget);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.archive.is_some() {
-                    let n = self.checked.iter().filter(|b| **b).count();
-                    let shown = self.visible_rows().len();
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{shown} {} {} · {n} {}",
-                            s.visible_of,
-                            self.entries.len(),
-                            s.checked
-                        ))
-                        .weak(),
-                    );
+                if let Some(t) = tally {
+                    ui.label(egui::RichText::new(t).weak());
                 }
             });
         });
@@ -2789,11 +2824,42 @@ impl Arca {
     // Where you are, as the folders you walked through rather than as one line
     // of text with slashes in it. Each one takes you back to that level, which
     // is three clicks the Up arrow used to be needed for.
-    fn breadcrumb(&mut self, ui: &mut egui::Ui) {
+    fn breadcrumb(&mut self, ui: &mut egui::Ui, budget: f32) {
         if self.archive.is_none() {
             return;
         }
-        let here = self.current_dir.clone();
+        let root = self
+            .archive
+            .as_ref()
+            .and_then(|a| a.file_name())
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut crumbs: Vec<(String, String)> = vec![(root, String::new())];
+        let mut walked = String::new();
+        for part in self.current_dir.split('/').filter(|p| !p.is_empty()) {
+            walked.push_str(part);
+            walked.push('/');
+            crumbs.push((part.to_string(), walked.clone()));
+        }
+
+        // A deep archive has more folders in its path than there is room for,
+        // and they used to run out over the count at the other end. So: measure
+        // first, keep the ones nearest to where you are, and put the rest
+        // behind a "…" that opens them as a list. Which is what the Explorer
+        // does with the same problem.
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let width = |ui: &egui::Ui, t: &str| {
+            ui.painter()
+                .layout_no_wrap(t.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
+                .size()
+                .x
+        };
+        let gap = 3.0;
+        let sep = width(ui, "›") + gap * 2.0;
+        let dots = width(ui, "…");
+        let sizes: Vec<f32> = crumbs.iter().map(|(n, _)| width(ui, n)).collect();
+        let first = crumbs_hidden(&sizes, sep, dots, (budget - 22.0).max(60.0));
+
         let mut go: Option<String> = None;
         egui::Frame::none()
             .fill(ui.visuals().window_fill)
@@ -2801,30 +2867,48 @@ impl Arca {
             .rounding(egui::Rounding::same(5.0))
             .inner_margin(egui::Margin::symmetric(9.0, 3.0))
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.x = 3.0;
-                let root = self
-                    .archive
-                    .as_ref()
-                    .and_then(|a| a.file_name())
-                    .map(|x| x.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let mut crumbs: Vec<(String, String)> = vec![(root, String::new())];
-                let mut walked = String::new();
-                for part in here.split('/').filter(|p| !p.is_empty()) {
-                    walked.push_str(part);
-                    walked.push('/');
-                    crumbs.push((part.to_string(), walked.clone()));
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.set_max_width(budget);
+                if first > 0 {
+                    let more = ui.add(
+                        egui::Label::new(egui::RichText::new("…").weak())
+                            .selectable(false)
+                            .sense(egui::Sense::click()),
+                    );
+                    let id = egui::Id::new("arca-crumbs");
+                    if more.clicked() {
+                        ui.memory_mut(|m| m.toggle_popup(id));
+                    }
+                    egui::popup_below_widget(
+                        ui,
+                        id,
+                        &more,
+                        egui::PopupCloseBehavior::CloseOnClick,
+                        |ui| {
+                            ui.set_min_width(180.0);
+                            for (name, path) in &crumbs[..first] {
+                                if ui.button(name).clicked() {
+                                    go = Some(path.clone());
+                                }
+                            }
+                        },
+                    );
+                    ui.add(egui::Label::new(egui::RichText::new("›").weak()).selectable(false));
                 }
                 let last = crumbs.len() - 1;
-                for (i, (name, path)) in crumbs.into_iter().enumerate() {
-                    if i > 0 {
+                for (i, (name, path)) in crumbs.iter().enumerate().skip(first) {
+                    if i > first {
                         ui.add(
                             egui::Label::new(egui::RichText::new("›").weak()).selectable(false),
                         );
                     }
                     // The one you are on is not a way to anywhere.
                     if i == last {
-                        ui.add(egui::Label::new(egui::RichText::new(name).strong()).selectable(false));
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(name).strong())
+                                .selectable(false)
+                                .truncate(),
+                        );
                     } else if ui
                         .add(
                             egui::Label::new(egui::RichText::new(name).weak())
@@ -2834,7 +2918,7 @@ impl Arca {
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .clicked()
                     {
-                        go = Some(path);
+                        go = Some(path.clone());
                     }
                 }
             });
@@ -4161,6 +4245,33 @@ mod tests {
 
     // A folder keeps its whole name and a file loses its extension, and the
     // shell extension has a copy of this that has to agree.
+    // The path row is the one place the window can run out of width, and it did:
+    // a deep folder pushed the trail out over the count at the other end.
+    #[test]
+    fn a_path_too_long_gives_up_its_oldest_folders_first() {
+        let sep = 10.0;
+        let dots = 8.0;
+        // Five folders of 100 each: 500 of names plus 40 of separators.
+        let five = [100.0_f32; 5];
+
+        // Room to spare: nothing hidden.
+        assert_eq!(crumbs_hidden(&five, sep, dots, 600.0), 0);
+        // Exactly enough: still nothing.
+        assert_eq!(crumbs_hidden(&five, sep, dots, 540.0), 0);
+        // One short. Dropping the first leaves 400 + 30 + 18 for the mark = 448.
+        assert_eq!(crumbs_hidden(&five, sep, dots, 539.0), 1);
+        assert_eq!(crumbs_hidden(&five, sep, dots, 448.0), 1);
+        assert_eq!(crumbs_hidden(&five, sep, dots, 447.0), 2);
+        // Absurdly narrow: everything goes but the folder you are in, which is
+        // left to be cut short rather than dropped.
+        assert_eq!(crumbs_hidden(&five, sep, dots, 10.0), 4);
+        // A single folder is that folder, whatever the width.
+        assert_eq!(crumbs_hidden(&[100.0], sep, dots, 1.0), 0);
+        // One long name in the middle is not a reason to drop the ones after it.
+        let uneven = [40.0_f32, 900.0, 40.0, 40.0];
+        assert_eq!(crumbs_hidden(&uneven, sep, dots, 200.0), 2);
+    }
+
     #[test]
     fn archive_stem_strips_what_it_should() {
         for (name, stem) in [
