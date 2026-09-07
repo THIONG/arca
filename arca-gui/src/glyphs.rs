@@ -38,6 +38,41 @@ pub enum Glyph {
     UncheckAll,
     /// A question mark in a circle: the list of shortcuts.
     Help,
+    /// The three that walk the folders.
+    Back,
+    Forward,
+    Up,
+}
+
+/// The same picture out of the font Windows draws its own programs with.
+///
+/// Preferred over everything below it. Drawing an icon that reads at fifteen
+/// points is a craft, and the hand-painted padlock came out as a handbag and
+/// the hand-painted cogwheel as an asterisk; more to the point, these are the
+/// shapes the user has already learned from every other window on the machine.
+/// What stays below is the fallback for a machine without the font.
+pub fn codepoint(glyph: Glyph) -> Option<char> {
+    Some(match glyph {
+        // A page with an arrow leaving it. The plain open folder, E838, is
+        // about folders, and what is being opened here is a file.
+        Glyph::Open => '\u{E8E5}',
+        // A folder with a zip fastener down it, which is the icon Windows
+        // itself puts on a .zip.
+        Glyph::Compress => '\u{F012}',
+        // An arrow coming down onto a line: out of the archive and onto the
+        // disk. Both extract buttons share it; the words tell them apart.
+        Glyph::ExtractAll | Glyph::ExtractPicked => '\u{E896}',
+        Glyph::Test => '\u{E721}',
+        Glyph::Locked => '\u{E72E}',
+        Glyph::Unlocked => '\u{E785}',
+        Glyph::Settings => '\u{E713}',
+        Glyph::CheckAll => '\u{E73A}',
+        Glyph::UncheckAll => '\u{E739}',
+        Glyph::Help => '\u{E9CE}',
+        Glyph::Back => '\u{E72B}',
+        Glyph::Forward => '\u{E72A}',
+        Glyph::Up => '\u{E74A}',
+    })
 }
 
 fn line(p: &egui::Painter, a: Pos2, b: Pos2, c: Color32, w: f32) {
@@ -93,16 +128,24 @@ pub fn draw(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) {
             ));
         }
         Glyph::ExtractAll | Glyph::ExtractPicked => {
-            // A box open at the top with something coming out of it.
-            let narrow = matches!(glyph, Glyph::ExtractPicked);
-            let right = if narrow { x1 - 5.0 } else { x1 - 1.5 };
-            line(painter, Pos2::new(x0 + 1.5, y0 + 5.0), Pos2::new(x0 + 1.5, y1 - 1.5), color, thin);
+            // A box open at the top with something coming out of it, and the
+            // same picture for both buttons.
+            //
+            // Two goes at telling them apart failed at this size: a tick beside
+            // the box meant squeezing the box narrow and both halves came out
+            // cramped, and a bar left inside it was too small to see at all.
+            // The two buttons are a hand's width apart and both are labelled,
+            // so the label is what tells them apart and the picture says what
+            // family they belong to. A difference nobody can see is worse than
+            // no difference.
+            let (l, right) = (x0 + 1.5, x1 - 1.5);
+            line(painter, Pos2::new(l, y0 + 5.0), Pos2::new(l, y1 - 1.5), color, thin);
             line(painter, Pos2::new(right, y0 + 5.0), Pos2::new(right, y1 - 1.5), color, thin);
-            line(painter, Pos2::new(x0 + 1.5, y1 - 1.5), Pos2::new(right, y1 - 1.5), color, thin);
+            line(painter, Pos2::new(l, y1 - 1.5), Pos2::new(right, y1 - 1.5), color, thin);
             // Rising out of the box, which is the whole difference from the
             // picture next door: that arrow goes in, this one comes out.
-            let mid = (x0 + 1.5 + right) / 2.0;
-            line(painter, Pos2::new(mid, y0 + 3.0), Pos2::new(mid, y0 + 9.5), color, thin);
+            let mid = (l + right) / 2.0;
+            line(painter, Pos2::new(mid, y0 + 3.0), Pos2::new(mid, y0 + 9.0), color, thin);
             painter.add(egui::Shape::convex_polygon(
                 vec![
                     Pos2::new(mid - 2.5, y0 + 4.0),
@@ -112,11 +155,6 @@ pub fn draw(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) {
                 color,
                 Stroke::NONE,
             ));
-            if narrow {
-                // The tick that says "the ones that are picked".
-                line(painter, Pos2::new(x1 - 4.0, y0 + 4.0), Pos2::new(x1 - 2.5, y0 + 5.5), color, thin);
-                line(painter, Pos2::new(x1 - 2.5, y0 + 5.5), Pos2::new(x1 + 0.5, y0 + 1.5), color, thin);
-            }
         }
         Glyph::Test => {
             // A magnifying glass. It began as a frame with a tick in it and
@@ -133,41 +171,59 @@ pub fn draw(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) {
             );
         }
         Glyph::Locked | Glyph::Unlocked => {
-            // The body filled rather than outlined: an outline this small ends
-            // up as a grey smudge, and the shackle above it needs something
-            // solid to sit on to read as a padlock at all.
+            // Outlined with a keyhole, not a filled slab: a solid body came out
+            // as a blob with a wire over it. The shackle is a real arc rather
+            // than three straight pieces, which is most of what makes it read
+            // as a padlock instead of as a rectangle wearing a bracket.
             let body = Rect::from_min_max(
-                Pos2::new(x0 + 1.5, y0 + 7.0),
-                Pos2::new(x1 - 1.5, y1 - 1.0),
+                Pos2::new(x0 + 2.0, y0 + 6.5),
+                Pos2::new(x1 - 2.0, y1 - 1.5),
             );
-            painter.rect_filled(body, 1.5, color);
+            painter.rect_stroke(body, 1.5, Stroke::new(thin, color));
+            painter.circle_filled(Pos2::new(body.center().x, body.center().y), 1.2, color);
+
             let shut = matches!(glyph, Glyph::Locked);
-            // Shut, the shackle sits over the middle; open, it leans off to the
-            // right and its near leg stops short of the body.
-            let (sl, sr) = if shut {
-                (x0 + 4.0, x1 - 4.0)
-            } else {
-                (x0 + 6.5, x1 - 1.5)
-            };
-            let top = y0 + 2.5;
-            let s = Stroke::new(1.7_f32, color);
-            painter.line_segment([Pos2::new(sl, y0 + 7.0), Pos2::new(sl, top)], s);
-            painter.line_segment([Pos2::new(sl, top), Pos2::new(sr, top)], s);
-            painter.line_segment(
-                [
-                    Pos2::new(sr, top),
-                    Pos2::new(sr, if shut { y0 + 7.0 } else { y0 + 5.0 }),
-                ],
-                s,
-            );
+            // Shut, the arc sits over the middle of the body. Open, it is the
+            // same arc lifted and turned, hinged on its right leg.
+            let cx = if shut { body.center().x } else { body.center().x + 2.2 };
+            let radius = 3.1;
+            let bottom = y0 + 6.5;
+            let steps = 12;
+            let mut arc: Vec<Pos2> = (0..=steps)
+                .map(|k| {
+                    let t = std::f32::consts::PI * (k as f32) / (steps as f32);
+                    Pos2::new(cx - radius * t.cos(), bottom - radius * t.sin())
+                })
+                .collect();
+            if !shut {
+                // The near leg stops short, which is what an open one looks
+                // like; the far one still reaches the body.
+                arc.truncate(steps - 2);
+            }
+            painter.add(egui::Shape::line(
+                arc,
+                Stroke::new(1.6_f32, color),
+            ));
         }
         Glyph::Settings => {
-            // Three sliders, not a cogwheel. A cog needs teeth, and teeth at
-            // fifteen points across come out as an asterisk.
-            for (k, knob) in [(0.0_f32, 0.66_f32), (1.0, 0.34), (2.0, 0.58)] {
-                let y = y0 + 3.0 + k * 4.5;
-                line(painter, Pos2::new(x0 + 1.0, y), Pos2::new(x1 - 1.0, y), color, thin);
-                painter.circle_filled(Pos2::new(x0 + 1.0 + (w - 2.0) * knob, y), 2.1, color);
+            // A cog after all, but with the ring drawn. The first try was six
+            // spokes around a dot and read as an asterisk; what was missing was
+            // the wheel the teeth are supposed to be attached to.
+            let c = r.center();
+            let ring = w * 0.28;
+            let tooth = w * 0.40;
+            painter.circle_stroke(c, ring, Stroke::new(thin, color));
+            painter.circle_filled(c, w * 0.09, color);
+            for k in 0..6 {
+                let a = std::f32::consts::TAU * (k as f32) / 6.0;
+                let (sn, cs) = a.sin_cos();
+                painter.line_segment(
+                    [
+                        Pos2::new(c.x + cs * (ring - 0.4), c.y + sn * (ring - 0.4)),
+                        Pos2::new(c.x + cs * tooth, c.y + sn * tooth),
+                    ],
+                    Stroke::new(2.4_f32, color),
+                );
             }
         }
         Glyph::CheckAll | Glyph::UncheckAll => {
@@ -180,6 +236,28 @@ pub fn draw(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) {
                 line(painter, Pos2::new(x0 + 4.0, r.center().y), Pos2::new(x0 + 6.5, y1 - 4.5), color, thin);
                 line(painter, Pos2::new(x0 + 6.5, y1 - 4.5), Pos2::new(x1 - 4.0, y0 + 4.5), color, thin);
             }
+        }
+        Glyph::Back | Glyph::Forward | Glyph::Up => {
+            let c = r.center();
+            let (aw, ah) = (4.5, 5.5);
+            let p = match glyph {
+                Glyph::Back => [
+                    Pos2::new(c.x + aw * 0.6, c.y - ah),
+                    Pos2::new(c.x + aw * 0.6, c.y + ah),
+                    Pos2::new(c.x - aw, c.y),
+                ],
+                Glyph::Forward => [
+                    Pos2::new(c.x - aw * 0.6, c.y - ah),
+                    Pos2::new(c.x - aw * 0.6, c.y + ah),
+                    Pos2::new(c.x + aw, c.y),
+                ],
+                _ => [
+                    Pos2::new(c.x - ah, c.y + aw * 0.6),
+                    Pos2::new(c.x + ah, c.y + aw * 0.6),
+                    Pos2::new(c.x, c.y - aw),
+                ],
+            };
+            painter.add(egui::Shape::convex_polygon(p.to_vec(), color, Stroke::NONE));
         }
         Glyph::Help => {
             painter.circle_stroke(r.center(), h * 0.42, Stroke::new(thin, color));

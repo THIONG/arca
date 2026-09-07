@@ -398,76 +398,10 @@ fn launch_with_system(path: &Path) -> arca_core::Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Arrow {
-    Left,
-    Right,
-    Up,
-}
-
-// Painted rather than written. The arrows that would say this in text are not
-// in the fonts egui ships by default, and a button showing a hollow box is
-// worse than no button at all.
-fn arrow_button(ui: &mut egui::Ui, dir: Arrow, enabled: bool, tip: &str) -> egui::Response {
-    let size = egui::vec2(28.0, 22.0);
-    let (rect, response) = ui.allocate_exact_size(
-        size,
-        if enabled {
-            egui::Sense::click()
-        } else {
-            egui::Sense::hover()
-        },
-    );
-
-    if ui.is_rect_visible(rect) {
-        let visuals = ui.style().interact(&response);
-        let fill = if enabled {
-            visuals.weak_bg_fill
-        } else {
-            ui.visuals().widgets.noninteractive.weak_bg_fill
-        };
-        let stroke = if enabled {
-            visuals.fg_stroke.color
-        } else {
-            ui.visuals().widgets.noninteractive.fg_stroke.color
-        };
-        ui.painter().rect(rect, 3.0, fill, visuals.bg_stroke);
-
-        let c = rect.center();
-        let w = 4.5;
-        let h = 5.5;
-        let p = match dir {
-            Arrow::Left => [
-                egui::pos2(c.x + w * 0.6, c.y - h),
-                egui::pos2(c.x + w * 0.6, c.y + h),
-                egui::pos2(c.x - w, c.y),
-            ],
-            Arrow::Right => [
-                egui::pos2(c.x - w * 0.6, c.y - h),
-                egui::pos2(c.x - w * 0.6, c.y + h),
-                egui::pos2(c.x + w, c.y),
-            ],
-            Arrow::Up => [
-                egui::pos2(c.x - h, c.y + w * 0.6),
-                egui::pos2(c.x + h, c.y + w * 0.6),
-                egui::pos2(c.x, c.y - w),
-            ],
-        };
-        ui.painter()
-            .add(egui::Shape::convex_polygon(p.to_vec(), stroke, egui::Stroke::NONE));
-    }
-
-    if enabled {
-        response.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand)
-    } else {
-        response
-    }
-}
-
 // A button with a picture on it, and a word next to the picture when the button
 // is one of the ones worth naming. Written out rather than built from
 // `egui::Button` because that one only takes an image for its icon, and these
-// are painted.
+// come either from the system icon font or from a painter.
 fn tool_button(
     ui: &mut egui::Ui,
     glyph: glyphs::Glyph,
@@ -511,7 +445,18 @@ fn tool_button(
             egui::pos2(rect.left() + pad.x, rect.center().y - glyphs::SIZE / 2.0),
             egui::Vec2::splat(glyphs::SIZE),
         );
-        glyphs::draw(ui.painter(), icon, glyph, fg);
+        match glyphs::codepoint(glyph).filter(|_| theme::icons_available()) {
+            Some(ch) => {
+                ui.painter().text(
+                    icon.center(),
+                    egui::Align2::CENTER_CENTER,
+                    ch,
+                    egui::FontId::new(glyphs::SIZE, egui::FontFamily::Name(theme::ICONS.into())),
+                    fg,
+                );
+            }
+            None => glyphs::draw(ui.painter(), icon, glyph, fg),
+        }
         if let Some(g) = galley {
             let at = egui::pos2(icon.right() + gap, rect.center().y - g.size().y / 2.0);
             ui.painter().galley(at, g, fg);
@@ -2678,13 +2623,13 @@ impl Arca {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let at_root = self.current_dir.is_empty();
-            if arrow_button(ui, Arrow::Left, self.can_go_back(), s.back).clicked() {
+            if tool_button(ui, glyphs::Glyph::Back, "", self.can_go_back(), s.back).clicked() {
                 self.go_back();
             }
-            if arrow_button(ui, Arrow::Right, self.can_go_forward(), s.forward).clicked() {
+            if tool_button(ui, glyphs::Glyph::Forward, "", self.can_go_forward(), s.forward).clicked() {
                 self.go_forward();
             }
-            if arrow_button(ui, Arrow::Up, !at_root, s.up).clicked() {
+            if tool_button(ui, glyphs::Glyph::Up, "", !at_root, s.up).clicked() {
                 let parent = parent_of(&self.current_dir);
                 self.go_to(parent);
             }

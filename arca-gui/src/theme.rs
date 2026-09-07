@@ -195,6 +195,18 @@ pub fn style(style: &mut egui::Style) {
 /// use the Explorer's letters reads as foreign before you have looked at
 /// anything in it. Whatever is missing falls back to what egui brought, so a
 /// machine without these still gets a window.
+/// The family the toolbar's system icons are drawn from, when there is one.
+pub const ICONS: &str = "icons";
+
+static HAS_ICONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether the system icon font was there to load. Buttons ask before reaching
+/// for a codepoint out of it, and fall back to the painted shapes when it is
+/// not, which is every platform that is not Windows.
+pub fn icons_available() -> bool {
+    *HAS_ICONS.get().unwrap_or(&false)
+}
+
 #[cfg(windows)]
 pub fn fonts() -> egui::FontDefinitions {
     let mut defs = egui::FontDefinitions::default();
@@ -217,6 +229,22 @@ pub fn fonts() -> egui::FontDefinitions {
             .entry(family)
             .or_default()
             .insert(0, name.to_owned());
+    }
+
+    // Windows ships the icons its own programs are drawn with. A padlock and a
+    // cogwheel out of that file are the ones the rest of the desktop uses and
+    // are drawn by people who do this for a living; the pair painted by hand
+    // here came out as a handbag and an asterisk. Segoe Fluent Icons on
+    // Windows 11, Segoe MDL2 Assets before it, and neither is fatal.
+    let icons = ["SegoeIcons.ttf", "segmdl2.ttf"]
+        .iter()
+        .find_map(|f| std::fs::read(dir.join(f)).ok());
+    if let Some(bytes) = icons {
+        defs.font_data
+            .insert(ICONS.to_owned(), egui::FontData::from_owned(bytes));
+        defs.families
+            .insert(egui::FontFamily::Name(ICONS.into()), vec![ICONS.to_owned()]);
+        let _ = HAS_ICONS.set(true);
     }
     defs
 }
