@@ -34,7 +34,7 @@ If the crate version is ever raised, that is the order worth looking in.
 
 | File | What it is |
 |---|---|
-| `arca-shell/src/lib.rs` | The DLL: `IExplorerCommand` and `IContextMenu`, with a submenu of three actions |
+| `arca-shell/src/lib.rs` | The DLL: `IExplorerCommand` and `IContextMenu`, with a submenu of four actions |
 | `AppxManifest.xml` | Sparse MSIX package giving the extension an identity |
 | `arca.iss` | Inno Setup script that produces the installer |
 | `build.ps1` | Builds, packages and registers both menus for development |
@@ -96,7 +96,8 @@ Stop-Process -Name explorer -Force
 
 And the checklist:
 
-1. Right click a `.zip` → **Arca** appears with three options
+1. Right click a `.zip` → **Arca** appears with four options, "Open with Arca"
+   first and "Extract to" naming the folder it would make
 2. Right click a `.txt` → "Extract here" does **not** appear
 3. "Extract here" unpacks next to the archive, showing a progress window
 4. Select several files → "Compress to .zip" puts them all in
@@ -105,7 +106,7 @@ And the checklist:
 
 And the classic menu ones, which are a separate implementation:
 
-7. "Show more options" on a `.zip` → **Arca** with all three
+7. "Show more options" on a `.zip` → **Arca** with all four
 8. "Show more options" on a `.txt` → **Arca** with "Compress" only
 9. `-Remove` also deletes the keys under `HKCU\Software\Classes`
 
@@ -139,6 +140,8 @@ never opens one.
   on a real Windows 10.
 - **The labels are English only**: the window follows the system language, this
   does not.
+- **The entries are fixed**: WinRAR lets the user pick which ones appear. Here
+  the four are always the four.
 - **No icons on the classic menu entries**: the package icons are real now, out
   of `windows/assets`, but the classic menu puts none on its own items. That
   would need `MENUITEMINFOW` with a bitmap.

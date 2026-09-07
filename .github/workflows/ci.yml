@@ -58,6 +58,7 @@ jobs:
         working-directory: windows/arca-shell
         run: |
           cargo build --release
+          cargo test
           cargo clippy --release --all-targets -- -D warnings
 
   macos:
