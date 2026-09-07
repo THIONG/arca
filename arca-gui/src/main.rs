@@ -13,7 +13,7 @@ use egui::ThemePreference;
 use egui_extras::{Column, TableBuilder};
 use i18n::{strings, Lang, Strings};
 use tree::{children_of, draw_icon, entries_under, kind_of, parent_of, Row};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -209,6 +209,33 @@ fn is_encrypted(archive: &Path) -> bool {
         .and_then(|f| ZipArchive::open(f).ok())
         .map(|a| a.has_encrypted())
         .unwrap_or(false)
+}
+
+// The icon the desktop shows for this kind of file, kept as a texture per
+// extension. Without the cache a listing of 1513 entries would ask the shell
+// 1513 times a frame; with it, once per kind for the life of the window.
+//
+// A `None` in the map is a remembered failure, so a kind the system has no
+// answer for is not asked about again every frame.
+fn system_icon(
+    ctx: &egui::Context,
+    cache: &mut HashMap<String, Option<egui::TextureHandle>>,
+    name: &str,
+    is_dir: bool,
+) -> Option<egui::TextureHandle> {
+    let key = arca_icons::cache_key(name, is_dir);
+    if let Some(found) = cache.get(&key) {
+        return found.clone();
+    }
+    let made = arca_icons::lookup(name, is_dir).map(|icon| {
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [icon.width as usize, icon.height as usize],
+            &icon.rgba,
+        );
+        ctx.load_texture(format!("icon:{key}"), image, egui::TextureOptions::LINEAR)
+    });
+    cache.insert(key, made.clone());
+    made
 }
 
 // A folder of its own per archive, so two archives holding a file with the same
@@ -967,6 +994,8 @@ struct Arca {
     // hangs off this, and there was no such thing before: the table had
     // checkboxes but no cursor. None means nothing is focused yet.
     cursor: Option<usize>,
+    // One texture per extension, filled the first time a kind is seen.
+    icons: HashMap<String, Option<egui::TextureHandle>>,
     // Set when the cursor moves by keyboard, so the table can scroll it into
     // view on the next frame and then forget about it.
     scroll_to_cursor: bool,
@@ -1011,6 +1040,7 @@ impl Arca {
             history: vec![String::new()],
             here: 0,
             cursor: None,
+            icons: HashMap::new(),
             scroll_to_cursor: false,
         }
     }
@@ -2057,6 +2087,7 @@ impl Arca {
         let mut toggle: Option<(usize, bool)> = None;
         let mut opened: Option<usize> = None;
         let mut moved_cursor: Option<usize> = None;
+        let mut icons = std::mem::take(&mut self.icons);
         let order = self.order;
         let hint = s.sort_hint;
         let head = |ui: &mut egui::Ui, text: &str, col: SortColumn| -> bool {
@@ -2131,7 +2162,15 @@ impl Arca {
                         }
                     });
                     row.col(|ui| {
-                        draw_icon(ui, r.kind);
+                        // The system icon when the desktop has one, and the
+                        // drawn one when it does not, which is every platform
+                        // that is not Windows so far.
+                        match system_icon(ui.ctx(), &mut icons, &r.label, r.is_dir) {
+                            Some(tex) => {
+                                ui.add(egui::Image::new(&tex).fit_to_exact_size(egui::vec2(15.0, 15.0)));
+                            }
+                            None => draw_icon(ui, r.kind),
+                        }
                         ui.add_space(4.0);
                         let text = if r.is_dir {
                             egui::RichText::new(&r.label).strong()
@@ -2191,6 +2230,7 @@ impl Arca {
                 }
             }
         }
+        self.icons = icons;
         self.scroll_to_cursor = false;
         if let Some(index) = moved_cursor {
             self.cursor = Some(index);

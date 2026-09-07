@@ -10,7 +10,7 @@ crate level. A malformed archive produces an error, never memory corruption.
 
 ```sh
 cargo build --release      # binary at target/release/arca
-cargo test --workspace     # 45 tests
+cargo test --workspace     # 49 tests
 bash interop.sh            # the phase acceptance criterion
 ```
 
@@ -51,6 +51,7 @@ Short aliases: `c`, `l`, `x`, `t`.
 | `arca-tar` | ustar TAR with checksum verification | forbidden |
 | `arca-cli` | The `arca` binary | allowed, unused |
 | `arca-gui` | The `arca-gui` window | forbidden |
+| `arca-icons` | The icon the desktop shows for a file type | Windows only, for the shell call |
 | `windows/arca-shell` | Explorer context menu. Outside the workspace so `cargo build` still works on Linux and macOS | required: COM |
 
 ## Measured
@@ -270,6 +271,13 @@ with. The whole row answers, not just the name, and the cursor says so.
 The mouse back and forward buttons move through where you have been, and so do
 Alt+Left and Alt+Right. The three arrows on the toolbar do the same thing, plus
 one level up.
+
+Each row carries the icon the desktop itself shows for that kind of file, so a
+listing looks like the file manager next to it. On Windows that is one call to
+the shell, asked by name and never by opening anything, since the entries do
+not exist on disk. Everywhere else the window still draws its own: there is no
+equivalent single call, and what it would take is written down in
+`arca-icons`.
 
 The list can be driven without a mouse at all. The keys act on the highlighted
 row, and the first arrow press puts that highlight on the first row rather than

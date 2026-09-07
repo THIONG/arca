@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["arca-core", "arca-zip", "arca-tar", "arca-cli", "arca-gui"]
+members = ["arca-core", "arca-zip", "arca-tar", "arca-cli", "arca-gui", "arca-icons"]
 # Solo compila en Windows: se queda fuera del workspace para que
 # `cargo build` siga funcionando en Linux y macOS.
 exclude = ["windows/arca-shell"]
@@ -21,6 +21,7 @@ authors = ["Proyecto Arca"]
 arca-core = { path = "arca-core" }
 arca-zip  = { path = "arca-zip" }
 arca-tar  = { path = "arca-tar" }
+arca-icons = { path = "arca-icons" }
 # DEFLATE: zlib-rs, la implementacion en Rust mas rapida medida (ver diseno S02)
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 crc32fast = "1"
