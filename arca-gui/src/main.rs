@@ -2638,9 +2638,23 @@ impl Arca {
             return;
         }
         // `viewport` is the scrolling part alone, so the header is already out
-        // of it: dragging a column edge cannot start a selection.
+        // of it: dragging a column edge cannot start a selection. The scroll
+        // bar is a different matter, because it is drawn over the right hand
+        // edge of that same area rather than beside it, so a press on it lands
+        // inside the viewport and used to start a band. Dragging the bar is
+        // scrolling, not picking.
         if self.band.is_none() {
-            let Some(p) = origin.filter(|p| viewport.contains(*p)) else {
+            let mut room = viewport;
+            if reach > 0.0 {
+                let bar = ui.spacing().scroll;
+                let wide = if bar.floating {
+                    bar.bar_width
+                } else {
+                    bar.bar_width + bar.bar_inner_margin
+                };
+                room.set_right(viewport.right() - wide - bar.bar_outer_margin);
+            }
+            let Some(p) = origin.filter(|p| room.contains(*p)) else {
                 return;
             };
             let Some(anchor) = row_at(row_rects, p.y) else {
@@ -3237,9 +3251,6 @@ impl Arca {
                             ui.close_menu();
                         }
                     });
-                    if resp.hovered() {
-                        resp.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
                     if resp.clicked() {
                         clicked = Some(idx);
                     }
