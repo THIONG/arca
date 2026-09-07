@@ -65,6 +65,25 @@ fn detect(p: &Path) -> Option<Format> {
     }
 }
 
+// The row a height falls on, out of the ones the table drew this frame. Above
+// the first and below the last it clamps instead of giving up: a drag that has
+// run off one end of the list is still asking for everything up to that end.
+fn row_at(rects: &[(usize, egui::Rect)], y: f32) -> Option<usize> {
+    let (first, top) = *rects.first()?;
+    let (last, bottom) = *rects.last()?;
+    if y <= top.top() {
+        return Some(first);
+    }
+    if y >= bottom.bottom() {
+        return Some(last);
+    }
+    rects
+        .iter()
+        .find(|(_, r)| y >= r.top() && y <= r.bottom())
+        .map(|(i, _)| *i)
+        .or(Some(last))
+}
+
 fn saved_of(r: &Row) -> f64 {
     if r.size == 0 {
         0.0
@@ -1211,6 +1230,11 @@ struct Arca {
     // dragging back over a row lets go of it again.
     band: Option<egui::Pos2>,
     band_base: Vec<bool>,
+    // The row the drag started on, and the scroll position it is dragging the
+    // list to when it runs off an edge. Row numbers rather than places on
+    // screen, because the list moves while the drag is happening.
+    band_anchor: Option<usize>,
+    band_scroll: Option<f32>,
     // Names waiting on a yes before they are taken out of the archive. There
     // is no undo, so this one asks.
     confirm_delete: Option<Vec<String>>,
@@ -1276,6 +1300,8 @@ impl Arca {
             clip_dir: None,
             cut_names: HashSet::new(),
             confirm_drop: None,
+            band_anchor: None,
+            band_scroll: None,
         }
     }
 
@@ -1399,8 +1425,12 @@ impl Arca {
 
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
         self.archive_password = None;
-        // Whatever was cut belonged to the listing being replaced.
+        // Whatever was cut belonged to the listing being replaced, and so did
+        // whatever the status bar was saying: the summary of the archive being
+        // closed sat there over the one that had just opened.
         self.cut_names.clear();
+        self.notice.clear();
+        self.error = false;
         let ctx2 = ctx.clone();
         self.spawn(ctx, 0, move |tx| {
             let m = match list_entries(&path) {
@@ -2582,7 +2612,9 @@ impl Arca {
         ui: &mut egui::Ui,
         visible: &[Row],
         row_rects: &[(usize, egui::Rect)],
-        body_area: egui::Rect,
+        viewport: egui::Rect,
+        offset: f32,
+        reach: f32,
     ) {
         let (down, origin, now, ctrl) = ui.input(|i| {
             (
@@ -2595,17 +2627,21 @@ impl Arca {
 
         if !down {
             self.band = None;
+            self.band_anchor = None;
+            self.band_scroll = None;
             return;
         }
-        // The header sits at the top of this area and is not part of the list:
-        // dragging a column edge must not start a selection.
-        let inside = origin
-            .is_some_and(|p| body_area.contains(p) && p.y > body_area.top() + ROW_HEIGHT + 6.0);
+        // `viewport` is the scrolling part alone, so the header is already out
+        // of it: dragging a column edge cannot start a selection.
         if self.band.is_none() {
-            if !inside {
+            let Some(p) = origin.filter(|p| viewport.contains(*p)) else {
                 return;
-            }
+            };
+            let Some(anchor) = row_at(row_rects, p.y) else {
+                return;
+            };
             self.band = origin;
+            self.band_anchor = Some(anchor);
             self.band_base = if ctrl {
                 self.checked.clone()
             } else {
@@ -2613,7 +2649,7 @@ impl Arca {
             };
         }
 
-        let (Some(start), Some(here)) = (self.band, now) else {
+        let (Some(start), Some(here), Some(anchor)) = (self.band, now, self.band_anchor) else {
             return;
         };
         // A click is a drag of no distance. Under this it is left alone, so
@@ -2622,22 +2658,61 @@ impl Arca {
             return;
         }
 
-        let band = egui::Rect::from_two_pos(start, here);
-        self.checked.clone_from(&self.band_base);
-        // By the index the row carried, not by position in this list: the table
-        // only builds the rows on screen, so pairing them off in order picked
-        // the wrong ones as soon as the list had been scrolled.
-        for (idx, rect) in row_rects {
-            if rect.intersects(band) {
-                if let Some(row) = visible.get(*idx) {
-                    self.set_checked(row, true);
-                }
-            }
+        // Past either edge the list follows the pointer, the way the Explorer
+        // does it. Without this a selection could never be longer than the
+        // window, because dragging no longer scrolls.
+        let over = if here.y < viewport.top() {
+            here.y - viewport.top()
+        } else if here.y > viewport.bottom() {
+            here.y - viewport.bottom()
+        } else {
+            0.0
+        };
+        if over == 0.0 {
+            self.band_scroll = None;
+        } else {
+            self.band_scroll = Some((offset + over.clamp(-24.0, 24.0)).clamp(0.0, reach));
+            // Nothing else is moving, so without this the list would take one
+            // step per stray mouse event instead of running.
+            ui.ctx().request_repaint();
         }
 
+        // Two row numbers, not a rectangle in window coordinates. The list
+        // moves underneath while the drag is happening, and a rectangle frozen
+        // where the button went down stops meaning anything the moment it does;
+        // it also loses every row that scrolls out of sight, because those are
+        // the only ones the table still knows the position of.
+        let head = row_at(row_rects, here.y).unwrap_or(anchor);
+        let (lo, hi) = if anchor <= head {
+            (anchor, head)
+        } else {
+            (head, anchor)
+        };
+        self.checked.clone_from(&self.band_base);
+        for row in visible.get(lo..=hi).unwrap_or_default() {
+            self.set_checked(row, true);
+        }
+
+        // Drawn from the row the drag began on rather than from the point the
+        // button went down, so that it stays put against the rows when the list
+        // scrolls under it.
+        let edge = row_rects
+            .iter()
+            .find(|(i, _)| *i == anchor)
+            .map(|(_, r)| if here.y < r.top() { r.bottom() } else { r.top() })
+            .unwrap_or(if here.y < viewport.center().y {
+                viewport.bottom()
+            } else {
+                viewport.top()
+            });
+        let band = egui::Rect::from_two_pos(egui::pos2(start.x, edge), here);
         let fill = ui.visuals().selection.bg_fill.linear_multiply(0.25);
-        let stroke = egui::Stroke::new(1.0_f32, ui.visuals().selection.stroke.color);
-        ui.painter().rect(band.intersect(body_area), 0.0, fill, stroke);
+        ui.painter().rect(
+            band.intersect(viewport),
+            0.0,
+            fill,
+            theme::cursor(ui.visuals()),
+        );
     }
 
     fn set_checked(&mut self, row: &Row, value: bool) {
@@ -2913,9 +2988,6 @@ impl Arca {
         // Paired with the index they came from. `body.rows` only builds the
         // ones on screen, so after any scrolling these do not start at nought.
         let mut row_rects: Vec<(usize, egui::Rect)> = Vec::with_capacity(visible.len());
-        // Taken before the table draws, so it covers the empty space under the
-        // last row too: a band has to be able to start down there.
-        let body_area = ui.available_rect_before_wrap();
         let mut icons = std::mem::take(&mut self.icons);
         let order = self.order;
         let hint = s.sort_hint;
@@ -2935,12 +3007,17 @@ impl Arca {
             .clicked()
         };
 
-        TableBuilder::new(ui)
+        let mut builder = TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
             // Without this the cells only sense hovering, and row.response()
             // would never report a double click.
             .sense(egui::Sense::click())
+            // Dragging in a file list draws a selection; it does not push the
+            // list about. With this on, dragging did both at once, and the two
+            // pull opposite ways: dragging down moves the content down, which
+            // is the list scrolling up, so a downward selection ran upwards.
+            .drag_to_scroll(false)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::exact(26.0))
             // Name first and wide, with the icon inside it. That is where the
@@ -2948,7 +3025,14 @@ impl Arca {
             // only pushed the one thing you read away from its picture.
             .column(Column::initial(300.0).at_least(140.0))
             .columns(Column::initial(95.0).at_least(60.0), shown.len().saturating_sub(1))
-            .column(Column::remainder().at_least(60.0))
+            .column(Column::remainder().at_least(60.0));
+        // Set only while a selection drag has run off the end of the list, so
+        // the rest of the time the table keeps its own scroll position.
+        if let Some(y) = self.band_scroll {
+            builder = builder.vertical_scroll_offset(y);
+        }
+
+        let out = builder
             .header(26.0, |mut h| {
                 // Right clicking anywhere along the header offers the list of
                 // columns, which is where both WinRAR and NanaZip keep it.
@@ -3228,7 +3312,11 @@ impl Arca {
                 .rect_stroke(rect.shrink(0.5), 0.0, theme::cursor(ui.visuals()));
         }
 
-        self.rubber_band(ui, &visible, &row_rects, body_area);
+        // The scrollable part on its own, without the header the outer rect
+        // takes in, and how far down the list it currently sits: both are what
+        // a drag needs to know when it reaches an edge.
+        let reach = (out.content_size.y - out.inner_rect.height()).max(0.0);
+        self.rubber_band(ui, &visible, &row_rects, out.inner_rect, out.state.offset.y, reach);
         if let Some(index) = opened {
             let target = &visible[index];
             if target.is_dir {
