@@ -19,6 +19,7 @@ enum Action {
     Open,
     ExtractHere,
     ExtractToFolder,
+    AddToArchive,
     CompressZip,
 }
 
@@ -33,7 +34,11 @@ impl Action {
         match self {
             Action::Open => wide("Open with Arca"),
             Action::ExtractHere => wide("Extract here"),
-            Action::CompressZip => wide("Compress to .zip"),
+            // The one that opens the window to choose format, level and
+            // password. The ellipsis is the usual promise that a dialog
+            // follows rather than the thing happening straight away.
+            Action::AddToArchive => wide("Add to archive…"),
+            Action::CompressZip => wide(&format!("Add to \"{}\"", quick_output_name(paths))),
             // Saying which folder saves the user guessing, which is what
             // WinRAR does. Only with one archive selected: with several there
             // is more than one answer and the generic wording is the honest
@@ -50,10 +55,45 @@ impl Action {
 
     fn applies_to(self, paths: &[PathBuf]) -> bool {
         match self {
-            Action::CompressZip => !paths.is_empty(),
+            Action::AddToArchive | Action::CompressZip => !paths.is_empty(),
             _ => paths.iter().any(|p| is_archive(p)),
         }
     }
+}
+
+// Has to agree with quick_output in arca-gui, which is what actually names the
+// file: this only writes the label. Same standing arrangement as archive_stem
+// below.
+fn quick_output_name(paths: &[PathBuf]) -> String {
+    let Some(first) = paths.first() else {
+        return "archive.zip".into();
+    };
+    let stem = if paths.len() == 1 {
+        let name = first
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "archive".into());
+        // A folder keeps its whole name, a file drops its extension. Telling
+        // them apart asks the filesystem for the attributes and nothing else:
+        // no file is opened here either.
+        if first.is_dir() {
+            name
+        } else {
+            std::path::Path::new(&name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or(name)
+        }
+    } else {
+        // Several things selected: the archive is named after the folder they
+        // sit in.
+        first
+            .parent()
+            .and_then(|d| d.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "archive".into())
+    };
+    format!("{stem}.zip")
 }
 
 // Has to agree with archive_stem in arca-gui, which is what actually creates
@@ -176,6 +216,12 @@ fn run(action: Action, paths: &[PathBuf]) -> Result<()> {
                 cmd.arg(p);
             }
         }
+        Action::AddToArchive => {
+            cmd.arg("--add");
+            for p in paths {
+                cmd.arg(p);
+            }
+        }
         Action::CompressZip => {
             cmd.arg("--add-quick");
             for p in paths {
@@ -286,6 +332,7 @@ impl IExplorerCommand_Impl for Root_Impl {
             Item(Action::Open).into(),
             Item(Action::ExtractHere).into(),
             Item(Action::ExtractToFolder).into(),
+            Item(Action::AddToArchive).into(),
             Item(Action::CompressZip).into(),
         ];
         Ok(Enumerator::new(children).into())
@@ -352,6 +399,7 @@ fn applicable_actions(paths: &[PathBuf]) -> Vec<Action> {
         Action::Open,
         Action::ExtractHere,
         Action::ExtractToFolder,
+        Action::AddToArchive,
         Action::CompressZip,
     ]
     .into_iter()
@@ -585,6 +633,35 @@ mod tests {
         }
     }
 
+    // The quick entry promises a file name and arca-gui is what picks it, the
+    // same standing arrangement as the folder above.
+    #[test]
+    fn the_file_in_the_quick_label_is_the_one_that_gets_made() {
+        // Nothing at these paths, so they count as files: extension dropped.
+        assert_eq!(quick_output_name(&[PathBuf::from(r"C:\x\notes.txt")]), "notes.zip");
+        assert_eq!(quick_output_name(&[PathBuf::from(r"C:\x\a.b.c.txt")]), "a.b.c.zip");
+        assert_eq!(
+            text(Action::CompressZip, &[r"C:\x\notes.txt"]),
+            "Add to \"notes.zip\""
+        );
+
+        // A real folder keeps its whole name, dots included, which is the case
+        // that made this worth pinning down.
+        let dir = std::env::temp_dir().join("arca test folder.com");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            quick_output_name(std::slice::from_ref(&dir)),
+            "arca test folder.com.zip"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn several_things_are_named_after_the_folder_holding_them() {
+        let two = [PathBuf::from(r"C:\projects\one.txt"), PathBuf::from(r"C:\projects\two.txt")];
+        assert_eq!(quick_output_name(&two), "projects.zip");
+    }
+
     #[test]
     fn several_archives_get_the_generic_wording() {
         let two = [r"C:\x\one.zip", r"C:\x\two.zip"];
@@ -604,7 +681,7 @@ mod tests {
         let one = [r"C:\x\game.zip"];
         assert_eq!(text(Action::Open, &one), "Open with Arca");
         assert_eq!(text(Action::ExtractHere, &one), "Extract here");
-        assert_eq!(text(Action::CompressZip, &one), "Compress to .zip");
+        assert_eq!(text(Action::AddToArchive, &one), "Add to archive…");
     }
 
     #[test]
@@ -613,13 +690,17 @@ mod tests {
         assert!(!Action::Open.applies_to(&folder));
         assert!(!Action::ExtractHere.applies_to(&folder));
         assert!(!Action::ExtractToFolder.applies_to(&folder));
-        // Compressing is the one that makes sense for anything at all.
+        // Adding is what makes sense for anything at all.
+        assert!(Action::AddToArchive.applies_to(&folder));
         assert!(Action::CompressZip.applies_to(&folder));
-        assert_eq!(applicable_actions(&folder), vec![Action::CompressZip]);
+        assert_eq!(
+            applicable_actions(&folder),
+            vec![Action::AddToArchive, Action::CompressZip]
+        );
     }
 
     #[test]
-    fn an_archive_gets_all_four_with_open_first() {
+    fn an_archive_gets_them_all_with_open_first() {
         let zip = [PathBuf::from(r"C:\x\game.zip")];
         assert_eq!(
             applicable_actions(&zip),
@@ -627,6 +708,7 @@ mod tests {
                 Action::Open,
                 Action::ExtractHere,
                 Action::ExtractToFolder,
+                Action::AddToArchive,
                 Action::CompressZip
             ]
         );

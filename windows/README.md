@@ -34,7 +34,7 @@ If the crate version is ever raised, that is the order worth looking in.
 
 | File | What it is |
 |---|---|
-| `arca-shell/src/lib.rs` | The DLL: `IExplorerCommand` and `IContextMenu`, with a submenu of four actions |
+| `arca-shell/src/lib.rs` | The DLL: `IExplorerCommand` and `IContextMenu`, with a submenu of five actions |
 | `AppxManifest.xml` | Sparse MSIX package giving the extension an identity |
 | `arca.iss` | Inno Setup script that produces the installer |
 | `build.ps1` | Builds, packages and registers both menus for development |
@@ -96,18 +96,19 @@ Stop-Process -Name explorer -Force
 
 And the checklist:
 
-1. Right click a `.zip` → **Arca** appears with four options, "Open with Arca"
-   first and "Extract to" naming the folder it would make
+1. Right click a `.zip` → **Arca** appears with five options, "Open with Arca"
+   first, and "Extract to" and "Add to" naming what they would make
 2. Right click a `.txt` → "Extract here" does **not** appear
 3. "Extract here" unpacks next to the archive, showing a progress window
-4. Select several files → "Compress to .zip" puts them all in
+4. Select several files → "Add to" names the folder holding them and puts them
+   all in; "Add to archive…" opens the window instead, to pick format and level
 5. Explorer does not freeze for an instant (requirement R5)
 6. `.\build.ps1 -Remove` leaves everything as it was
 
 And the classic menu ones, which are a separate implementation:
 
-7. "Show more options" on a `.zip` → **Arca** with all four
-8. "Show more options" on a `.txt` → **Arca** with "Compress" only
+7. "Show more options" on a `.zip` → **Arca** with all five
+8. "Show more options" on a `.txt` → **Arca** with the two "Add" entries only
 9. `-Remove` also deletes the keys under `HKCU\Software\Classes`
 
 All of them pass. The first four were additionally checked by driving the COM
@@ -141,7 +142,7 @@ never opens one.
 - **The labels are English only**: the window follows the system language, this
   does not.
 - **The entries are fixed**: WinRAR lets the user pick which ones appear. Here
-  the four are always the four.
+  the five are always the five.
 - **No icons on the classic menu entries**: the package icons are real now, out
   of `windows/assets`, but the classic menu puts none on its own items. That
   would need `MENUITEMINFOW` with a bitmap.
