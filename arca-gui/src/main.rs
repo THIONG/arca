@@ -1410,6 +1410,19 @@ impl Arca {
         });
     }
 
+    // Escape and the Cancel button are the same act, so they go through the
+    // same code: two copies of this would drift apart the first time one side
+    // grew a step.
+    fn cancel_password(&mut self) {
+        let was_job = matches!(self.waiting_on_password, Some(Pending::Extract(_)));
+        self.waiting_on_password = None;
+        self.password_input.clear();
+        // Only a job left the window on the running view with nothing running.
+        if was_job {
+            self.view = View::Browse;
+        }
+    }
+
     fn password_window(&mut self, ctx: &egui::Context) {
         if self.waiting_on_password.is_none() {
             return;
@@ -1455,12 +1468,7 @@ impl Arca {
             });
 
         if cancel {
-            let was_job = matches!(self.waiting_on_password, Some(Pending::Extract(_)));
-            self.waiting_on_password = None;
-            self.password_input.clear();
-            if was_job {
-                self.view = View::Browse;
-            }
+            self.cancel_password();
             return;
         }
         if go && !self.password_input.is_empty() {
@@ -1869,9 +1877,14 @@ impl Arca {
         let mut enter = false;
         let mut space = false;
         let mut up_level = false;
+        let mut shift = false;
+        let mut check_all = false;
+        let mut typed = String::new();
 
         ctx.input(|i| {
             let at = self.cursor.unwrap_or(0);
+            shift = i.modifiers.shift;
+            check_all = i.modifiers.command && i.key_pressed(egui::Key::A);
             for (key, to) in [
                 (egui::Key::ArrowDown, (at + 1).min(last)),
                 (egui::Key::ArrowUp, at.saturating_sub(1)),
@@ -1889,9 +1902,50 @@ impl Arca {
             enter = i.key_pressed(egui::Key::Enter);
             space = i.key_pressed(egui::Key::Space);
             up_level = i.key_pressed(egui::Key::Backspace);
+            // Plain letters, the way the Explorer jumps to a name. Ctrl and Alt
+            // are somebody else's shortcut.
+            if !i.modifiers.command && !i.modifiers.alt {
+                for e in &i.events {
+                    if let egui::Event::Text(t) = e {
+                        typed.push_str(t);
+                    }
+                }
+            }
         });
 
+        if check_all {
+            let value = rows.iter().any(|r| !self.is_checked(r));
+            for r in rows {
+                self.set_checked(r, value);
+            }
+            return;
+        }
+
+        // Typing jumps to the next row starting with what was typed, wrapping
+        // round, so pressing the same letter walks through the matches.
+        if !typed.is_empty() && typed != " " {
+            let needle = typed.to_lowercase();
+            let from = self.cursor.map_or(0, |c| c + 1);
+            let hit = (0..rows.len())
+                .map(|n| (from + n) % rows.len())
+                .find(|&n| rows[n].label.to_lowercase().starts_with(&needle));
+            if let Some(n) = hit {
+                self.cursor = Some(n);
+                self.scroll_to_cursor = true;
+                return;
+            }
+        }
+
         if let Some(to) = moved {
+            // Shift drags the ticks along with the cursor, so a run of files
+            // can be picked without reaching for the mouse.
+            if shift {
+                let from = self.cursor.unwrap_or(to);
+                let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+                for r in &rows[lo..=hi] {
+                    self.set_checked(r, true);
+                }
+            }
             self.cursor = Some(to);
             self.scroll_to_cursor = true;
         }
@@ -2164,10 +2218,39 @@ impl eframe::App for Arca {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive(ctx);
 
+        // Escape backs out of whatever is on top, innermost first, the way it
+        // does everywhere else. The password prompt goes through the same path
+        // as its Cancel button so a cancelled job is cancelled once.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.waiting_on_password.is_some() {
+                self.cancel_password();
+            } else if self.show_settings {
+                self.show_settings = false;
+            }
+        }
+
         // The side buttons on a mouse, which winit reports as Back and Forward
         // and egui hands over as Extra1 and Extra2. Alt+Left and Alt+Right do
         // the same, for anyone without them.
         if matches!(self.view, View::Browse) && !self.busy {
+            let (open, extract) = ctx.input(|i| {
+                (
+                    i.modifiers.command && i.key_pressed(egui::Key::O),
+                    i.modifiers.command && i.key_pressed(egui::Key::E),
+                )
+            });
+            if open {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Archives", &["zip", "tar", "gz", "tgz"])
+                    .pick_file()
+                {
+                    self.open(ctx, p);
+                }
+            }
+            if extract && self.archive.is_some() {
+                self.ask_extract(ctx, false);
+            }
+
             let (back, forward) = ctx.input(|i| {
                 (
                     i.pointer.button_pressed(egui::PointerButton::Extra1)

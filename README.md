@@ -281,7 +281,12 @@ jumping blindly:
 | Enter | go into the folder, or open the file |
 | Backspace | up one level |
 | Space | tick or untick the row |
+| Shift+↑ Shift+↓ | tick a run of rows on the way |
+| letters | jump to the next row starting with them, wrapping round |
+| Ctrl+A | tick everything, or untick it if it is all ticked |
 | Alt+← Alt+→ | back and forward |
+| Ctrl+O · Ctrl+E | open an archive · extract it all |
+| Esc | back out of the password prompt or the settings window |
 
 While the filter box or a dialog has the keyboard, none of these apply: the
 typing belongs there. The window also declares itself through AccessKit, so
