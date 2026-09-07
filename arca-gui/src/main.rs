@@ -65,23 +65,29 @@ fn detect(p: &Path) -> Option<Format> {
     }
 }
 
-// The row a height falls on, out of the ones the table drew this frame. Above
-// the first and below the last it clamps instead of giving up: a drag that has
-// run off one end of the list is still asking for everything up to that end.
+// The row a height falls on, out of the ones the table drew this frame.
+//
+// The rows do not touch: there is a gap of the item spacing between one and the
+// next, and the table paints over it so that the stripes look continuous, but
+// the rectangles it hands back stop short. Asking which rectangle *contains* a
+// height therefore has no answer whenever the pointer is resting in one of
+// those gaps, which is most of the way from one row to the next. So the
+// question asked here is which row has started by this height, and the answer
+// in a gap is the row above it.
+//
+// Below the last row that gives the last row, and above the first it clamps to
+// the first: a drag that has run off one end of the list is still asking for
+// everything up to that end.
 fn row_at(rects: &[(usize, egui::Rect)], y: f32) -> Option<usize> {
     let (first, top) = *rects.first()?;
-    let (last, bottom) = *rects.last()?;
     if y <= top.top() {
         return Some(first);
     }
-    if y >= bottom.bottom() {
-        return Some(last);
-    }
     rects
         .iter()
-        .find(|(_, r)| y >= r.top() && y <= r.bottom())
+        .rev()
+        .find(|(_, r)| y >= r.top())
         .map(|(i, _)| *i)
-        .or(Some(last))
 }
 
 fn saved_of(r: &Row) -> f64 {
