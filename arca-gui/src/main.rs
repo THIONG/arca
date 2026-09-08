@@ -238,6 +238,28 @@ struct Settings {
     lang: Option<Lang>,
     theme: ThemePreference,
     columns: Columns,
+    // How wide each column is: the name first, then the ones that can be
+    // turned off, in the order of `Columns::ALL`. A column keeps its width
+    // while it is off, so turning one back on does not lose how it was set.
+    widths: Vec<f32>,
+}
+
+impl Settings {
+    // What a column starts out at, before anybody has pulled on it.
+    fn default_widths() -> Vec<f32> {
+        std::iter::once(NAME_WIDE)
+            .chain(std::iter::repeat(CELL_WIDE).take(Columns::ALL.len()))
+            .collect()
+    }
+
+    // The least a column can be pulled down to, by its place in `widths`.
+    fn least(slot: usize) -> f32 {
+        if slot == 0 {
+            NAME_LEAST
+        } else {
+            CELL_LEAST
+        }
+    }
 }
 
 impl Default for Settings {
@@ -246,6 +268,7 @@ impl Default for Settings {
             lang: None,
             theme: ThemePreference::System,
             columns: Columns::default(),
+            widths: Settings::default_widths(),
         }
     }
 }
@@ -267,6 +290,37 @@ impl Settings {
                 ("theme", "light") => s.theme = ThemePreference::Light,
                 ("theme", "dark") => s.theme = ThemePreference::Dark,
                 ("theme", _) => s.theme = ThemePreference::System,
+                // Written since the columns could first be turned off and read
+                // by nobody, so every window opened with the six of them
+                // showing however they had been left.
+                ("columns", list) => {
+                    let mut c = Columns::default();
+                    for (which, _) in Columns::ALL {
+                        c.set(which, false);
+                    }
+                    for name in list.split(',').map(str::trim) {
+                        if let Some((which, _)) = Columns::ALL.iter().find(|(_, n)| *n == name) {
+                            c.set(*which, true);
+                        }
+                    }
+                    s.columns = c;
+                }
+                // All of them or none: a line with a column missing from it
+                // belongs to a different set of columns than this one has, and
+                // guessing which is which would put the widths on the wrong
+                // ones. Each is held above its floor in case the file was
+                // written by hand.
+                ("widths", list) => {
+                    let read: Vec<f32> = list
+                        .split(',')
+                        .filter_map(|n| n.trim().parse::<f32>().ok())
+                        .enumerate()
+                        .map(|(i, w)| w.max(Settings::least(i)))
+                        .collect();
+                    if read.len() == s.widths.len() {
+                        s.widths = read;
+                    }
+                }
                 _ => {}
             }
         }
@@ -289,11 +343,13 @@ impl Settings {
             .filter(|(which, _)| self.columns.on(*which))
             .map(|(_, name)| *name)
             .collect();
+        let widths: Vec<String> = self.widths.iter().map(|w| format!("{w:.1}")).collect();
         let _ = fs::write(
             p,
             format!(
-                "lang = {lang}\ntheme = {theme}\ncolumns = {}\n",
-                columns.join(",")
+                "lang = {lang}\ntheme = {theme}\ncolumns = {}\nwidths = {}\n",
+                columns.join(","),
+                widths.join(",")
             ),
         );
     }
@@ -1387,17 +1443,6 @@ struct Arca {
     // button really does come up.
     drag_settling: bool,
     band_scroll: Option<f32>,
-    // How wide each column is: the name first, then the ones that can be
-    // turned off, in the order of `Columns::ALL`.
-    //
-    // Kept here rather than left to the table because the table hangs the
-    // handle that resizes a column down its whole height. With six columns
-    // that is six invisible strips a hand's width across running the length of
-    // the list, and pressing on one of them anywhere in the rows grabbed a
-    // column edge instead of starting a selection. The handles are ours now
-    // and live in the header, where WinRAR, the Explorer and every other list
-    // of files keep them.
-    widths: Vec<f32>,
     // Set while the wheel is being used to walk the list up and down.
     wheel: Option<Wheel>,
     // The last row a left click landed on, and when. What tells a second click
@@ -1483,9 +1528,6 @@ impl Arca {
             drag_ready: None,
             drag_settling: false,
             band_scroll: None,
-            widths: std::iter::once(NAME_WIDE)
-                .chain(std::iter::repeat(CELL_WIDE).take(Columns::ALL.len()))
-                .collect(),
             wheel: None,
             last_click: None,
             cut_armed: None,
@@ -3289,8 +3331,8 @@ impl Arca {
         // Counted from one, so the edge in hand is the one this cell begins
         // with and the column it resizes is the one before. The last column
         // has no edge of its own: it ends where the table does.
-        for i in 1..heads.len() {
-            let x = heads[i].left() - half;
+        for (i, cell) in heads.iter().enumerate().skip(1) {
+            let x = cell.left() - half;
             let rect = egui::Rect::from_x_y_ranges((x - grab)..=(x + grab), first.y_range());
             // Clicks as well as drags, so that catching the edge and letting go
             // again does not fall through to the heading and sort the list.
@@ -3303,10 +3345,17 @@ impl Arca {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
             }
             if resp.dragged() {
-                if let Some(width) = slots.get(i - 1).and_then(|s| self.widths.get_mut(*s)) {
-                    let least = if slots[i - 1] == 0 { NAME_LEAST } else { CELL_LEAST };
-                    *width = (*width + resp.drag_delta().x).max(least);
+                if let Some(slot) = slots.get(i - 1).copied() {
+                    if let Some(width) = self.settings.widths.get_mut(slot) {
+                        *width = (*width + resp.drag_delta().x).max(Settings::least(slot));
+                    }
                 }
+            }
+            // Written when the hand lets go rather than on the way, so that
+            // pulling an edge across the window is one visit to the disk and
+            // not one per frame.
+            if resp.drag_stopped() {
+                self.settings.save();
             }
             let stroke = if resp.dragged() {
                 ui.visuals().widgets.active.bg_stroke
@@ -4025,7 +4074,7 @@ impl Arca {
             builder = if n + 1 == slots.len() {
                 builder.column(Column::remainder().at_least(CELL_LEAST))
             } else {
-                builder.column(Column::exact(self.widths[*slot]))
+                builder.column(Column::exact(self.settings.widths[*slot]))
             };
         }
         // Set only while a selection drag has run off the end of the list, so
