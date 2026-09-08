@@ -6988,7 +6988,7 @@ impl Arca {
                 out.inner_rect.expand(half.x).x_range(),
                 rect.expand(half.y).y_range(),
             );
-            // Cut off at the top and the foot of the list, and nowhere else.
+            // Cut off at the edges of the list, like the rows themselves.
             //
             // The row the keyboard is on keeps being built while it is only
             // half on screen, and it keeps its place in the archive whether or
@@ -6996,14 +6996,7 @@ impl Arca {
             // the whole panel, the outline went on being drawn where the row
             // would have been: scroll a marked row up and its rectangle stayed
             // sitting on the column headings.
-            //
-            // The sides are left alone on purpose. This rectangle is drawn a
-            // few pixels wider than the list, to sit on the edge of the fill
-            // rather than inside it, so clipping to the list itself sliced off
-            // both of its uprights and left a row with a lid and a floor.
-            let cut =
-                egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), out.inner_rect.y_range());
-            ui.painter().with_clip_rect(cut).rect_stroke(
+            ui.painter().with_clip_rect(out.inner_rect).rect_stroke(
                 here.shrink(0.5),
                 0.0,
                 theme::cursor(ui.visuals()),
