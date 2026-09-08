@@ -3314,7 +3314,14 @@ impl Arca {
     // near any of them was a column edge rather than the start of a selection.
     // The rule is still drawn the whole way down: that is what tells you which
     // number belongs under which heading halfway down a page.
-    fn column_edges(&mut self, ui: &mut egui::Ui, heads: &[egui::Rect], slots: &[usize], foot: f32) {
+    fn column_edges(
+        &mut self,
+        ui: &mut egui::Ui,
+        heads: &[egui::Rect],
+        slots: &[usize],
+        top: f32,
+        foot: f32,
+    ) {
         let Some(first) = heads.first() else {
             return;
         };
@@ -3365,7 +3372,7 @@ impl Arca {
                 quiet
             };
             ui.painter()
-                .line_segment([egui::pos2(x, first.top()), egui::pos2(x, foot)], stroke);
+                .line_segment([egui::pos2(x, top), egui::pos2(x, foot)], stroke);
         }
     }
 
@@ -4021,22 +4028,27 @@ impl Arca {
         // which was a change nobody asked for and the wrong call. The table
         // used to draw them along with its own resize handles; they are drawn
         // in `column_edges` now, with the handles.
-        let accent = theme::cursor(ui.visuals()).color;
+        let accent = theme::mark(ui.visuals());
         let head = |ui: &mut egui::Ui, text: &str, col: SortColumn| -> egui::Response {
             let cell = ui.max_rect();
             // Asked for before the word is drawn, so the ground can be laid
             // under it: a heading lights up when the pointer is on it, which is
             // how WinRAR says that a column name is a thing you press and not
-            // just a label. Spread half the gap either side, the same as the
-            // fill on a row, so that the lit heading reaches its neighbours.
+            // just a label, and the column the list is sorted by keeps a ground
+            // of its own. Spread half the gap either side, the same as the fill
+            // on a row, so that a lit heading reaches its neighbours.
             let resp = ui.interact(cell, egui::Id::new(("arca-head", text)), egui::Sense::click());
-            if resp.hovered() {
+            let fill = if resp.hovered() {
+                Some(ui.visuals().widgets.hovered.bg_fill)
+            } else if order.0 == col {
+                Some(theme::header_sorted(ui.visuals()))
+            } else {
+                None
+            };
+            if let Some(fill) = fill {
                 let half = ui.spacing().item_spacing.x * 0.5;
-                ui.painter().rect_filled(
-                    cell.expand2(egui::vec2(half, 0.0)),
-                    0.0,
-                    ui.visuals().widgets.hovered.bg_fill,
-                );
+                ui.painter()
+                    .rect_filled(cell.expand2(egui::vec2(half, 0.0)), 0.0, fill);
             }
             // The table puts its cells in truncating mode, and a truncating
             // label takes the whole width it is offered. That is right for a
@@ -4060,6 +4072,15 @@ impl Arca {
             resp.on_hover_text(hint)
         };
 
+        // Where the table begins, taken before it is built and kept for the
+        // band the headings stand on and for the top of the column rules: the
+        // cells themselves start a few pixels below this, and rules that began
+        // there left a gap of bare window above them.
+        let table_top = ui.cursor().top();
+        // A place in the paint list held open for that band, so it can be
+        // filled in once the header has said how tall it is and still come out
+        // underneath the words rather than over them.
+        let band = ui.painter().add(egui::Shape::Noop);
         let mut builder = TableBuilder::new(ui)
             // Stripes, ticks and a highlight were three ways of saying the same
             // thing. What is picked is painted; the rest is left quiet.
@@ -4405,7 +4426,21 @@ impl Arca {
         // takes in, and how far down the list it currently sits: both are what
         // a drag needs to know when it reaches an edge.
         let reach = (out.content_size.y - out.inner_rect.height()).max(0.0);
-        self.column_edges(ui, &heads, &slots, out.inner_rect.bottom());
+        if let Some(first) = heads.first() {
+            let half = ui.spacing().item_spacing * 0.5;
+            ui.painter().set(
+                band,
+                egui::Shape::rect_filled(
+                    egui::Rect::from_x_y_ranges(
+                        out.inner_rect.expand(half.x).x_range(),
+                        table_top..=first.bottom() + half.y,
+                    ),
+                    0.0,
+                    theme::header(ui.visuals()),
+                ),
+            );
+        }
+        self.column_edges(ui, &heads, &slots, table_top, out.inner_rect.bottom());
         self.rubber_band(ui, &visible, &row_rects, out.inner_rect, out.state.offset.y, reach);
         self.wheel_scroll(ui, out.inner_rect, out.state.offset.y, reach);
         if let Some(index) = opened {

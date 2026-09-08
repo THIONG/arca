@@ -180,6 +180,46 @@ pub fn cursor(v: &Visuals) -> Stroke {
     Stroke::new(1.0_f32, color)
 }
 
+/// The ground the column headings stand on.
+///
+/// A shade off the list, so that the row of names reads as the lid of the list
+/// rather than as its first row. It is the one place in the window where a
+/// panel is allowed to be a different colour from the panel next to it: what is
+/// above the line is the handle and what is below it is the contents.
+pub fn header(v: &Visuals) -> Color32 {
+    if v.dark_mode {
+        rgb(0x141414)
+    } else {
+        rgb(0xE7EBF2)
+    }
+}
+
+/// The same, for the column the list is sorted by.
+///
+/// One step further from the list than its neighbours, which is enough to pick
+/// it out down the whole height of the window without a second colour.
+pub fn header_sorted(v: &Visuals) -> Color32 {
+    if v.dark_mode {
+        rgb(0x1F1F1F)
+    } else {
+        rgb(0xD9E0EC)
+    }
+}
+
+/// The mark that says which way a column is sorted.
+///
+/// Blue, and only ever blue: it is the one thing in the header that is not a
+/// word, and in the colour of the text it read as a speck of dust on the
+/// screen. This is the colour that says the list is being held a particular way
+/// round, and nothing else in the window is allowed to use it.
+pub fn mark(v: &Visuals) -> Color32 {
+    if v.dark_mode {
+        rgb(0x4C8DFF)
+    } else {
+        ACCENT_LIGHT
+    }
+}
+
 /// Sizes and spacing, which are the same whichever way the theme goes.
 pub fn style(style: &mut egui::Style) {
     use egui::{FontFamily, FontId, TextStyle};
