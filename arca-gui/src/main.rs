@@ -428,6 +428,20 @@ fn system_icon(
     made
 }
 
+// What the desktop calls this kind of file, cached by extension the way the
+// icons are: the answer is the same for every .txt in the archive, and asking
+// the shell fifteen hundred times for it would be fifteen hundred round trips
+// to another thread while the list is being drawn.
+fn system_type(cache: &mut HashMap<String, Option<String>>, name: &str, is_dir: bool) -> String {
+    let key = arca_icons::cache_key(name, is_dir);
+    if let Some(found) = cache.get(&key) {
+        return found.clone().unwrap_or_default();
+    }
+    let made = arca_icons::type_name(name, is_dir);
+    cache.insert(key, made.clone());
+    made.unwrap_or_default()
+}
+
 // A folder of its own per archive, so two archives holding a file with the same
 // name do not overwrite each other's copy. safe_name is what keeps an entry
 // called "../../evil" from landing outside it.
@@ -1275,6 +1289,7 @@ enum SortColumn {
     Saved,
     Modified,
     Crc,
+    Type,
 }
 
 // Which columns the list shows. Name is not here: a list of nothing but sizes
@@ -1287,24 +1302,34 @@ struct Columns {
     saved: bool,
     modified: bool,
     crc: bool,
+    type_: bool,
 }
 
 impl Default for Columns {
     fn default() -> Self {
         // What was on screen before any of this was a choice, plus the date,
         // which both WinRAR and NanaZip show and which people look for.
-        Columns { size: true, packed: true, method: true, saved: true, modified: true, crc: false }
+        Columns {
+            size: true,
+            packed: true,
+            method: true,
+            saved: true,
+            modified: true,
+            crc: false,
+            type_: false,
+        }
     }
 }
 
 impl Columns {
-    const ALL: [(SortColumn, &'static str); 6] = [
+    const ALL: [(SortColumn, &'static str); 7] = [
         (SortColumn::Size, "size"),
         (SortColumn::Packed, "packed"),
         (SortColumn::Method, "method"),
         (SortColumn::Saved, "saved"),
         (SortColumn::Modified, "modified"),
         (SortColumn::Crc, "crc"),
+        (SortColumn::Type, "type"),
     ];
 
     fn on(&self, which: SortColumn) -> bool {
@@ -1315,6 +1340,7 @@ impl Columns {
             SortColumn::Saved => self.saved,
             SortColumn::Modified => self.modified,
             SortColumn::Crc => self.crc,
+            SortColumn::Type => self.type_,
             SortColumn::Name => true,
         }
     }
@@ -1327,6 +1353,7 @@ impl Columns {
             SortColumn::Saved => self.saved = value,
             SortColumn::Modified => self.modified = value,
             SortColumn::Crc => self.crc = value,
+            SortColumn::Type => self.type_ = value,
             SortColumn::Name => {}
         }
     }
@@ -1339,6 +1366,7 @@ impl Columns {
             SortColumn::Saved => s.col_saved,
             SortColumn::Modified => s.col_modified,
             SortColumn::Crc => s.col_crc,
+            SortColumn::Type => s.col_type,
             SortColumn::Name => s.col_name,
         }
     }
@@ -1414,6 +1442,66 @@ struct Wheel {
     /// running until the next click; that is what makes press-and-drag and
     /// click-and-go both work off the one button.
     moved: bool,
+}
+
+/// How wide `text` comes out in `style`, laid out on one line.
+fn wide_of(ui: &egui::Ui, text: &str, style: egui::TextStyle) -> f32 {
+    ui.fonts(|f| {
+        f.layout_no_wrap(
+            text.to_owned(),
+            style.resolve(ui.style()),
+            egui::Color32::PLACEHOLDER,
+        )
+        .size()
+        .x
+    })
+}
+
+/// What a column would have to be to hold everything in it without cutting
+/// anything off.
+///
+/// Measured over the rows on screen -- which is the folder you are looking at,
+/// filter and all -- rather than over the whole archive, because that is the
+/// list the column is being fitted to. Every cell is measured in the style it
+/// is drawn in: the numbers are monospaced and a monospaced digit is wider than
+/// a proportional one, so measuring them all as body text would fit a column
+/// that then cuts off its own contents.
+fn natural_width(ui: &egui::Ui, rows: &[Row], which: SortColumn, s: &Strings) -> f32 {
+    use egui::TextStyle::{Body, Monospace};
+    let pad = ui.spacing().item_spacing.x * 2.0;
+    let widest = |style: egui::TextStyle, of: &dyn Fn(&Row) -> String| -> f32 {
+        rows.iter()
+            .map(|r| wide_of(ui, &of(r), style.clone()))
+            .fold(0.0_f32, f32::max)
+    };
+    match which {
+        // The icon and the gap after it are part of what the name column has to
+        // hold, so they are part of what it is fitted to.
+        SortColumn::Name => {
+            let head = wide_of(ui, s.col_name, Body) + 20.0;
+            (widest(Body, &|r| r.label.clone()) + 19.0 + pad).max(head)
+        }
+        SortColumn::Size => widest(Monospace, &|r| human(r.size)) + pad,
+        SortColumn::Packed => widest(Monospace, &|r| human(r.packed)) + pad,
+        SortColumn::Method => {
+            widest(Body, &|r| {
+                if r.is_dir {
+                    format!("{} {}", r.count, s.items_word)
+                } else if r.encrypted {
+                    format!("AES-256 {}", r.method)
+                } else {
+                    r.method.to_string()
+                }
+            }) + pad
+        }
+        SortColumn::Saved => widest(Monospace, &|_| "100%".to_string()) + pad,
+        SortColumn::Modified => widest(Monospace, &|r| when(r.mtime)) + pad,
+        SortColumn::Crc => widest(Monospace, &|_| "FFFFFFFF".to_string()) + pad,
+        // Fitted to the heading alone. The words come from the shell one
+        // extension at a time and measuring them here would ask it about every
+        // row in the folder before the column could be sized.
+        SortColumn::Type => wide_of(ui, s.col_type, Body) + pad,
+    }
 }
 
 /// The name of a row, opened for editing where it stands.
@@ -1540,6 +1628,8 @@ struct Arca {
     cursor: Option<usize>,
     // One texture per extension, filled the first time a kind is seen.
     icons: HashMap<String, Option<egui::TextureHandle>>,
+    // The desktop's word for each kind of file, by extension. See `system_type`.
+    types: HashMap<String, Option<String>>,
     // Where a rubber band started, and what was ticked before it did. The
     // second is what lets the band be recomputed from scratch every frame, so
     // dragging back over a row lets go of it again.
@@ -1641,6 +1731,7 @@ impl Arca {
             here: 0,
             cursor: None,
             icons: HashMap::new(),
+            types: HashMap::new(),
             band: None,
             band_base: Vec::new(),
             confirm_delete: None,
@@ -1753,6 +1844,11 @@ impl Arca {
                     .unwrap_or(std::cmp::Ordering::Equal),
                 SortColumn::Modified => x.mtime.cmp(&y.mtime),
                 SortColumn::Crc => x.crc32.cmp(&y.crc32),
+            // By extension, which is what the type is worked out from: sorting by
+            // the words themselves would need the shell asked about every entry
+            // in the archive to answer one click.
+            SortColumn::Type => arca_icons::cache_key(&x.label, x.is_dir)
+                .cmp(&arca_icons::cache_key(&y.label, y.is_dir)),
             };
             if asc {
                 o
@@ -3077,12 +3173,26 @@ impl Arca {
             let tally = self.archive.is_some().then(|| {
                 let n = self.checked.iter().filter(|b| **b).count();
                 let shown = self.visible_rows().len();
-                format!(
+                let all = format!(
                     "{shown} {} {} · {n} {}",
                     s.visible_of,
                     self.entries.len(),
                     s.checked
-                )
+                );
+                if n == 0 {
+                    return all;
+                }
+                // What is picked, weighed. WinRAR keeps this in the corner of
+                // its status bar and it is the answer to the question anybody
+                // is asking before they extract something: how much is this.
+                let bytes: u64 = self
+                    .entries
+                    .iter()
+                    .zip(&self.checked)
+                    .filter(|(_, &on)| on)
+                    .map(|(e, _)| e.size)
+                    .sum();
+                format!("{all} · {}", human(bytes))
             });
             let keep = tally.as_ref().map_or(0.0, |t| {
                 ui.painter()
@@ -3497,11 +3607,15 @@ impl Arca {
     // near any of them was a column edge rather than the start of a selection.
     // The rule is still drawn the whole way down: that is what tells you which
     // number belongs under which heading halfway down a page.
+    #[allow(clippy::too_many_arguments)]
     fn column_edges(
         &mut self,
         ui: &mut egui::Ui,
         heads: &[egui::Rect],
         slots: &[usize],
+        cols: &[SortColumn],
+        rows: &[Row],
+        s: &Strings,
         top: f32,
         foot: f32,
     ) {
@@ -3540,6 +3654,21 @@ impl Arca {
                         *width = (*width + resp.drag_delta().x).max(Settings::least(slot));
                     }
                 }
+            }
+            // Double clicking an edge fits the column to what is in it, which
+            // is what the same gesture does in WinRAR and in the Explorer.
+            // Capped, because one absurd name in a folder of sensible ones
+            // should not push every other column off the window.
+            if resp.double_clicked() {
+                if let (Some(slot), Some(which)) =
+                    (slots.get(i - 1).copied(), cols.get(i - 1).copied())
+                {
+                    if let Some(width) = self.settings.widths.get_mut(slot) {
+                        *width = natural_width(ui, rows, which, s)
+                            .clamp(Settings::least(slot), 640.0);
+                    }
+                }
+                self.settings.save();
             }
             // Written when the hand lets go rather than on the way, so that
             // pulling an edge across the window is one visit to the disk and
@@ -4211,6 +4340,9 @@ impl Arca {
         let mut row_rects: Vec<(usize, egui::Rect)> = Vec::with_capacity(visible.len());
         let pressing = ui.input(|i| i.pointer.any_down());
         let mut icons = std::mem::take(&mut self.icons);
+        // A RefCell rather than a plain take: the cell closures are handed out one
+        // per column and two of them would otherwise want the same &mut.
+        let types = std::cell::RefCell::new(std::mem::take(&mut self.types));
         let order = self.order;
         let hint = s.sort_hint;
         // The whole header cell answers, not the four letters of the name:
@@ -4403,7 +4535,15 @@ impl Arca {
                         // Faded while it is on the clipboard as a cut, which is
                         // the only sign the Explorer gives either.
                         let text = if cut { text.weak() } else { text };
-                        ui.add(egui::Label::new(text).selectable(false).truncate());
+                        let room = ui.available_width();
+                        let name = ui.add(egui::Label::new(text).selectable(false).truncate());
+                        // The whole name on hover, but only when the column is
+                        // too narrow to hold it. A tip that repeats what is
+                        // already legible is a tip that teaches you to ignore
+                        // tips.
+                        if wide_of(ui, &r.label, egui::TextStyle::Body) > room {
+                            name.on_hover_text(&r.label);
+                        }
                     });
                     for which in &shown {
                         row.col(|ui| match which {
@@ -4438,6 +4578,17 @@ impl Arca {
                                     ui.monospace(format!("{:08X}", r.crc32));
                                 }
                             }
+                            SortColumn::Type => {
+                                ui.add(
+                                    egui::Label::new(system_type(
+                                        &mut types.borrow_mut(),
+                                        &r.label,
+                                        r.is_dir,
+                                    ))
+                                    .selectable(false)
+                                    .truncate(),
+                                );
+                            }
                             SortColumn::Name => {}
                         });
                     }
@@ -4463,6 +4614,27 @@ impl Arca {
                             wants_extract.set(true);
                             ui.close_menu();
                         }
+                        ui.separator();
+                        // The same list the header offers by being clicked, for
+                        // the times the pointer is already down here. WinRAR
+                        // keeps one in its row menu too.
+                        ui.menu_button(s.sort_by, |ui| {
+                            for which in std::iter::once(SortColumn::Name).chain(shown.clone()) {
+                                let on = self.order.0 == which;
+                                let arrow = if !on {
+                                    ""
+                                } else if self.order.1 {
+                                    " \u{25B2}"
+                                } else {
+                                    " \u{25BC}"
+                                };
+                                let label = format!("{}{arrow}", Columns::label(which, s));
+                                if ui.selectable_label(on, label).clicked() {
+                                    requested = Some(which);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
                         ui.separator();
                         // Only a zip can be written to, so anywhere else this
                         // is left out rather than offered and refused.
@@ -4530,6 +4702,7 @@ impl Arca {
             });
 
         self.icons = icons;
+        self.types = types.into_inner();
         self.scroll_to_cursor = false;
 
         // Everything the two menus asked for, now that the table has let go of
@@ -4681,7 +4854,19 @@ impl Arca {
                 ),
             );
         }
-        self.column_edges(ui, &heads, &slots, table_top, out.inner_rect.bottom());
+        let cols: Vec<SortColumn> = std::iter::once(SortColumn::Name)
+            .chain(shown.iter().copied())
+            .collect();
+        self.column_edges(
+            ui,
+            &heads,
+            &slots,
+            &cols,
+            &visible,
+            s,
+            table_top,
+            out.inner_rect.bottom(),
+        );
         self.rubber_band(ui, &visible, &row_rects, out.inner_rect, out.state.offset.y, reach);
         self.wheel_scroll(ui, out.inner_rect, out.state.offset.y, reach);
         if let Some(index) = opened {

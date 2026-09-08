@@ -56,26 +56,61 @@ pub fn lookup(_name: &str, _is_dir: bool) -> Option<Icon> {
 // matter because callers cache by extension.
 #[cfg(windows)]
 pub fn lookup(name: &str, is_dir: bool) -> Option<Icon> {
+    match ask(name, is_dir, false)? {
+        Answer::Picture(icon) => icon,
+        Answer::Words(_) => None,
+    }
+}
+
+/// What the desktop calls this kind of file: "Text Document", "SQL Source
+/// File". The same question as [`lookup`] with a different flag, so it goes
+/// down the same thread and caches under the same key.
+#[cfg(not(windows))]
+pub fn type_name(_name: &str, _is_dir: bool) -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+pub fn type_name(name: &str, is_dir: bool) -> Option<String> {
+    match ask(name, is_dir, true)? {
+        Answer::Words(text) => text,
+        Answer::Picture(_) => None,
+    }
+}
+
+#[cfg(windows)]
+enum Answer {
+    Picture(Option<Icon>),
+    Words(Option<String>),
+}
+
+#[cfg(windows)]
+fn ask(name: &str, is_dir: bool, words: bool) -> Option<Answer> {
     use std::sync::mpsc::{channel, Sender};
     use std::sync::OnceLock;
 
-    type Question = (String, bool, Sender<Option<Icon>>);
+    type Question = (String, bool, bool, Sender<Answer>);
     static ASK: OnceLock<Sender<Question>> = OnceLock::new();
 
     let ask = ASK.get_or_init(|| {
         let (tx, rx) = channel::<Question>();
         std::thread::spawn(move || {
             windows_impl::start_com();
-            for (name, is_dir, reply) in rx {
-                let _ = reply.send(windows_impl::lookup(&name, is_dir));
+            for (name, is_dir, words, reply) in rx {
+                let answer = if words {
+                    Answer::Words(windows_impl::type_name(&name, is_dir))
+                } else {
+                    Answer::Picture(windows_impl::lookup(&name, is_dir))
+                };
+                let _ = reply.send(answer);
             }
         });
         tx
     });
 
     let (tx, rx) = channel();
-    ask.send((name.to_string(), is_dir, tx)).ok()?;
-    rx.recv().ok()?
+    ask.send((name.to_string(), is_dir, words, tx)).ok()?;
+    rx.recv().ok()
 }
 
 #[cfg(windows)]
@@ -87,7 +122,10 @@ mod windows_impl {
     use windows::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
     };
-    use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES};
+    use windows::Win32::UI::Shell::{
+        SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_TYPENAME,
+        SHGFI_USEFILEATTRIBUTES,
+    };
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 
@@ -131,6 +169,37 @@ mod windows_impl {
             let icon = to_rgba(info.hIcon);
             let _ = DestroyIcon(info.hIcon);
             icon
+        }
+    }
+
+    /// The shell's own words for this kind of file, which is what the Explorer
+    /// puts in its Type column and WinRAR copies.
+    pub fn type_name(name: &str, is_dir: bool) -> Option<String> {
+        let leaf = name.rsplit(['/', '\\']).next().unwrap_or(name);
+        let asked = if leaf.is_empty() { "file" } else { leaf };
+        let text = wide(asked);
+
+        let mut info = SHFILEINFOW::default();
+        let attrs = if is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
+
+        unsafe {
+            let ok = SHGetFileInfoW(
+                PCWSTR(text.as_ptr()),
+                attrs,
+                Some(&mut info),
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_TYPENAME | SHGFI_USEFILEATTRIBUTES,
+            );
+            if ok == 0 {
+                return None;
+            }
+            let end = info
+                .szTypeName
+                .iter()
+                .position(|c| *c == 0)
+                .unwrap_or(info.szTypeName.len());
+            let out = String::from_utf16_lossy(&info.szTypeName[..end]);
+            (!out.is_empty()).then_some(out)
         }
     }
 
