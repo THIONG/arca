@@ -215,6 +215,8 @@ mod tests {
 
     fn entry(name: &str, is_dir: bool, size: u64) -> Entry {
         Entry {
+            raw_name: name.as_bytes().to_vec(),
+            utf8: true,
             name: name.to_string(),
             size,
             compressed_size: size,
@@ -384,6 +386,8 @@ mod folder_tests {
 
     fn entry(name: &str, is_dir: bool) -> Entry {
         Entry {
+            raw_name: name.as_bytes().to_vec(),
+            utf8: true,
             name: name.to_string(),
             size: 0,
             compressed_size: 0,

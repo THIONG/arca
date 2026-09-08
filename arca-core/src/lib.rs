@@ -151,6 +151,12 @@ pub struct Entry {
     // has no such thing.
     pub attributes: u8,
     pub offset: u64,
+    // The name as the archive spells it, before anybody decided what code page
+    // it was written in, and whether the archive said outright that it is
+    // UTF-8. Kept because that decision can be taken again: a zip that does not
+    // flag its names says nothing about which page they are in.
+    pub raw_name: Vec<u8>,
+    pub utf8: bool,
     // WinZip AES: the entry is encrypted and `method` holds the real compressor,
     // read out of the 0x9901 extra field rather than the method field, which
     // says 99 for every encrypted entry.

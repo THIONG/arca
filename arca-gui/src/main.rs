@@ -242,6 +242,10 @@ struct Settings {
     flat: bool,
     // The folders of the archive down the left hand side.
     tree: bool,
+    // Which code page an unflagged zip has its names written in. Only the
+    // person looking at the archive can know, so it is remembered: somebody
+    // whose archives all come from one machine says it once.
+    page: arca_zip::pages::Page,
     // Where the window was left and how big: x, y, width, height. None until it
     // has been opened once.
     window: Option<[f32; 4]>,
@@ -280,6 +284,7 @@ impl Default for Settings {
             columns: Columns::default(),
             flat: false,
             tree: false,
+            page: arca_zip::pages::Page::default(),
             window: None,
             recent: Vec::new(),
             widths: Settings::default_widths(),
@@ -306,6 +311,11 @@ impl Settings {
                 ("theme", _) => s.theme = ThemePreference::System,
                 ("flat", v) => s.flat = v == "yes",
                 ("tree", v) => s.tree = v == "yes",
+                ("page", v) => {
+                    if let Some(p) = arca_zip::pages::Page::from_code(v) {
+                        s.page = p;
+                    }
+                }
                 // One line each, because a path can hold anything a filename
                 // can and there is no separator left that it could not.
                 ("recent", p) if !p.is_empty() => s.recent.push(p.to_string()),
@@ -1711,6 +1721,7 @@ enum More {
     Test,
     Undo,
     NewFolder,
+    Page(arca_zip::pages::Page),
     SaveCopy,
     DefaultPassword,
     Flat,
@@ -2063,6 +2074,12 @@ fn branch(
             branch(ui, icons, kid, &path, depth + 1, here, go);
         }
     }
+}
+
+/// Whether a name is a folder's, which in a zip is the slash on the end of it
+/// and nothing else. Both slashes, because archives from Windows use theirs.
+fn is_folder_name(name: &str) -> bool {
+    name.ends_with('/') || name.ends_with('\\')
 }
 
 /// The folder an entry is filed in, without the name on the end. Empty at the
@@ -2689,6 +2706,38 @@ impl Arca {
         }
     }
 
+    // Reads the names again in a different code page.
+    //
+    // Nothing is written and the archive is not touched: the bytes of every
+    // name were kept as the archive spells them, and this decides again what
+    // they mean. Entries the archive marked as UTF-8 are left alone -- there is
+    // no question about those and reading them any other way would break the
+    // ones that were right.
+    //
+    // The listing goes back to the root afterwards. The folder you were in was
+    // a path made out of those names, and under a different page it is a path
+    // that does not exist.
+    fn reread_names(&mut self, ctx: &egui::Context, page: arca_zip::pages::Page) {
+        self.settings.page = page;
+        self.settings.save();
+        for e in &mut self.entries {
+            if e.utf8 {
+                continue;
+            }
+            e.name = arca_zip::pages::decode(&e.raw_name, page);
+            e.is_dir = e.name.ends_with('/') || e.name.ends_with('\\');
+        }
+        self.folders = tree::folders_of(&self.entries);
+        self.clear_picked();
+        self.cursor = None;
+        self.current_dir.clear();
+        self.history = vec![String::new()];
+        self.here = 0;
+        self.notice = self.summary();
+        self.error = false;
+        ctx.request_repaint();
+    }
+
     // A folder made inside the archive, in the one you are looking at.
     //
     // Asked for in a box rather than made as "New folder" and renamed after,
@@ -3049,7 +3098,7 @@ impl Arca {
         if let Some(rx) = &self.channel {
             while let Ok(m) = rx.try_recv() {
                 match m {
-                    Message::Listing(path, v) => {
+                    Message::Listing(path, mut v) => {
                         if v.iter().any(|e| e.encrypted) && self.archive_password.is_none() {
                             // The one already given for everything, if there is
                             // one. A wrong guess here is no worse than a wrong
@@ -3071,6 +3120,19 @@ impl Arca {
                         // selected" is not what a list means when you open it.
                         // The buttons that work on the whole archive never
                         // looked at the ticks anyway.
+                        // The archive was read with the page the format nominally
+                        // means; if this window has been told otherwise, the
+                        // names are read again before anything else looks at
+                        // them.
+                        let page = self.settings.page;
+                        if page != arca_zip::pages::Page::default() {
+                            for e in &mut v {
+                                if !e.utf8 {
+                                    e.name = arca_zip::pages::decode(&e.raw_name, page);
+                                    e.is_dir = is_folder_name(&e.name);
+                                }
+                            }
+                        }
                         self.checked = vec![false; v.len()];
                         self.folders = tree::folders_of(&v);
                         self.entries = v;
@@ -4592,6 +4654,19 @@ impl Arca {
                     {
                         wants = Some(More::Tree);
                     }
+                    // Only where there is an archive whose names could be read
+                    // another way. A tar has none of this argument.
+                    ui.add_enabled_ui(has && self.format == Format::Zip, |ui| {
+                        ui.menu_button(s.name_encoding, |ui| {
+                            for (page, _, label) in arca_zip::pages::Page::ALL {
+                                let on = self.settings.page == page;
+                                if ui.selectable_label(on, label).clicked() {
+                                    wants = Some(More::Page(page));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    });
                     // The archives opened lately. By name, with the whole path
                     // on hover: a menu of paths is a menu nobody reads.
                     ui.add_enabled_ui(!self.settings.recent.is_empty(), |ui| {
@@ -4685,6 +4760,7 @@ impl Arca {
                     self.password_input.clear();
                     self.asking_default_password = true;
                 }
+                Some(More::Page(p)) => self.reread_names(ctx, p),
                 Some(More::Tree) => {
                     self.settings.tree = !self.settings.tree;
                     self.settings.save();

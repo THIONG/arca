@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod aes;
+pub mod pages;
 
 use arca_core::{limits, Codec, Cursor, Entry, Error, Level, Method, Result};
 use flate2::write::DeflateEncoder;
@@ -625,7 +626,8 @@ fn read_central_header(c: &mut Cursor<'_>) -> Result<Entry> {
         }
     };
 
-    let name = if flags & 0x800 != 0 {
+    let utf8 = flags & 0x800 != 0;
+    let name = if utf8 {
         String::from_utf8_lossy(name_bytes).into_owned()
     } else {
         from_cp437(name_bytes)
@@ -635,6 +637,8 @@ fn read_central_header(c: &mut Cursor<'_>) -> Result<Entry> {
 
     Ok(Entry {
         name,
+        raw_name: name_bytes.to_vec(),
+        utf8,
         size: uncompressed,
         compressed_size: comp_size,
         method,

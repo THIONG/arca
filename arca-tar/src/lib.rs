@@ -129,6 +129,10 @@ impl<R: Read> TarReader<R> {
         }
 
         let entry = Entry {
+            // A tar name is bytes too, but this reader has always taken them as
+            // UTF-8 and no tar carries a flag to argue with.
+            raw_name: name.as_bytes().to_vec(),
+            utf8: true,
             name,
             size,
             compressed_size: size,
