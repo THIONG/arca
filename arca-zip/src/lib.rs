@@ -1296,17 +1296,27 @@ pub fn add_entries(
     // than finishing a copy nobody is waiting for.
     notify: &dyn Fn(usize, usize, &str) -> bool,
 ) -> Result<u64> {
-    let taken: std::collections::HashSet<&str> = extra.iter().map(|a| a.name.as_str()).collect();
+    // Compared with the separator the format actually specifies. Windows tools
+    // write backslashes into zips, and an existing `a\b.txt` measured against a
+    // new `a/b.txt` looks like a different file: the archive would come out
+    // holding both, under one name, and which one anybody got back would be
+    // whichever their unzipper happened to find first.
+    let taken: std::collections::HashSet<String> = extra.iter().map(|a| slashed(&a.name)).collect();
     rewrite(
         archive,
         out,
         password,
         password,
-        &|e| !taken.contains(e.name.as_str()),
+        &|e| !taken.contains(&slashed(&e.name)),
         &keep_name,
         extra,
         notify,
     )
+}
+
+/// A name with the separator a zip is supposed to use. See [`add_entries`].
+fn slashed(name: &str) -> String {
+    name.replace('\\', "/")
 }
 
 /// Writes a copy of `archive` at `out` without the entries `keep` turns down.
@@ -2141,6 +2151,52 @@ mod tests {
             read_times(&[0x0A, 0x00, 0xFF, 0xFF, 1, 2, 3]),
             Times::default()
         );
+    }
+
+    // A name written with backslashes is the same name. Windows tools put them
+    // in zips, and taking them for a different file leaves an archive holding
+    // two entries under one name, where what anybody gets back depends on which
+    // one their unzipper reaches first.
+    #[test]
+    fn adding_over_a_windows_spelled_name_replaces_it_instead_of_doubling_it() {
+        let room = std::env::temp_dir().join(format!("arca-slash-{}", std::process::id()));
+        std::fs::create_dir_all(&room).unwrap();
+
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        w.add(
+            "dir\\a.txt",
+            &b"viejo"[..],
+            Codec::Store,
+            Level::Store,
+            None,
+        )
+        .unwrap();
+        w.add("dir\\b.txt", &b"otro"[..], Codec::Store, Level::Store, None)
+            .unwrap();
+        let archive = room.join("a.zip");
+        std::fs::write(&archive, w.finish().unwrap().into_inner()).unwrap();
+
+        let fresh = room.join("fresh.bin");
+        std::fs::write(&fresh, b"nuevo").unwrap();
+        let extra = [Addition {
+            source: Some(fresh),
+            name: "dir/a.txt".into(),
+            codec: Codec::Store,
+            level: Level::Store,
+        }];
+        let out = room.join("b.zip");
+        add_entries(&archive, &out, None, &extra, &|_, _, _| true).unwrap();
+
+        let mut a = ZipArchive::open(std::fs::File::open(&out).unwrap()).unwrap();
+        assert_eq!(a.len(), 2, "two entries in, two out");
+        let names: Vec<String> = a.entries().iter().map(|e| e.name.clone()).collect();
+        assert!(names.contains(&"dir/a.txt".to_string()));
+        let at = names.iter().position(|n| n == "dir/a.txt").unwrap();
+        let mut got = Vec::new();
+        a.extract_to(at, &mut got).unwrap();
+        assert_eq!(got, b"nuevo", "and the one that stayed is the new one");
+
+        let _ = std::fs::remove_dir_all(&room);
     }
 
     // A folder is an entry with nothing in it and a slash on the end, which is

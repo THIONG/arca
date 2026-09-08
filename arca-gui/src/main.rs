@@ -1406,12 +1406,12 @@ fn run_job_blocking(
             let under = format!("{from}/");
             let moved = format!("{to}/");
             let rename = |name: &str| -> String {
+                // Compared in the spelling the window works in. An archive
+                // written with backslashes matched nothing otherwise, and the
+                // rename quietly did nothing at all.
+                let name = slashed(name);
                 if !folder {
-                    return if name == from {
-                        to.clone()
-                    } else {
-                        name.to_string()
-                    };
+                    return if name == from { to.clone() } else { name };
                 }
                 if name == from {
                     to.clone()
@@ -1420,7 +1420,7 @@ fn run_job_blocking(
                 } else if let Some(rest) = name.strip_prefix(&under) {
                     format!("{moved}{rest}")
                 } else {
-                    name.to_string()
+                    name
                 }
             };
             let done = arca_zip::rename_entries(
@@ -2127,9 +2127,21 @@ fn branch(
 ///
 /// Anything that matches nothing keeps its name, which is most of the archive:
 /// this is asked of every entry in it.
+/// The same name with the separators a zip is supposed to use.
+///
+/// The format says forward slashes and most tools write them, but Windows's own
+/// Compress-Archive writes backslashes, and the window works in the spelling it
+/// shows. Comparing one against the other silently matched nothing: renaming
+/// and moving inside a folder did nothing at all in those archives.
+fn slashed(name: &str) -> String {
+    name.replace('\\', "/")
+}
+
 fn moved_name(name: &str, moves: &[(String, String)]) -> String {
+    // Compared, and written out again, in the spelling the window works in.
+    let name = slashed(name);
     for (from, to) in moves {
-        if name == from {
+        if name == *from {
             return to.clone();
         }
         let under = format!("{from}/");
@@ -2140,7 +2152,28 @@ fn moved_name(name: &str, moves: &[(String, String)]) -> String {
             return format!("{to}/{rest}");
         }
     }
-    name.to_string()
+    name
+}
+
+/// Seconds as a clock: `0:07`, `1:38`, `2:05:11`.
+///
+/// Minutes and seconds until there are hours, and no leading zero on the
+/// largest part: a job that says `0:00:07` is a job whose progress window was
+/// designed for a job that takes hours.
+fn clock(seconds: f64) -> String {
+    // A guess of a hundred hours is not a guess; anything past this is capped
+    // rather than shown, and NaN falls to nothing rather than to a panic.
+    let whole = if seconds.is_finite() {
+        seconds.clamp(0.0, 359_999.0) as u64
+    } else {
+        0
+    };
+    let (h, m, s) = (whole / 3600, (whole / 60) % 60, whole % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 /// Whether a name is a folder's, which in a zip is the slash on the end of it
@@ -2406,6 +2439,9 @@ struct Arca {
     // with the same word. Never written anywhere: see `default_password_window`.
     default_password: Option<String>,
     asking_default_password: bool,
+    // Set while a job is being shown as a window over the list rather than as
+    // the whole window. Cleared when the job finishes without a complaint.
+    overlay: bool,
     // The selection while it is in the air: the top of what was picked when
     // the drag began. Where it lands is not decided until the button comes up.
     carrying: Option<Vec<String>>,
@@ -2525,6 +2561,7 @@ impl Arca {
             rename_fresh: false,
             default_password: None,
             asking_default_password: false,
+            overlay: false,
             carrying: None,
             asking_folder: false,
             folder_input: String::new(),
@@ -3068,6 +3105,11 @@ impl Arca {
     // encrypted, and costs nothing next to extracting it. Asking here, before
     // any work starts, keeps the question on the window's own thread.
     fn run_job(&mut self, ctx: &egui::Context, job: Job) {
+        // One at a time. Two jobs on one archive would be two rewrites of the
+        // same file racing to be the one that lands.
+        if self.busy {
+            return;
+        }
         if let Job::Extract {
             archives,
             password: None,
@@ -3084,7 +3126,14 @@ impl Arca {
             }
         }
         let s: &'static Strings = self.s();
-        self.view = View::Running;
+        // Work started from the list stays over the list: what is being worked
+        // on is right there behind it, and a window that goes away and comes
+        // back loses your place in it. Work started from the command line has
+        // no list behind it and takes the whole window, which is all there is.
+        self.overlay = matches!(self.view, View::Browse) && self.archive.is_some();
+        if !self.overlay {
+            self.view = View::Running;
+        }
         self.title = match &job {
             Job::Extract { .. } => s.extracting.to_string(),
             Job::Test { .. } => s.testing.to_string(),
@@ -3240,6 +3289,10 @@ impl Arca {
                     Message::Done(text) => {
                         self.notice = text;
                         self.busy = false;
+                        // Nothing went wrong, so there is nothing to read and
+                        // nothing to dismiss: the window over the list takes
+                        // itself away.
+                        self.overlay = false;
                         close = true;
                         finished_ok = true;
                     }
@@ -5232,6 +5285,103 @@ impl Arca {
         });
     }
 
+    // What is happening, over the list it is happening to.
+    //
+    // Everything that takes a while has looked the same until now: the whole
+    // window turned into a progress bar and had to be dismissed by hand
+    // afterwards, which for a job of four seconds is three seconds of nothing
+    // and one of tidying up. This is the shape every other archiver uses --
+    // a small window over the work, saying what, how far, how long, and how to
+    // stop -- and it goes away by itself when the work is done.
+    fn progress_window(&mut self, ctx: &egui::Context) {
+        if !self.overlay {
+            return;
+        }
+        let s = self.s();
+        // The list behind is dimmed rather than left bright: it is not what is
+        // being asked about, and anything pressed in it would be a second job
+        // on an archive that is being rewritten.
+        let screen = ctx.screen_rect();
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::PanelResizeLine,
+            egui::Id::new("arca-dim"),
+        ))
+        .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(120));
+
+        let fraction = if self.total_count == 0 {
+            0.0
+        } else {
+            self.done_count as f32 / self.total_count as f32
+        };
+        let mut close = false;
+        egui::Window::new(&self.title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.add_space(4.0);
+                // What it is on right now. A fixed line whether or not there is
+                // a name yet, so the window does not change height as it works.
+                ui.add(egui::Label::new(egui::RichText::new(&self.current_file).weak()).truncate());
+                ui.add_space(6.0);
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .text(format!("{:.0}%", fraction * 100.0))
+                        .desired_width(ui.available_width()),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if let Some(t) = self.started {
+                        let gone = t.elapsed().as_secs_f64();
+                        ui.label(
+                            egui::RichText::new(format!("{} {}", s.elapsed_word, clock(gone)))
+                                .weak()
+                                .small(),
+                        );
+                        // Guessed from how long the part already done took, and
+                        // only once enough of it is done for the guess to be
+                        // worth reading: at two per cent it would say an hour
+                        // and then a minute.
+                        if self.busy && fraction > 0.05 {
+                            let left = gone / fraction as f64 - gone;
+                            ui.label(
+                                egui::RichText::new(format!("· {} {}", s.time_left, clock(left)))
+                                    .weak()
+                                    .small(),
+                            );
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if self.busy {
+                        let asked = self.stop.load(std::sync::atomic::Ordering::Relaxed);
+                        if ui
+                            .add_enabled(!asked, egui::Button::new(s.cancel))
+                            .clicked()
+                        {
+                            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if asked {
+                            ui.label(egui::RichText::new(s.stopping).weak());
+                        }
+                    } else {
+                        // Only ever seen when something went wrong: a job that
+                        // finishes takes this window with it.
+                        if ui.button(s.close).clicked() {
+                            close = true;
+                        }
+                        ui.colored_label(ui.visuals().error_fg_color, &self.notice);
+                    }
+                });
+                ui.add_space(4.0);
+            });
+        if close {
+            self.overlay = false;
+        }
+    }
+
     fn running_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let s = self.s();
         ui.add_space(12.0);
@@ -7031,6 +7181,7 @@ impl eframe::App for Arca {
                 self.viewer_window(&ctx2);
                 self.default_password_window(&ctx2);
                 self.new_folder_window(&ctx2);
+                self.progress_window(&ctx2);
                 self.conflict_window(&ctx2);
                 self.password_window(&ctx2);
                 self.confirm_delete_window(&ctx2);
@@ -7042,7 +7193,9 @@ impl eframe::App for Arca {
                     .exact_height(30.0)
                     .show(ctx, |ui| {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            if self.busy && !self.quiet {
+                            // Not while the window over the list is saying the
+                            // same thing in more detail.
+                            if self.busy && !self.quiet && !self.overlay {
                                 let f = if self.total_count == 0 {
                                     0.0
                                 } else {
@@ -7171,6 +7324,16 @@ mod tests {
     // have to move together, and everything else has to come through untouched:
     // a prefix matched too eagerly here would quietly re-file half the archive.
     #[test]
+    fn moving_reads_an_archive_written_with_backslashes() {
+        // Windows's own Compress-Archive writes these, and the window shows and
+        // compares forward slashes. Before this they matched nothing and a
+        // move inside a folder did nothing without saying so.
+        let moves = vec![("carpeta/f1.txt".to_string(), "f1.txt".to_string())];
+        assert_eq!(moved_name(r"carpeta\f1.txt", &moves), "f1.txt");
+        assert_eq!(moved_name(r"carpeta\f2.txt", &moves), "carpeta/f2.txt");
+    }
+
+    #[test]
     fn moving_carries_a_whole_branch_and_leaves_everything_else_alone() {
         let moves = vec![
             ("docs/notas".to_string(), "notas".to_string()),
@@ -7191,6 +7354,19 @@ mod tests {
         assert_eq!(of("docs/uno.txt"), "docs/uno.txt");
         assert_eq!(of("leeme.txt.bak"), "leeme.txt.bak");
         assert_eq!(of("otra/cosa.bin"), "otra/cosa.bin");
+    }
+
+    #[test]
+    fn the_clock_reads_as_a_clock() {
+        assert_eq!(clock(0.0), "0:00");
+        assert_eq!(clock(7.4), "0:07");
+        assert_eq!(clock(98.0), "1:38");
+        assert_eq!(clock(3600.0), "1:00:00");
+        assert_eq!(clock(7511.0), "2:05:11");
+        // A guess made from almost nothing, and one made from nonsense.
+        assert_eq!(clock(-5.0), "0:00");
+        assert_eq!(clock(f64::NAN), "0:00");
+        assert_eq!(clock(f64::INFINITY), "0:00");
     }
 
     #[test]
