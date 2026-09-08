@@ -5523,6 +5523,19 @@ impl Arca {
         // The rule sits down the middle of the gap between two cells.
         let half = ui.spacing().item_spacing.x * 0.5;
         let quiet = ui.visuals().widgets.noninteractive.bg_stroke;
+
+        // The two outer rules, which are the sides of the list itself.
+        //
+        // Running the list to the edges of the window left a picked row
+        // spilling its blue off both cantos with nothing to stop it. These are
+        // the same hairline as the rules between the columns and they close the
+        // list the way the frame around WinRAR's does: nothing is given up, and
+        // what is picked ends against a line instead of against the window.
+        let side = ui.max_rect();
+        for x in [side.left() + 0.5, side.right() - 0.5] {
+            ui.painter()
+                .line_segment([egui::pos2(x, top), egui::pos2(x, foot)], quiet);
+        }
         // Every edge is read off the left of the cell that follows it, never
         // off the right of the cell before. A header cell reports a rectangle
         // that has been stretched to hold what was drawn in it, so its right
