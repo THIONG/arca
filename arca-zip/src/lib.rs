@@ -1264,7 +1264,10 @@ pub fn rewrite_password(
 /// with the file rather than sitting in the call so a paste can use whatever
 /// the window is set to without the rewrite having to know about it.
 pub struct Addition {
-    pub source: std::path::PathBuf,
+    // The file to read the bytes from, or nothing at all: a folder in a zip is
+    // an entry with no contents and a slash on the end of its name, and there
+    // is no file on disk behind one that somebody has just asked for.
+    pub source: Option<std::path::PathBuf>,
     pub name: String,
     pub codec: Codec,
     pub level: Level,
@@ -1422,13 +1425,23 @@ fn rewrite(
         if !notify(entries.len() + i, total, &a.name) {
             return Err(Error::Cancelled);
         }
-        let meta = std::fs::metadata(&a.source)?;
+        let Some(from) = &a.source else {
+            // A folder: nothing to read, nothing to compress, and the slash on
+            // the end of the name is what makes it one.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs() as i64);
+            w.add_with_password(&a.name, io::empty(), Codec::Store, Level::Store, now, None)?;
+            continue;
+        };
+        let meta = std::fs::metadata(from)?;
         let mtime = meta.modified().ok().and_then(|t| {
             t.duration_since(std::time::UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_secs() as i64)
         });
-        let f = BufReader::with_capacity(STREAM_BUF, File::open(&a.source)?);
+        let f = BufReader::with_capacity(STREAM_BUF, File::open(from)?);
         w.add_with_password(&a.name, f, a.codec, a.level, mtime, new)?;
         bytes += meta.len();
     }
@@ -2126,6 +2139,48 @@ mod tests {
         );
     }
 
+    // A folder is an entry with nothing in it and a slash on the end, which is
+    // the only way a zip has of recording one. Worth its own test because there
+    // is no file on disk behind it: everything else in the writer starts by
+    // opening something.
+    #[test]
+    fn a_folder_goes_in_as_an_empty_entry_with_a_slash() {
+        let room = std::env::temp_dir().join(format!("arca-mkdir-{}", std::process::id()));
+        std::fs::create_dir_all(&room).unwrap();
+
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        w.add(
+            "keep.txt",
+            &b"hola"[..],
+            Codec::Deflate,
+            Level::Normal,
+            None,
+        )
+        .unwrap();
+        let archive = room.join("a.zip");
+        std::fs::write(&archive, w.finish().unwrap().into_inner()).unwrap();
+
+        let out = room.join("b.zip");
+        let extra = [Addition {
+            source: None,
+            name: "nueva carpeta/".into(),
+            codec: Codec::Store,
+            level: Level::Store,
+        }];
+        add_entries(&archive, &out, None, &extra, &|_, _, _| true).unwrap();
+
+        let a = ZipArchive::open(std::fs::File::open(&out).unwrap()).unwrap();
+        let made = a
+            .entries()
+            .iter()
+            .find(|e| e.name == "nueva carpeta/")
+            .expect("the folder is in the archive");
+        assert!(made.is_dir, "and the archive knows it is one");
+        assert_eq!(made.size, 0);
+
+        let _ = std::fs::remove_dir_all(&room);
+    }
+
     // Stopping halfway has to leave the archive exactly as it was. Every one of
     // these builds a new file beside the old one and swaps at the end, so what
     // this really checks is that the giving up happens before the swap and that
@@ -2194,13 +2249,13 @@ mod tests {
         std::fs::write(&fresh, b"brand new bytes".repeat(50)).unwrap();
         let extra = [
             Addition {
-                source: fresh.clone(),
+                source: Some(fresh.clone()),
                 name: "replace.txt".into(),
                 codec: Codec::Deflate,
                 level: Level::Normal,
             },
             Addition {
-                source: fresh.clone(),
+                source: Some(fresh.clone()),
                 name: "sub/added.bin".into(),
                 codec: Codec::Store,
                 level: Level::Store,

@@ -1062,6 +1062,13 @@ enum Job {
         archive: PathBuf,
         dest: PathBuf,
     },
+    NewFolder {
+        archive: PathBuf,
+        // The whole path with the slash already on it, worked out where the
+        // folder you are looking at is known.
+        name: String,
+        password: Option<String>,
+    },
     Rename {
         archive: PathBuf,
         // Both are full paths inside the archive, not the names on their own:
@@ -1473,7 +1480,7 @@ fn run_job_blocking(
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .map(|(source, name)| arca_zip::Addition {
-                    source,
+                    source: Some(source),
                     name: format!("{dir}{name}"),
                     codec,
                     level,
@@ -1498,6 +1505,40 @@ fn run_job_blocking(
             step_aside(&archive).map_err(|e| e.to_string())?;
             fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
             Ok(fill(s.added, &[("n", &n.to_string())]))
+        }
+        Job::NewFolder {
+            archive,
+            name,
+            password,
+        } => {
+            if detect(&archive) != Some(Format::Zip) {
+                return Err(s.only_zip_can_change.to_string());
+            }
+            let temp = archive.with_file_name(format!(
+                "{}.arca-new",
+                archive
+                    .file_name()
+                    .map(|x| x.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            ));
+            let extra = [arca_zip::Addition {
+                // No file behind it: a folder in a zip is a name and nothing
+                // else.
+                source: None,
+                name,
+                codec: Codec::Store,
+                level: Level::Store,
+            }];
+            let done = arca_zip::add_entries(&archive, &temp, password.as_deref(), &extra, notify);
+            if let Err(e) = done {
+                let _ = fs::remove_file(&temp);
+                return Err(e.to_string());
+            }
+            step_aside(&archive).map_err(|e| e.to_string())?;
+            fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
+            // Nothing to say: the folder is in the list, which is where the eye
+            // already is.
+            Ok(String::new())
         }
     }
 }
@@ -1669,6 +1710,7 @@ enum View {
 enum More {
     Test,
     Undo,
+    NewFolder,
     SaveCopy,
     DefaultPassword,
     Flat,
@@ -2280,6 +2322,10 @@ struct Arca {
     // with the same word. Never written anywhere: see `default_password_window`.
     default_password: Option<String>,
     asking_default_password: bool,
+    // Set while the box that asks for a new folder's name is up, and what has
+    // been typed into it.
+    asking_folder: bool,
+    folder_input: String,
     // The archive that has a previous version kept beside it, and the word for
     // what was done to it. One step back, which is the one anybody wants:
     // deeper than that and the sidecars would pile up.
@@ -2392,6 +2438,8 @@ impl Arca {
             rename_fresh: false,
             default_password: None,
             asking_default_password: false,
+            asking_folder: false,
+            folder_input: String::new(),
             undo: None,
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             viewing: None,
@@ -2641,6 +2689,85 @@ impl Arca {
         }
     }
 
+    // A folder made inside the archive, in the one you are looking at.
+    //
+    // Asked for in a box rather than made as "New folder" and renamed after,
+    // because making it is a rewrite of the whole archive and doing that twice
+    // for one folder would be silly.
+    fn new_folder_window(&mut self, ctx: &egui::Context) {
+        if !self.asking_folder {
+            return;
+        }
+        let s = self.s();
+        let mut go = false;
+        let mut cancel = false;
+        egui::Window::new(s.new_folder)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.label(s.folder_name);
+                ui.add_space(6.0);
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.folder_input)
+                        .id(egui::Id::new("arca-new-folder"))
+                        .desired_width(260.0),
+                );
+                if !field.has_focus() && !field.lost_focus() {
+                    field.request_focus();
+                }
+                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    go = true;
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button(s.new_folder).clicked() {
+                        go = true;
+                    }
+                    if ui.button(s.cancel).clicked() {
+                        cancel = true;
+                    }
+                });
+                ui.add_space(4.0);
+            });
+        if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.asking_folder = false;
+            self.folder_input.clear();
+        }
+        if go {
+            self.asking_folder = false;
+            let name = std::mem::take(&mut self.folder_input).trim().to_string();
+            let Some(archive) = self.archive.clone() else {
+                return;
+            };
+            // The same rules a rename lives by: a name is a name and not a
+            // path, and nothing here is called that already.
+            if name.is_empty() || name.contains('/') || name.contains('\\') {
+                self.notice = s.bad_name.to_string();
+                self.error = true;
+                return;
+            }
+            if self
+                .visible_rows()
+                .iter()
+                .any(|r| r.label.eq_ignore_ascii_case(&name))
+            {
+                self.notice = fill(s.name_taken, &[("name", &name)]);
+                self.error = true;
+                return;
+            }
+            self.run_job(
+                ctx,
+                Job::NewFolder {
+                    archive,
+                    name: format!("{}{name}/", self.current_dir),
+                    password: self.archive_password.clone(),
+                },
+            );
+        }
+    }
+
     // A copy of the archive under whatever name is chosen for it.
     //
     // The one thing to do before a change nobody is sure about, and the reason
@@ -2845,6 +2972,7 @@ impl Arca {
             Job::Delete { .. } => s.deleting.to_string(),
             Job::Rename { .. } => s.renaming.to_string(),
             Job::CopyTo { .. } => s.copying_word.to_string(),
+            Job::NewFolder { .. } => s.adding.to_string(),
             Job::Compress { .. } => s.compressing.to_string(),
             Job::Add { .. } => s.adding.to_string(),
         };
@@ -2855,6 +2983,7 @@ impl Arca {
                 | Job::Delete { .. }
                 | Job::Rename { .. }
                 | Job::CopyTo { .. }
+                | Job::NewFolder { .. }
                 | Job::Add { .. }
         );
         // The file on disk is about to change, so the listing has to be redone.
@@ -2888,6 +3017,7 @@ impl Arca {
             Job::Rename { archive, .. } => Some((archive.clone(), words.rename_word)),
             Job::Add { archive, .. } => Some((archive.clone(), words.add_to_archive)),
             Job::Password { archive, .. } => Some((archive.clone(), words.password_word)),
+            Job::NewFolder { archive, .. } => Some((archive.clone(), words.new_folder)),
             _ => None,
         };
 
@@ -4409,6 +4539,15 @@ impl Arca {
                         wants = Some(More::Test);
                     }
                     if ui
+                        .add_enabled(
+                            has && self.format == Format::Zip,
+                            egui::Button::new(s.new_folder),
+                        )
+                        .clicked()
+                    {
+                        wants = Some(More::NewFolder);
+                    }
+                    if ui
                         .add_enabled(has, egui::Button::new(s.save_copy))
                         .clicked()
                     {
@@ -4537,6 +4676,10 @@ impl Arca {
                     self.settings.save();
                 }
                 Some(More::Undo) => self.undo_last(ctx),
+                Some(More::NewFolder) => {
+                    self.folder_input.clear();
+                    self.asking_folder = true;
+                }
                 Some(More::SaveCopy) => self.save_copy(ctx),
                 Some(More::DefaultPassword) => {
                     self.password_input.clear();
@@ -6601,6 +6744,7 @@ impl eframe::App for Arca {
                 self.group_window(&ctx2);
                 self.viewer_window(&ctx2);
                 self.default_password_window(&ctx2);
+                self.new_folder_window(&ctx2);
                 self.conflict_window(&ctx2);
                 self.password_window(&ctx2);
                 self.confirm_delete_window(&ctx2);
