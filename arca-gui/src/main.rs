@@ -2439,6 +2439,11 @@ struct Arca {
     // with the same word. Never written anywhere: see `default_password_window`.
     default_password: Option<String>,
     asking_default_password: bool,
+    // Where to put the list on the next frame so that it rests on whole rows,
+    // and where it was on the last one, which is how a stopped list is told
+    // from one still moving.
+    snap: Option<f32>,
+    last_offset: f32,
     // Set while a job is being shown as a window over the list rather than as
     // the whole window. Cleared when the job finishes without a complaint.
     overlay: bool,
@@ -2561,6 +2566,8 @@ impl Arca {
             rename_fresh: false,
             default_password: None,
             asking_default_password: false,
+            snap: None,
+            last_offset: 0.0,
             overlay: false,
             carrying: None,
             asking_folder: false,
@@ -6523,7 +6530,11 @@ impl Arca {
         }
         // Set only while a selection drag has run off the end of the list, so
         // the rest of the time the table keeps its own scroll position.
-        if let Some(y) = self.band_scroll.or(self.wheel.map(|w| w.at)) {
+        if let Some(y) = self
+            .band_scroll
+            .or(self.wheel.map(|w| w.at))
+            .or(self.snap.take())
+        {
             builder = builder.vertical_scroll_offset(y);
         }
 
@@ -7034,6 +7045,33 @@ impl Arca {
             out.state.offset.y,
             reach,
         );
+        // A list that has come to rest sits on whole rows.
+        //
+        // Scrolling by pixels leaves the top row sliced through the middle and
+        // jammed against the headings, which is what it looked like: half a
+        // name under the word Name. WinRAR and the Explorer move theirs a line
+        // at a time and never show that. This keeps the smooth scroll -- the
+        // nudge only happens once the list has stopped -- and the row it lands
+        // on is whichever is already closer, so it never travels backwards.
+        if self.band_scroll.is_none() && self.wheel.is_none() && self.carrying.is_none() {
+            let offset = out.state.offset.y;
+            let still = (offset - self.last_offset).abs() < 0.01;
+            self.last_offset = offset;
+            if still {
+                if let Some((_, first)) = row_rects.first() {
+                    let over = first.top() - out.inner_rect.top();
+                    let pitch = ROW_HEIGHT + ui.spacing().item_spacing.y;
+                    if over < -0.5 {
+                        let to = if -over < pitch * 0.5 {
+                            offset + over
+                        } else {
+                            offset + over + pitch
+                        };
+                        self.snap = Some(to.clamp(0.0, reach));
+                    }
+                }
+            }
+        }
         self.carry(ui, &visible, &row_rects, out.inner_rect);
         self.wheel_scroll(ui, out.inner_rect, out.state.offset.y, reach);
         if let Some(index) = opened {
