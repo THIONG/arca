@@ -2788,11 +2788,19 @@ impl Arca {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(
+                // As tall as the buttons beside it, worked out the same way
+                // they work theirs out, and as wide as whatever is left between
+                // them and the edge. A thin box floating in a gap looked like
+                // something that had not finished loading.
+                let tall = (glyphs::SIZE + ui.spacing().button_padding.y * 2.0)
+                    .max(ui.spacing().interact_size.y);
+                let wide = ui.available_width();
+                ui.add_sized(
+                    egui::vec2(wide, tall),
                     egui::TextEdit::singleline(&mut self.filter)
                         .id(egui::Id::new("filter"))
-                        .hint_text(s.filter_hint)
-                        .desired_width(200.0),
+                        .vertical_align(egui::Align::Center)
+                        .hint_text(s.filter_hint),
                 );
             });
         });
@@ -4211,7 +4219,10 @@ fn main() -> eframe::Result<()> {
     // bar and the taskbar keep the generic one unless it is set here too.
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(size)
-        .with_min_inner_size([460.0, 240.0])
+        // Wide enough for the row of commands, now that every one of them says
+        // its name. Below this the filter box at the end of it has no width
+        // left to be given and the bar starts running off its own edge.
+        .with_min_inner_size([720.0, 320.0])
         .with_title("Arca");
     if let Ok(icon) = eframe::icon_data::from_png_bytes(ICON_PNG) {
         viewport = viewport.with_icon(icon);
