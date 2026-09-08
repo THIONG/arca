@@ -1072,6 +1072,13 @@ enum Job {
         archive: PathBuf,
         dest: PathBuf,
     },
+    Move {
+        archive: PathBuf,
+        // Pairs of what a name is now and what it becomes, without the slash a
+        // folder carries: both spellings are handled where the move is made.
+        moves: Vec<(String, String)>,
+        password: Option<String>,
+    },
     NewFolder {
         archive: PathBuf,
         // The whole path with the slash already on it, worked out where the
@@ -1515,6 +1522,40 @@ fn run_job_blocking(
             step_aside(&archive).map_err(|e| e.to_string())?;
             fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
             Ok(fill(s.added, &[("n", &n.to_string())]))
+        }
+        Job::Move {
+            archive,
+            moves,
+            password,
+        } => {
+            if detect(&archive) != Some(Format::Zip) {
+                return Err(s.only_zip_can_change.to_string());
+            }
+            let temp = archive.with_file_name(format!(
+                "{}.arca-new",
+                archive
+                    .file_name()
+                    .map(|x| x.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            ));
+            // All of them in one pass. Moving is renaming with a different
+            // folder in front, and renaming is a rewrite of the whole archive:
+            // five files moved one at a time would be five rewrites.
+            let done = arca_zip::rename_entries(
+                &archive,
+                &temp,
+                password.as_deref(),
+                &|e| moved_name(&e.name, &moves),
+                notify,
+            );
+            if let Err(e) = done {
+                let _ = fs::remove_file(&temp);
+                return Err(e.to_string());
+            }
+            step_aside(&archive).map_err(|e| e.to_string())?;
+            fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
+            // The list says where everything is now, which is the whole answer.
+            Ok(String::new())
         }
         Job::NewFolder {
             archive,
@@ -2076,6 +2117,32 @@ fn branch(
     }
 }
 
+/// What an entry is called after a move.
+///
+/// `moves` are pairs of paths without their trailing slash. A file matches one
+/// of them outright; a folder matches in two more ways, because the archive may
+/// carry an entry for the folder itself with a slash on the end and it
+/// certainly carries everything filed under it. All three have to move together
+/// or the branch comes apart.
+///
+/// Anything that matches nothing keeps its name, which is most of the archive:
+/// this is asked of every entry in it.
+fn moved_name(name: &str, moves: &[(String, String)]) -> String {
+    for (from, to) in moves {
+        if name == from {
+            return to.clone();
+        }
+        let under = format!("{from}/");
+        if name == under {
+            return format!("{to}/");
+        }
+        if let Some(rest) = name.strip_prefix(&under) {
+            return format!("{to}/{rest}");
+        }
+    }
+    name.to_string()
+}
+
 /// Whether a name is a folder's, which in a zip is the slash on the end of it
 /// and nothing else. Both slashes, because archives from Windows use theirs.
 fn is_folder_name(name: &str) -> bool {
@@ -2339,6 +2406,9 @@ struct Arca {
     // with the same word. Never written anywhere: see `default_password_window`.
     default_password: Option<String>,
     asking_default_password: bool,
+    // The selection while it is in the air: the top of what was picked when
+    // the drag began. Where it lands is not decided until the button comes up.
+    carrying: Option<Vec<String>>,
     // Set while the box that asks for a new folder's name is up, and what has
     // been typed into it.
     asking_folder: bool,
@@ -2455,6 +2525,7 @@ impl Arca {
             rename_fresh: false,
             default_password: None,
             asking_default_password: false,
+            carrying: None,
             asking_folder: false,
             folder_input: String::new(),
             undo: None,
@@ -3022,6 +3093,7 @@ impl Arca {
             Job::Rename { .. } => s.renaming.to_string(),
             Job::CopyTo { .. } => s.copying_word.to_string(),
             Job::NewFolder { .. } => s.adding.to_string(),
+            Job::Move { .. } => s.moving_word.to_string(),
             Job::Compress { .. } => s.compressing.to_string(),
             Job::Add { .. } => s.adding.to_string(),
         };
@@ -3033,6 +3105,7 @@ impl Arca {
                 | Job::Rename { .. }
                 | Job::CopyTo { .. }
                 | Job::NewFolder { .. }
+                | Job::Move { .. }
                 | Job::Add { .. }
         );
         // The file on disk is about to change, so the listing has to be redone.
@@ -3067,6 +3140,7 @@ impl Arca {
             Job::Add { archive, .. } => Some((archive.clone(), words.add_to_archive)),
             Job::Password { archive, .. } => Some((archive.clone(), words.password_word)),
             Job::NewFolder { archive, .. } => Some((archive.clone(), words.new_folder)),
+            Job::Move { archive, .. } => Some((archive.clone(), words.moving_word)),
             _ => None,
         };
 
@@ -5361,6 +5435,129 @@ impl Arca {
         }
     }
 
+    // The selection while it is being carried: what it is over, where it would
+    // land, and when it stops being this window's business.
+    //
+    // The whole window is inside. Leaving it -- which is the pointer going
+    // somewhere the toolkit stops hearing about -- is what says the selection
+    // is going to another program, and only then is the system's own drag
+    // started. That order matters: the system's drag takes the pointer the
+    // instant it begins, so starting it while still over the list would make
+    // dropping into a folder of this archive impossible.
+    fn carry(
+        &mut self,
+        ui: &mut egui::Ui,
+        visible: &[Row],
+        row_rects: &[(usize, egui::Rect)],
+        viewport: egui::Rect,
+    ) {
+        if self.carrying.is_none() {
+            return;
+        }
+        let (down, at) = ui.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos()));
+
+        // Gone from the window. Whatever happens now happens out there.
+        let Some(at) = at else {
+            if down {
+                let ctx = ui.ctx().clone();
+                self.carrying = None;
+                self.drag_out(&ctx);
+            } else {
+                self.carrying = None;
+            }
+            return;
+        };
+
+        // The folder under the pointer, if it is one and it is not one of the
+        // things being carried: dropping a folder into itself is not a move.
+        let carried = self.carrying.clone().unwrap_or_default();
+        let over = row_at(row_rects, at.y, visible.len())
+            .and_then(|i| visible.get(i))
+            .filter(|r| r.is_dir && viewport.contains(at))
+            .filter(|r| {
+                r.up || !carried
+                    .iter()
+                    .any(|c| c.trim_end_matches('/') == r.path.trim_end_matches('/'))
+            });
+
+        if !down {
+            self.carrying = None;
+            if let Some(row) = over {
+                let target = row.path.clone();
+                let ctx = ui.ctx().clone();
+                self.move_into(&ctx, &carried, &target);
+            }
+            return;
+        }
+
+        // While it is in the air: the folder it would go into is outlined, and
+        // the pointer says what would happen.
+        ui.ctx().set_cursor_icon(if over.is_some() {
+            egui::CursorIcon::Grabbing
+        } else {
+            egui::CursorIcon::NoDrop
+        });
+        if let Some(row) = over {
+            if let Some((_, rect)) = row_rects
+                .iter()
+                .find(|(i, _)| visible.get(*i).is_some_and(|r| r.path == row.path))
+            {
+                let accent = theme::cursor(ui.visuals());
+                ui.painter().rect_stroke(rect.shrink(1.0), 3.0, accent);
+            }
+        }
+    }
+
+    // Moves what was being carried into `target`, which is a folder's path or
+    // the empty string for the root.
+    //
+    // One job for all of it. A move is a rename with a different folder in
+    // front of it, and a rename is a rewrite of the whole archive: doing them
+    // one at a time would rewrite it once per file.
+    fn move_into(&mut self, ctx: &egui::Context, roots: &[String], target: &str) {
+        let Some(archive) = self.archive.clone() else {
+            return;
+        };
+        let s = self.s();
+        let mut moves: Vec<(String, String)> = Vec::new();
+        for root in roots {
+            let from = root.trim_end_matches('/').to_string();
+            let leaf = from.rsplit('/').next().unwrap_or(&from).to_string();
+            let to = format!("{}{leaf}", target);
+            // Already there, or into itself: nothing to do rather than a
+            // rewrite that changes nothing.
+            if from == to || to.starts_with(&format!("{from}/")) {
+                continue;
+            }
+            moves.push((from, to));
+        }
+        if moves.is_empty() {
+            return;
+        }
+        // Nothing in the destination may already answer to the name. The
+        // archive would take it -- a zip can hold the same name twice -- and
+        // what came out afterwards would be anybody's guess.
+        let taken: HashSet<&str> = self
+            .entries
+            .iter()
+            .map(|e| e.name.trim_end_matches('/'))
+            .collect();
+        if let Some((_, to)) = moves.iter().find(|(_, to)| taken.contains(to.as_str())) {
+            let leaf = to.rsplit('/').next().unwrap_or(to);
+            self.notice = fill(s.name_taken, &[("name", leaf)]);
+            self.error = true;
+            return;
+        }
+        self.run_job(
+            ctx,
+            Job::Move {
+                archive,
+                moves,
+                password: self.archive_password.clone(),
+            },
+        );
+    }
+
     // The wheel used as a button: press it and the list follows the pointer
     // until something puts it away.
     fn wheel_scroll(&mut self, ui: &mut egui::Ui, viewport: egui::Rect, offset: f32, reach: f32) {
@@ -5511,6 +5708,13 @@ impl Arca {
             )
         });
 
+        // Something is already in the air. The press that is on the books
+        // belongs to that gesture, and a band drawn from it would follow the
+        // pointer around underneath what is being carried.
+        if self.carrying.is_some() {
+            return;
+        }
+
         // Just back from a drag out of the window, with the button still down
         // as far as the toolkit knows. Nothing happens until it comes up for
         // real; the press that is still on the books belongs to a gesture that
@@ -5594,13 +5798,18 @@ impl Arca {
         }
 
         // Far enough to be a gesture, and it began on something picked: the
-        // selection is being carried out of the window, not redrawn.
+        // selection is being carried somewhere, not redrawn.
+        //
+        // Where it is going is not decided yet. Inside the window it is a move
+        // into another folder of this archive; outside it is a drag into
+        // whatever is out there, and that one cannot be started early because
+        // the moment it is, the system takes the pointer and there is no way
+        // back into the list.
         if self.drag_ready.take().is_some() {
             self.band = None;
             self.band_anchor = None;
             self.band_scroll = None;
-            let ctx = ui.ctx().clone();
-            self.drag_out(&ctx);
+            self.carrying = Some(self.selected_roots());
             return;
         }
 
@@ -6675,6 +6884,7 @@ impl Arca {
             out.state.offset.y,
             reach,
         );
+        self.carry(ui, &visible, &row_rects, out.inner_rect);
         self.wheel_scroll(ui, out.inner_rect, out.state.offset.y, reach);
         if let Some(index) = opened {
             let target = &visible[index];
@@ -6955,6 +7165,33 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A move is a rename with a different folder in front of it, asked of every
+    // entry in the archive. The three ways a folder can turn up in that list
+    // have to move together, and everything else has to come through untouched:
+    // a prefix matched too eagerly here would quietly re-file half the archive.
+    #[test]
+    fn moving_carries_a_whole_branch_and_leaves_everything_else_alone() {
+        let moves = vec![
+            ("docs/notas".to_string(), "notas".to_string()),
+            ("leeme.txt".to_string(), "docs/leeme.txt".to_string()),
+        ];
+        let of = |n: &str| moved_name(n, &moves);
+
+        // The folder, both ways it can be written, and what is under it.
+        assert_eq!(of("docs/notas"), "notas");
+        assert_eq!(of("docs/notas/"), "notas/");
+        assert_eq!(of("docs/notas/uno.md"), "notas/uno.md");
+        assert_eq!(of("docs/notas/dos/tres.md"), "notas/dos/tres.md");
+        // A file on its own.
+        assert_eq!(of("leeme.txt"), "docs/leeme.txt");
+        // Everything else, including names that begin the same way and are not
+        // the same folder at all.
+        assert_eq!(of("docs/notas2/otro.md"), "docs/notas2/otro.md");
+        assert_eq!(of("docs/uno.txt"), "docs/uno.txt");
+        assert_eq!(of("leeme.txt.bak"), "leeme.txt.bak");
+        assert_eq!(of("otra/cosa.bin"), "otra/cosa.bin");
+    }
 
     #[test]
     fn the_attribute_letters_hold_their_places() {
