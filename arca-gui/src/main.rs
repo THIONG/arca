@@ -3299,22 +3299,36 @@ impl Arca {
             ui.ctx().request_repaint();
         }
 
+        // Windows says which way the list is going with the pointer itself: an
+        // arrow up while it runs up, down while it runs down, and both ways
+        // while it stands still. There is no asking the system for those --
+        // they live in its own resources, and the toolkit offers one
+        // double-headed arrow and no way to tell it apart from a resize -- so
+        // the real pointer is put away here and this one drawn in its place.
+        //
+        // On its own layer rather than on the table's, because the hand is free
+        // to wander off the list while the gesture runs and a pointer that
+        // vanished at the edge of it would be worse than no pointer at all.
+        ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+        let paint = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("arca-wheel"),
+        ));
+
         // The anchor, left where the wheel went down: a ring with an arrow out
-        // of the top and one out of the bottom, which is what Windows draws,
-        // so it reads as the same gesture rather than as something of ours.
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        // of the top and one out of the bottom, which is the mark Windows
+        // leaves, so it reads as the same gesture rather than as one of ours.
         let ink = ui.visuals().weak_text_color();
-        let painter = ui.painter();
-        painter.circle(
+        paint.circle(
             wheel.anchor,
             10.0,
             ui.visuals().panel_fill,
             egui::Stroke::new(1.0_f32, ink),
         );
-        painter.circle_filled(wheel.anchor, 1.5, ink);
+        paint.circle_filled(wheel.anchor, 1.5, ink);
         for up in [1.0_f32, -1.0] {
             let tip = wheel.anchor.y - up * 6.5;
-            painter.add(egui::Shape::convex_polygon(
+            paint.add(egui::Shape::convex_polygon(
                 vec![
                     egui::pos2(wheel.anchor.x - 3.0, tip + up * 3.0),
                     egui::pos2(wheel.anchor.x + 3.0, tip + up * 3.0),
@@ -3323,6 +3337,32 @@ impl Arca {
                 ink,
                 egui::Stroke::NONE,
             ));
+        }
+
+        // Pale with a dark edge, the way every pointer is drawn: it has to be
+        // seen over a picked row as easily as over an empty list, and neither
+        // theme gets a say in what a pointer looks like.
+        let face = egui::Color32::WHITE;
+        let edge = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(30));
+        let arrow = |down: f32, base: f32, tip: f32| {
+            egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(at.x - 5.0, at.y + down * base),
+                    egui::pos2(at.x + 5.0, at.y + down * base),
+                    egui::pos2(at.x, at.y + down * tip),
+                ],
+                face,
+                edge,
+            )
+        };
+        if speed < 0.0 {
+            paint.add(arrow(-1.0, 1.0, 11.0));
+        } else if speed > 0.0 {
+            paint.add(arrow(1.0, 1.0, 11.0));
+        } else {
+            // Still: both ways at once, held apart to leave the hot spot clear.
+            paint.add(arrow(-1.0, 3.0, 12.0));
+            paint.add(arrow(1.0, 3.0, 12.0));
         }
     }
 
