@@ -1289,38 +1289,6 @@ struct Wheel {
     moved: bool,
 }
 
-/// Keeps the handles that resize the columns in the header, where every file
-/// list on the machine keeps them.
-///
-/// `egui_extras` hangs each one down the whole height of the table instead, a
-/// hand's width either side of the rule. With six columns that is six invisible
-/// strips running the length of the list, and pressing on one of them anywhere
-/// in the rows grabbed a column edge rather than starting a selection: the
-/// three narrow columns on the right are almost nothing but strip.
-///
-/// The handles are simply asked for again here over the header alone. A widget
-/// offered twice in the same frame keeps the last rectangle it was given, and
-/// that is the one the next frame decides what the pointer is on with; the rule
-/// itself is painted separately and still runs the full height.
-fn resize_from_the_header_only(ui: &mut egui::Ui, heads: &[egui::Rect]) {
-    let Some(first) = heads.first() else {
-        return;
-    };
-    // The same reach the table gave them, so the edges are no harder to catch
-    // in the header than they were before, and the same half gap, because the
-    // rule is drawn down the middle of the space between two cells.
-    let grab = ui.style().interaction.resize_grab_radius_side;
-    let half = ui.spacing().item_spacing.x * 0.5;
-    let band = first.y_range();
-    // The last column has no edge of its own: it ends where the table does.
-    for (i, cell) in heads.iter().enumerate().take(heads.len().saturating_sub(1)) {
-        let x = cell.right() + half;
-        let id = ui.id().with("resize_column").with(i);
-        let rect = egui::Rect::from_x_y_ranges((x - grab)..=(x + grab), band);
-        ui.interact(rect, id, egui::Sense::click_and_drag());
-    }
-}
-
 /// How fast the list should run, in pixels a second, for a pointer `away`
 /// pixels from the anchor. Negative runs it up.
 ///
@@ -3857,9 +3825,6 @@ impl Arca {
 
 
         let mut requested: Option<SortColumn> = None;
-        // Where each header cell ended up. What says where the column edges
-        // are, which is where the handles that resize them belong.
-        let mut heads: Vec<egui::Rect> = Vec::new();
         let mut opened: Option<usize> = None;
         let mut clicked: Option<usize> = None;
         // Only the left button, and only from a row. The row menu also fills in
@@ -3983,8 +3948,7 @@ impl Arca {
                     }
                 };
                 let mut resp = None;
-                let (cell, _) = h.col(|ui| resp = Some(head(ui, s.col_name, SortColumn::Name)));
-                heads.push(cell);
+                h.col(|ui| resp = Some(head(ui, s.col_name, SortColumn::Name)));
                 if let Some(r) = resp {
                     if r.clicked() {
                         requested = Some(SortColumn::Name);
@@ -3993,9 +3957,7 @@ impl Arca {
                 }
                 for which in &shown {
                     let mut resp = None;
-                    let (cell, _) =
-                        h.col(|ui| resp = Some(head(ui, Columns::label(*which, s), *which)));
-                    heads.push(cell);
+                    h.col(|ui| resp = Some(head(ui, Columns::label(*which, s), *which)));
                     if let Some(r) = resp {
                         if r.clicked() {
                             requested = Some(*which);
@@ -4260,7 +4222,6 @@ impl Arca {
         // takes in, and how far down the list it currently sits: both are what
         // a drag needs to know when it reaches an edge.
         let reach = (out.content_size.y - out.inner_rect.height()).max(0.0);
-        resize_from_the_header_only(ui, &heads);
         self.rubber_band(ui, &visible, &row_rects, out.inner_rect, out.state.offset.y, reach);
         self.wheel_scroll(ui, out.inner_rect, out.state.offset.y, reach);
         if let Some(index) = opened {
