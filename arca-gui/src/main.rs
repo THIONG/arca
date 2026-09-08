@@ -1199,8 +1199,10 @@ fn run_job_blocking(
                 return Err(e.to_string());
             }
             fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
-            let leaf = to.rsplit('/').next().unwrap_or(&to).to_string();
-            Ok(fill(s.renamed, &[("name", &leaf)]))
+            // Nothing to say: the new name is in the list, which is where the
+            // eye already is. An empty word here leaves the summary of the
+            // archive standing, which is what the bar is for.
+            Ok(String::new())
         }
         Job::Compress {
             out,
@@ -4865,7 +4867,10 @@ impl Arca {
             &visible,
             s,
             table_top,
-            out.inner_rect.bottom(),
+            // The foot of the panel, not the foot of the rows: the rules run the
+            // whole height of the list and the list now ends where the window
+            // does.
+            ui.max_rect().bottom(),
         );
         self.rubber_band(ui, &visible, &row_rects, out.inner_rect, out.state.offset.y, reach);
         self.wheel_scroll(ui, out.inner_rect, out.state.offset.y, reach);
@@ -5019,7 +5024,13 @@ impl eframe::App for Arca {
                     }
                     });
                 });
-                egui::CentralPanel::default().show(ctx, |ui| {
+                // No gap under the list: it ends against the status bar, the
+                // way a file list ends against the bottom of its window
+                // everywhere else. The margin left there was the reason the
+                // rules between the columns stopped short of the foot.
+                let mut frame = egui::Frame::central_panel(&ctx.style());
+                frame.inner_margin.bottom = 0.0;
+                egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
                     if self.entries.is_empty() {
                         let text = self.s().drop_here;
                         ui.centered_and_justified(|ui| {
