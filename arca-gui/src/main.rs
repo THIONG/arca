@@ -908,6 +908,18 @@ enum Job {
         names: Vec<String>,
         password: Option<String>,
     },
+    Rename {
+        archive: PathBuf,
+        // Both are full paths inside the archive, not the names on their own:
+        // renaming happens in the folder you are looking at and the entries are
+        // stored by their whole path.
+        from: String,
+        to: String,
+        // A folder is not one entry but everything filed under it, so the whole
+        // branch moves. There is no entry for it to be renamed on its own.
+        folder: bool,
+        password: Option<String>,
+    },
     Compress {
         out: PathBuf,
         inputs: Vec<PathBuf>,
@@ -1124,6 +1136,57 @@ fn run_job_blocking(
             }
             fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
             Ok(fill(s.deleted, &[("n", &gone.to_string())]))
+        }
+        Job::Rename {
+            archive,
+            from,
+            to,
+            folder,
+            password,
+        } => {
+            if detect(&archive) != Some(Format::Zip) {
+                return Err(s.only_zip_can_change.to_string());
+            }
+            let temp = archive.with_file_name(format!(
+                "{}.arca-new",
+                archive
+                    .file_name()
+                    .map(|x| x.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            ));
+            // A folder answers to two spellings: some tools file an entry for
+            // the folder itself with a slash on the end, others only file what
+            // is inside it. Both have to move, and neither can be assumed.
+            let under = format!("{from}/");
+            let moved = format!("{to}/");
+            let rename = |name: &str| -> String {
+                if !folder {
+                    return if name == from { to.clone() } else { name.to_string() };
+                }
+                if name == from {
+                    to.clone()
+                } else if name == under {
+                    moved.clone()
+                } else if let Some(rest) = name.strip_prefix(&under) {
+                    format!("{moved}{rest}")
+                } else {
+                    name.to_string()
+                }
+            };
+            let done = arca_zip::rename_entries(
+                &archive,
+                &temp,
+                password.as_deref(),
+                &|e| rename(&e.name),
+                notify,
+            );
+            if let Err(e) = done {
+                let _ = fs::remove_file(&temp);
+                return Err(e.to_string());
+            }
+            fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
+            let leaf = to.rsplit('/').next().unwrap_or(&to).to_string();
+            Ok(fill(s.renamed, &[("name", &leaf)]))
         }
         Job::Compress {
             out,
@@ -1353,6 +1416,60 @@ struct Wheel {
     moved: bool,
 }
 
+/// The name of a row, opened for editing where it stands.
+///
+/// In the row rather than in a dialog, because that is where the name is and
+/// where the eye already is: WinRAR and the Explorer both do it here. Enter
+/// keeps what was typed, Escape throws it away, and so does clicking somewhere
+/// else -- a rename abandoned by looking away has to be abandoned, not left
+/// half open on a row nobody is looking at any more.
+///
+/// `fresh` is true on the first frame only. That is when the box takes the
+/// keyboard and picks out the part of the name before the extension, which is
+/// the part anybody renaming a file means to change; the extension stays behind
+/// the cursor, ready to be kept.
+fn name_box(
+    ui: &mut egui::Ui,
+    typing: &std::cell::RefCell<String>,
+    fresh: &std::cell::Cell<bool>,
+    finish: &std::cell::Cell<Option<bool>>,
+) {
+    let id = egui::Id::new("arca-rename");
+    let mut text = typing.borrow_mut();
+    let field = ui.add(
+        egui::TextEdit::singleline(&mut *text)
+            .id(id)
+            .desired_width(ui.available_width())
+            .vertical_align(egui::Align::Center),
+    );
+    if fresh.get() {
+        field.request_focus();
+        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
+            // The stem, or the whole thing when there is no extension to keep
+            // out of the way. A leading dot is not an extension, it is how a
+            // file asks to be left alone.
+            let stem = text.rfind('.').filter(|at| *at > 0).unwrap_or(text.len());
+            let upto = text[..stem].chars().count();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(upto),
+                )));
+            state.store(ui.ctx(), id);
+        }
+        fresh.set(false);
+    }
+    if field.lost_focus() {
+        // Losing the keyboard to Enter is finishing; losing it any other way --
+        // Tab, a click elsewhere -- is walking away.
+        let kept = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        finish.set(Some(kept));
+    } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        finish.set(Some(false));
+    }
+}
+
 /// How fast the list should run, in pixels a second, for a pointer `away`
 /// pixels from the anchor. Negative runs it up.
 ///
@@ -1443,6 +1560,13 @@ struct Arca {
     // button really does come up.
     drag_settling: bool,
     band_scroll: Option<f32>,
+    // The entry being renamed and what has been typed into it so far. Held by
+    // path rather than by row number so that sorting or filtering underneath a
+    // half typed name cannot move the box onto somebody else's row.
+    renaming: Option<(String, String)>,
+    // True for the first frame of a rename, when the box has to be given the
+    // keyboard and the part of the name before the extension picked out.
+    rename_fresh: bool,
     // Set while the wheel is being used to walk the list up and down.
     wheel: Option<Wheel>,
     // The last row a left click landed on, and when. What tells a second click
@@ -1528,6 +1652,8 @@ impl Arca {
             drag_ready: None,
             drag_settling: false,
             band_scroll: None,
+            renaming: None,
+            rename_fresh: false,
             wheel: None,
             last_click: None,
             cut_armed: None,
@@ -1699,12 +1825,17 @@ impl Arca {
             Job::Test(_) => s.testing.to_string(),
             Job::Password { .. } => s.changing_password.to_string(),
             Job::Delete { .. } => s.deleting.to_string(),
+            Job::Rename { .. } => s.renaming.to_string(),
             Job::Compress { .. } => s.compressing.to_string(),
             Job::Add { .. } => s.adding.to_string(),
         };
         self.close_when_done = !matches!(
             job,
-            Job::Test(_) | Job::Password { .. } | Job::Delete { .. } | Job::Add { .. }
+            Job::Test(_)
+                | Job::Password { .. }
+                | Job::Delete { .. }
+                | Job::Rename { .. }
+                | Job::Add { .. }
         );
         // The file on disk is about to change, so the listing has to be redone.
         if let Job::Password { archive, new, .. } = &job {
@@ -1714,6 +1845,9 @@ impl Arca {
             self.after_password = Some((archive.clone(), password.clone()));
         }
         if let Job::Add { archive, password, .. } = &job {
+            self.after_password = Some((archive.clone(), password.clone()));
+        }
+        if let Job::Rename { archive, password, .. } = &job {
             self.after_password = Some((archive.clone(), password.clone()));
         }
 
@@ -3101,7 +3235,7 @@ impl Arca {
                 // The keys are spelled out rather than drawn with the arrows
                 // and the page symbols: Consolas has the four arrows and not
                 // the page ones, so half of that line came out as hollow boxes.
-                let left: [(&str, &str); 13] = [
+                let left: [(&str, &str); 14] = [
                     ("Ctrl+O", s.open),
                     ("Ctrl+N", s.compress),
                     ("Ctrl+E", s.extract_all),
@@ -3113,6 +3247,7 @@ impl Arca {
                     ("Ctrl+I", s.invert_selection),
                     ("Esc", s.clear_selection),
                     ("Space", s.toggle_word),
+                    ("F2", s.rename_word),
                     ("Supr", s.delete_word),
                     ("F1", s.shortcuts_title),
                 ];
@@ -3303,6 +3438,54 @@ impl Arca {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
+    }
+
+    // What a finished rename does with what was typed.
+    //
+    // The checks are the ones the archive cannot make for itself: a name is a
+    // name and not a path, nothing else in this folder is already called that,
+    // and a rename to the same name is not a rewrite of the whole archive for
+    // nothing. Anything else the zip will refuse on its own and say so.
+    fn rename_to(&mut self, ctx: &egui::Context, rows: &[Row], path: &str, name: &str) {
+        let Some(row) = rows.iter().find(|r| r.path == path) else {
+            return;
+        };
+        if name == row.label {
+            return;
+        }
+        let s = self.s();
+        if name.is_empty() || name.contains('/') || name.contains('\\') {
+            self.notice = s.bad_name.to_string();
+            self.error = true;
+            return;
+        }
+        // Only against what is in this folder: the same name elsewhere in the
+        // archive is somebody else's business.
+        if rows
+            .iter()
+            .any(|r| r.path != path && r.label.eq_ignore_ascii_case(name))
+        {
+            self.notice = fill(s.name_taken, &[("name", name)]);
+            self.error = true;
+            return;
+        }
+        let to = match path.rsplit_once('/') {
+            Some((parent, _)) => format!("{parent}/{name}"),
+            None => name.to_string(),
+        };
+        let Some(archive) = self.archive.clone() else {
+            return;
+        };
+        self.run_job(
+            ctx,
+            Job::Rename {
+                archive,
+                from: path.to_string(),
+                to,
+                folder: row.is_dir,
+                password: self.archive_password.clone(),
+            },
+        );
     }
 
     // The rule between two columns, and the handle that moves it.
@@ -3777,6 +3960,7 @@ impl Arca {
         let mut check_all = false;
         let mut invert = false;
         let mut typed = String::new();
+        let mut rename = false;
 
         ctx.input(|i| {
             let at = self.cursor.unwrap_or(0);
@@ -3801,6 +3985,7 @@ impl Arca {
                     }
                 }
             }
+            rename = i.key_pressed(egui::Key::F2);
             enter = i.key_pressed(egui::Key::Enter);
             space = i.key_pressed(egui::Key::Space);
             up_level = i.key_pressed(egui::Key::Backspace)
@@ -3873,6 +4058,15 @@ impl Arca {
         let Some(at) = self.cursor else { return };
         let Some(row) = rows.get(at) else { return };
 
+        // F2 opens the name for editing where it stands, which is what it does
+        // in WinRAR and in the Explorer. Only a zip can be written to, so
+        // anywhere else it does nothing rather than opening a box that would
+        // have to say no afterwards.
+        if rename && self.format == Format::Zip {
+            self.renaming = Some((row.path.clone(), row.label.clone()));
+            self.rename_fresh = true;
+            return;
+        }
         if space {
             let value = !self.is_checked(row);
             self.set_checked(row, value);
@@ -3994,6 +4188,16 @@ impl Arca {
         // while the table still holds it.
         let wants_extract = std::cell::Cell::new(false);
         let wants_delete = std::cell::Cell::new(false);
+        // The rename in progress, unpacked into pieces the row closure can hold
+        // while the table still has `self`. `finish` is how the box says it is
+        // done: yes to keep what was typed, no to throw it away.
+        let editing: Option<String> = self.renaming.as_ref().map(|(p, _)| p.clone());
+        let typing = std::cell::RefCell::new(
+            self.renaming.as_ref().map_or(String::new(), |(_, t)| t.clone()),
+        );
+        let fresh = std::cell::Cell::new(self.rename_fresh);
+        let finish: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
+        let wants_rename = std::cell::Cell::new(false);
         let wants_copy_names = std::cell::Cell::new(false);
         let wants_clip: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
         let wants_paste = std::cell::Cell::new(false);
@@ -4187,6 +4391,10 @@ impl Arca {
                             None => draw_icon(ui, r.kind),
                         }
                         ui.add_space(4.0);
+                        if editing.as_deref() == Some(r.path.as_str()) {
+                            name_box(ui, &typing, &fresh, &finish);
+                            return;
+                        }
                         let text = if r.is_dir {
                             egui::RichText::new(&r.label).strong()
                         } else {
@@ -4256,6 +4464,15 @@ impl Arca {
                             ui.close_menu();
                         }
                         ui.separator();
+                        // Only a zip can be written to, so anywhere else this
+                        // is left out rather than offered and refused.
+                        if self.format == Format::Zip
+                            && ui.button(format!("{}	F2", s.rename_word)).clicked()
+                        {
+                            clicked = Some(idx);
+                            wants_rename.set(true);
+                            ui.close_menu();
+                        }
                         if ui.button(format!("{}	Supr", s.delete_word)).clicked() {
                             wants_delete.set(true);
                             ui.close_menu();
@@ -4386,6 +4603,30 @@ impl Arca {
             let names = self.selected_names();
             if !names.is_empty() {
                 self.confirm_delete = Some(names);
+            }
+        }
+        // The menu asked for a rename of the row it was opened on.
+        if wants_rename.get() {
+            if let Some(row) = clicked.and_then(|i| visible.get(i)) {
+                self.renaming = Some((row.path.clone(), row.label.clone()));
+                self.rename_fresh = true;
+            }
+        }
+        // What the box in the row typed, and whether it was finished or walked
+        // away from. Done here rather than inside the table because starting a
+        // job needs `self` and the table still had it.
+        self.rename_fresh = fresh.get();
+        if let Some((path, _)) = self.renaming.clone() {
+            let text = typing.borrow().clone();
+            self.renaming = Some((path.clone(), text.clone()));
+            match finish.get() {
+                None => {}
+                Some(false) => self.renaming = None,
+                Some(true) => {
+                    self.renaming = None;
+                    let ctx = ui.ctx().clone();
+                    self.rename_to(&ctx, &visible, &path, text.trim());
+                }
             }
         }
         if wants_extract.get() {

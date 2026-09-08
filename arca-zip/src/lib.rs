@@ -1022,7 +1022,7 @@ pub fn rewrite_password(
     new: Option<&str>,
     notify: &dyn Fn(usize, usize, &str),
 ) -> Result<u64> {
-    rewrite(archive, out, current, new, &|_| true, &[], notify)
+    rewrite(archive, out, current, new, &|_| true, &keep_name, &[], notify)
 }
 
 /// A file on disk waiting to go into an archive: where to read it from, the
@@ -1060,6 +1060,7 @@ pub fn add_entries(
         password,
         password,
         &|e| !taken.contains(e.name.as_str()),
+        &keep_name,
         extra,
         notify,
     )
@@ -1079,15 +1080,44 @@ pub fn remove_entries(
     keep: &dyn Fn(&Entry) -> bool,
     notify: &dyn Fn(usize, usize, &str),
 ) -> Result<u64> {
-    rewrite(archive, out, password, password, keep, &[], notify)
+    rewrite(archive, out, password, password, keep, &keep_name, &[], notify)
 }
 
+/// The name an entry keeps when nothing is being renamed.
+fn keep_name(e: &Entry) -> String {
+    e.name.clone()
+}
+
+/// Writes a copy of `archive` at `out` with every entry under whatever name
+/// `name` gives it.
+///
+/// The same rebuild as [`remove_entries`], and for the same reason: an entry's
+/// name is written twice, once beside the data and once in the central
+/// directory at the end, and the second copy records how far into the file the
+/// first one sits. Change the length of a name in place and every offset after
+/// it is a lie. Nothing is compressed again; the bytes are copied through.
+///
+/// Renaming a folder is renaming everything under it, which is the caller's
+/// business: `name` is asked about every entry, so a caller that wants a whole
+/// branch moved answers for the branch.
+pub fn rename_entries(
+    archive: &std::path::Path,
+    out: &std::path::Path,
+    password: Option<&str>,
+    name: &dyn Fn(&Entry) -> String,
+    notify: &dyn Fn(usize, usize, &str),
+) -> Result<u64> {
+    rewrite(archive, out, password, password, &|_| true, name, &[], notify)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn rewrite(
     archive: &std::path::Path,
     out: &std::path::Path,
     current: Option<&str>,
     new: Option<&str>,
     keep: &dyn Fn(&Entry) -> bool,
+    name: &dyn Fn(&Entry) -> String,
     extra: &[Addition],
     notify: &dyn Fn(usize, usize, &str),
 ) -> Result<u64> {
@@ -1115,7 +1145,7 @@ fn rewrite(
             e.crc32
         };
         let mut src = BufReader::with_capacity(STREAM_BUF, File::open(archive)?);
-        w.copy_entry(&e.name, crc, e.size, e.method, e.mtime, pw, |sink| {
+        w.copy_entry(&name(e), crc, e.size, e.method, e.mtime, pw, |sink| {
             copy_compressed(&mut src, e, sink, current)
         })?;
         bytes += e.size;
@@ -1634,6 +1664,58 @@ mod tests {
             !s.contains('\u{FFFD}'),
             "CP437 has no gaps: no replacement character should appear"
         );
+    }
+
+    // A renamed entry has to come out the other side byte for byte. The name is
+    // written twice in a zip and the second copy says how far into the file the
+    // first one is, so a rename that only changed one of them would leave an
+    // archive that still opens and gives back rubbish.
+    #[test]
+    fn renaming_an_entry_leaves_its_bytes_alone_and_carries_a_whole_folder() {
+        let room = std::env::temp_dir().join(format!("arca-rename-{}", std::process::id()));
+        std::fs::create_dir_all(&room).unwrap();
+
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        for name in ["notes.txt", "old/one.bin", "old/deep/two.bin"] {
+            let body = format!("body of {name} ").repeat(40).into_bytes();
+            w.add(name, &body[..], Codec::Deflate, Level::Normal, None).unwrap();
+        }
+        let archive = room.join("a.zip");
+        std::fs::write(&archive, w.finish().unwrap().into_inner()).unwrap();
+
+        let out = room.join("b.zip");
+        rename_entries(
+            &archive,
+            &out,
+            None,
+            &|e| {
+                if e.name == "notes.txt" {
+                    // A name that is longer than the one it replaces, which is
+                    // what moves every offset after it.
+                    "a much longer name.txt".to_string()
+                } else if let Some(rest) = e.name.strip_prefix("old/") {
+                    format!("new/{rest}")
+                } else {
+                    e.name.clone()
+                }
+            },
+            &|_, _, _| {},
+        )
+        .unwrap();
+
+        let mut a = ZipArchive::open(std::fs::File::open(&out).unwrap()).unwrap();
+        let names: Vec<String> = a.entries().iter().map(|e| e.name.clone()).collect();
+        assert_eq!(
+            names,
+            ["a much longer name.txt", "new/one.bin", "new/deep/two.bin"]
+        );
+        for (i, was) in ["notes.txt", "old/one.bin", "old/deep/two.bin"].iter().enumerate() {
+            let mut got = Vec::new();
+            a.extract_to(i, &mut got).unwrap();
+            assert_eq!(got, format!("body of {was} ").repeat(40).into_bytes());
+        }
+
+        let _ = std::fs::remove_dir_all(&room);
     }
 
     // Pasting into an archive rewrites it, so what was already inside has to
