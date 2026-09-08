@@ -171,16 +171,11 @@ fn round(v: &mut Visuals) {
 /// one is spoken for as the text colour of a picked row. Where the keyboard is
 /// and what is picked are two different things and they need two colours, or
 /// moving the cursor onto a picked row makes both of them disappear.
-/// `on_selection` says the row underneath is already filled with the selection
-/// colour. The mark has to be told apart from what it sits on, and a pale blue
-/// outline on a blue row is a line nobody can see: there it becomes white,
-/// which is the colour that row's own text is already wearing.
-pub fn cursor(v: &Visuals, on_selection: bool) -> Stroke {
-    let color = match (v.dark_mode, on_selection) {
-        (true, false) => rgb(0x7FA6F0),
-        (true, true) => Color32::WHITE,
-        (false, false) => ACCENT_LIGHT,
-        (false, true) => rgb(0x10141B),
+pub fn cursor(v: &Visuals) -> Stroke {
+    let color = if v.dark_mode {
+        rgb(0x7FA6F0)
+    } else {
+        ACCENT_LIGHT
     };
     Stroke::new(1.0_f32, color)
 }
