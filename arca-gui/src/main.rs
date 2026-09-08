@@ -6820,7 +6820,12 @@ impl Arca {
                         left_click = Some(idx);
                     }
                     row_rects.push((idx, resp.rect));
-                    if self.cursor == Some(idx) {
+                    // Only where the keyboard is somewhere the fill is not
+                    // already saying. Where you are and what is picked are two
+                    // different things and usually need two marks, but on a row
+                    // that is both they say the same thing twice: an outline
+                    // drawn inside the blue is a box around a box.
+                    if self.cursor == Some(idx) && !self.is_checked(r) {
                         cursor_rect.set(Some(resp.rect));
                     }
                     // Only when the keyboard moved it: doing this every frame
