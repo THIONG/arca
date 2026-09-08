@@ -5652,7 +5652,7 @@ impl Arca {
                 .iter()
                 .find(|(i, _)| visible.get(*i).is_some_and(|r| r.path == row.path))
             {
-                let accent = theme::cursor(ui.visuals());
+                let accent = theme::cursor(ui.visuals(), false);
                 ui.painter().rect_stroke(rect.shrink(1.0), 3.0, accent);
             }
         }
@@ -6045,7 +6045,7 @@ impl Arca {
             band.intersect(viewport),
             0.0,
             fill,
-            theme::cursor(ui.visuals()),
+            theme::cursor(ui.visuals(), false),
         );
     }
 
@@ -6404,7 +6404,7 @@ impl Arca {
         let picked = std::cell::Cell::new(false);
         // The row the cursor is on, painted after the table: the highlight now
         // belongs to the ticks, so the cursor needs a mark of its own.
-        let cursor_rect: std::cell::Cell<Option<egui::Rect>> = std::cell::Cell::new(None);
+        let cursor_rect: std::cell::Cell<Option<(egui::Rect, bool)>> = std::cell::Cell::new(None);
         // Paired with the index they came from. `body.rows` only builds the
         // ones on screen, so after any scrolling these do not start at nought.
         let mut row_rects: Vec<(usize, egui::Rect)> = Vec::with_capacity(visible.len());
@@ -6820,13 +6820,11 @@ impl Arca {
                         left_click = Some(idx);
                     }
                     row_rects.push((idx, resp.rect));
-                    // Only where the keyboard is somewhere the fill is not
-                    // already saying. Where you are and what is picked are two
-                    // different things and usually need two marks, but on a row
-                    // that is both they say the same thing twice: an outline
-                    // drawn inside the blue is a box around a box.
-                    if self.cursor == Some(idx) && !self.is_checked(r) {
-                        cursor_rect.set(Some(resp.rect));
+                    // Kept with whether the row is also picked: the mark is
+                    // drawn in whichever colour can be seen against what is
+                    // underneath it.
+                    if self.cursor == Some(idx) {
+                        cursor_rect.set(Some((resp.rect, self.is_checked(r))));
                     }
                     // Only when the keyboard moved it: doing this every frame
                     // would fight the scroll wheel.
@@ -6987,7 +6985,7 @@ impl Arca {
         // cell by cell, each spread half the gap between columns wider than its
         // column so that the row comes out unbroken, and that is the shape the
         // outline has to follow.
-        if let Some(rect) = cursor_rect.get() {
+        if let Some((rect, picked)) = cursor_rect.get() {
             let half = ui.spacing().item_spacing * 0.5;
             let here = egui::Rect::from_x_y_ranges(
                 out.inner_rect.expand(half.x).x_range(),
@@ -7004,7 +7002,7 @@ impl Arca {
             ui.painter().with_clip_rect(out.inner_rect).rect_stroke(
                 here.shrink(0.5),
                 0.0,
-                theme::cursor(ui.visuals()),
+                theme::cursor(ui.visuals(), picked),
             );
         }
 
