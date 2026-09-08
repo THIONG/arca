@@ -421,6 +421,117 @@ fn from_cp437(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The two times a zip does not have room for in its header.
+#[derive(Default, PartialEq, Eq, Debug)]
+struct Times {
+    created: Option<i64>,
+    accessed: Option<i64>,
+}
+
+/// A Windows FILETIME as seconds since 1970.
+///
+/// It counts hundreds of nanoseconds from the first day of 1601, which is a
+/// unit and an epoch nothing else uses. Zero means "not recorded" rather than
+/// the year 1601, which is what every tool that writes one of these means by
+/// leaving it empty.
+fn filetime_to_unix(ticks: u64) -> Option<i64> {
+    if ticks == 0 {
+        return None;
+    }
+    Some((ticks / 10_000_000) as i64 - 11_644_473_600)
+}
+
+/// Reads the creation and access times out of an entry's extra fields.
+///
+/// Two spellings, because the two halves of the world that write zips do not
+/// agree. Windows writes 0x000A, a block of three Windows FILETIMEs; the unix
+/// tools write 0x5455, a flag byte saying which of the three are there followed
+/// by that many 32-bit unix times. Neither is required and most archives carry
+/// neither, so the answer is usually nothing at all.
+///
+/// Anything malformed is skipped rather than refused. These fields are a
+/// courtesy from whoever wrote the archive and a wrong one is not a reason to
+/// stop reading it.
+fn read_times(extra: &[u8]) -> Times {
+    let mut out = Times::default();
+    let mut x = Cursor::new(extra);
+    while x.remaining() >= 4 {
+        let Ok(id) = x.u16le("extra field id") else {
+            break;
+        };
+        let Ok(size_val) = x.u16le("extra field size") else {
+            break;
+        };
+        let size_val = size_val as usize;
+        if size_val > x.remaining() {
+            break;
+        }
+        let Ok(body) = x.bytes(size_val, "extra field body") else {
+            break;
+        };
+        match id {
+            // NTFS: four reserved bytes, then tagged blocks. Tag 1 holds the
+            // three times in the order the file system keeps them.
+            0x000A => {
+                let mut n = Cursor::new(body);
+                if n.skip(4, "reserved").is_err() {
+                    continue;
+                }
+                while n.remaining() >= 4 {
+                    let (Ok(tag), Ok(len)) = (n.u16le("tag"), n.u16le("tag size")) else {
+                        break;
+                    };
+                    let len = len as usize;
+                    if len > n.remaining() {
+                        break;
+                    }
+                    if tag == 0x0001 && len >= 24 {
+                        let Ok(block) = n.bytes(len, "times") else {
+                            break;
+                        };
+                        let mut t = Cursor::new(block);
+                        let _mtime = t.u64le("mtime");
+                        if let Ok(v) = t.u64le("atime") {
+                            out.accessed = filetime_to_unix(v);
+                        }
+                        if let Ok(v) = t.u64le("ctime") {
+                            out.created = filetime_to_unix(v);
+                        }
+                        break;
+                    }
+                    if n.skip(len, "tag body").is_err() {
+                        break;
+                    }
+                }
+            }
+            // Extended timestamp: one flag byte, then the times that are
+            // present, always in the order modified, accessed, created.
+            0x5455 => {
+                let mut e = Cursor::new(body);
+                let Ok(first) = e.bytes(1, "flags") else {
+                    continue;
+                };
+                let flags = first[0];
+                if flags & 1 != 0 && e.remaining() >= 4 {
+                    let _ = e.u32le("mtime");
+                }
+                if flags & 2 != 0 && e.remaining() >= 4 {
+                    if let Ok(v) = e.u32le("atime") {
+                        out.accessed = Some(v as i32 as i64);
+                    }
+                }
+                if flags & 4 != 0 && e.remaining() >= 4 {
+                    if let Ok(v) = e.u32le("ctime") {
+                        out.created = Some(v as i32 as i64);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn read_central_header(c: &mut Cursor<'_>) -> Result<Entry> {
     if c.u32le("central directory signature")? != SIG_CD {
         return Err(Error::Format("invalid entry signature".into()));
@@ -437,7 +548,7 @@ fn read_central_header(c: &mut Cursor<'_>) -> Result<Entry> {
     let x_len = c.u16le("extra field length")? as usize;
     let k_len = c.u16le("comment length")? as usize;
     c.skip(4, "disk and internal attributes")?;
-    let _ext_attr = c.u32le("external attributes")?;
+    let ext_attr = c.u32le("external attributes")?;
     let mut offset = c.u32le("local offset")? as u64;
 
     if n_len > limits::MAX_NAME {
@@ -520,6 +631,7 @@ fn read_central_header(c: &mut Cursor<'_>) -> Result<Entry> {
         from_cp437(name_bytes)
     };
     let is_dir = name.ends_with('/') || name.ends_with('\\');
+    let times = read_times(extra);
 
     Ok(Entry {
         name,
@@ -529,6 +641,11 @@ fn read_central_header(c: &mut Cursor<'_>) -> Result<Entry> {
         crc32: crc_val,
         is_dir,
         mtime: arca_core::dos_to_unix(date_val, time_val),
+        created: times.created,
+        accessed: times.accessed,
+        // The low byte of the external attributes is the DOS byte, whatever
+        // system made the archive claims to be.
+        attributes: (ext_attr & 0xFF) as u8,
         offset,
         encrypted,
     })
@@ -1952,6 +2069,61 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&room);
+    }
+
+    // The two extra fields that carry a creation and an access time, in the two
+    // spellings that exist. Both are optional and most archives have neither,
+    // so the thing worth checking is that a field that is there is read right
+    // and a field that is broken is stepped over rather than believed.
+    #[test]
+    fn the_times_a_zip_hides_in_its_extra_fields_come_back_out() {
+        // NTFS: id 0x000A, four reserved bytes, tag 1 of 24 bytes holding
+        // modified, accessed and created as Windows FILETIMEs.
+        let mut ntfs = Vec::new();
+        ntfs.extend_from_slice(&0x000Au16.to_le_bytes());
+        ntfs.extend_from_slice(&32u16.to_le_bytes());
+        ntfs.extend_from_slice(&0u32.to_le_bytes());
+        ntfs.extend_from_slice(&1u16.to_le_bytes());
+        ntfs.extend_from_slice(&24u16.to_le_bytes());
+        // 2026-09-08 00:00:00 UTC, and two round hours either side of it.
+        let base = 1_788_912_000i64;
+        for t in [base, base + 3600, base - 3600] {
+            let ticks = (t + 11_644_473_600) as u64 * 10_000_000;
+            ntfs.extend_from_slice(&ticks.to_le_bytes());
+        }
+        let got = read_times(&ntfs);
+        assert_eq!(got.accessed, Some(base + 3600));
+        assert_eq!(got.created, Some(base - 3600));
+
+        // Extended timestamp: id 0x5455, a flag byte saying which of the three
+        // follow, then that many 32-bit unix times in a fixed order.
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&0x5455u16.to_le_bytes());
+        // One flag byte and three four byte times.
+        ext.extend_from_slice(&13u16.to_le_bytes());
+        ext.push(0b0000_0111);
+        for t in [base, base + 60, base - 60] {
+            ext.extend_from_slice(&(t as i32).to_le_bytes());
+        }
+        let got = read_times(&ext);
+        assert_eq!(got.accessed, Some(base + 60));
+        assert_eq!(got.created, Some(base - 60));
+
+        // A zero FILETIME is how a tool says it did not record one, not the
+        // year 1601.
+        let mut empty = ntfs.clone();
+        for b in empty.iter_mut().skip(12).take(24) {
+            *b = 0;
+        }
+        assert_eq!(read_times(&empty), Times::default());
+
+        // Nothing at all, and rubbish, both come back with nothing rather than
+        // with a wrong answer or a panic.
+        assert_eq!(read_times(&[]), Times::default());
+        assert_eq!(
+            read_times(&[0x0A, 0x00, 0xFF, 0xFF, 1, 2, 3]),
+            Times::default()
+        );
     }
 
     // Stopping halfway has to leave the archive exactly as it was. Every one of

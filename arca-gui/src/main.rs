@@ -1513,6 +1513,9 @@ enum SortColumn {
     Crc,
     Type,
     Path,
+    Created,
+    Accessed,
+    Attributes,
 }
 
 // Which columns the list shows. Name is not here: a list of nothing but sizes
@@ -1527,6 +1530,9 @@ struct Columns {
     crc: bool,
     type_: bool,
     path: bool,
+    created: bool,
+    accessed: bool,
+    attributes: bool,
 }
 
 impl Default for Columns {
@@ -1542,12 +1548,15 @@ impl Default for Columns {
             crc: false,
             type_: false,
             path: false,
+            created: false,
+            accessed: false,
+            attributes: false,
         }
     }
 }
 
 impl Columns {
-    const ALL: [(SortColumn, &'static str); 8] = [
+    const ALL: [(SortColumn, &'static str); 11] = [
         (SortColumn::Size, "size"),
         (SortColumn::Packed, "packed"),
         (SortColumn::Method, "method"),
@@ -1556,6 +1565,9 @@ impl Columns {
         (SortColumn::Crc, "crc"),
         (SortColumn::Type, "type"),
         (SortColumn::Path, "path"),
+        (SortColumn::Created, "created"),
+        (SortColumn::Accessed, "accessed"),
+        (SortColumn::Attributes, "attributes"),
     ];
 
     fn on(&self, which: SortColumn) -> bool {
@@ -1568,6 +1580,9 @@ impl Columns {
             SortColumn::Crc => self.crc,
             SortColumn::Type => self.type_,
             SortColumn::Path => self.path,
+            SortColumn::Created => self.created,
+            SortColumn::Accessed => self.accessed,
+            SortColumn::Attributes => self.attributes,
             SortColumn::Name => true,
         }
     }
@@ -1582,6 +1597,9 @@ impl Columns {
             SortColumn::Crc => self.crc = value,
             SortColumn::Type => self.type_ = value,
             SortColumn::Path => self.path = value,
+            SortColumn::Created => self.created = value,
+            SortColumn::Accessed => self.accessed = value,
+            SortColumn::Attributes => self.attributes = value,
             SortColumn::Name => {}
         }
     }
@@ -1596,6 +1614,9 @@ impl Columns {
             SortColumn::Crc => s.col_crc,
             SortColumn::Type => s.col_type,
             SortColumn::Path => s.col_path,
+            SortColumn::Created => s.col_created,
+            SortColumn::Accessed => s.col_accessed,
+            SortColumn::Attributes => s.col_attributes,
             SortColumn::Name => s.col_name,
         }
     }
@@ -1678,6 +1699,20 @@ struct Wheel {
     /// running until the next click; that is what makes press-and-drag and
     /// click-and-go both work off the one button.
     moved: bool,
+}
+
+/// The DOS attribute byte as the letters every file manager has shown it with
+/// since there were file managers: read only, hidden, system, archive.
+///
+/// A dash where a bit is off rather than a shorter string, so that the column
+/// lines up down the page and the eye can read one position instead of one
+/// word. The directory bit is not shown: the list already says which rows are
+/// folders, in a way that does not need decoding.
+fn attribute_letters(bits: u8) -> String {
+    [(0x01, 'R'), (0x02, 'H'), (0x04, 'S'), (0x20, 'A')]
+        .iter()
+        .map(|(mask, letter)| if bits & mask != 0 { *letter } else { '-' })
+        .collect()
 }
 
 /// Whether a name claims to be a picture of a kind the window can draw.
@@ -1896,6 +1931,9 @@ fn up_row(dir: &str) -> Row {
         encrypted: false,
         count: 0,
         mtime: None,
+        created: None,
+        accessed: None,
+        attributes: 0,
         crc32: 0,
         up: true,
     }
@@ -1959,6 +1997,9 @@ fn natural_width(ui: &egui::Ui, rows: &[Row], which: SortColumn, s: &Strings) ->
         // row in the folder before the column could be sized.
         SortColumn::Type => wide_of(ui, s.col_type, Body) + pad,
         SortColumn::Path => widest(Body, &|r| folder_of(&r.path).to_string()) + pad,
+        SortColumn::Created => widest(Monospace, &|r| when(r.created)) + pad,
+        SortColumn::Accessed => widest(Monospace, &|r| when(r.accessed)) + pad,
+        SortColumn::Attributes => wide_of(ui, "RHSA", Monospace) + pad,
     }
 }
 
@@ -2320,6 +2361,9 @@ impl Arca {
                         encrypted: e.encrypted,
                         count: 0,
                         mtime: e.mtime,
+                        created: e.created,
+                        accessed: e.accessed,
+                        attributes: e.attributes,
                         crc32: e.crc32,
                         up: false,
                     }
@@ -2344,6 +2388,9 @@ impl Arca {
                     encrypted: e.encrypted,
                     count: 0,
                     mtime: e.mtime,
+                    created: e.created,
+                    accessed: e.accessed,
+                    attributes: e.attributes,
                     crc32: e.crc32,
                     up: false,
                 })
@@ -2375,6 +2422,9 @@ impl Arca {
                 SortColumn::Type => arca_icons::cache_key(&x.label, x.is_dir)
                     .cmp(&arca_icons::cache_key(&y.label, y.is_dir)),
                 SortColumn::Path => folder_of(&x.path).cmp(folder_of(&y.path)),
+                SortColumn::Created => x.created.cmp(&y.created),
+                SortColumn::Accessed => x.accessed.cmp(&y.accessed),
+                SortColumn::Attributes => x.attributes.cmp(&y.attributes),
             };
             if asc {
                 o
@@ -5912,6 +5962,15 @@ impl Arca {
                                         .truncate(),
                                     );
                                 }
+                                SortColumn::Created => {
+                                    ui.monospace(when(r.created));
+                                }
+                                SortColumn::Accessed => {
+                                    ui.monospace(when(r.accessed));
+                                }
+                                SortColumn::Attributes => {
+                                    ui.monospace(attribute_letters(r.attributes));
+                                }
                                 SortColumn::Path => {
                                     ui.add(
                                         egui::Label::new(
@@ -6542,6 +6601,16 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_attribute_letters_hold_their_places() {
+        assert_eq!(attribute_letters(0), "----");
+        assert_eq!(attribute_letters(0x01), "R---");
+        assert_eq!(attribute_letters(0x20), "---A");
+        assert_eq!(attribute_letters(0x01 | 0x02 | 0x04 | 0x20), "RHSA");
+        // The directory bit is the list's job, not this column's.
+        assert_eq!(attribute_letters(0x10), "----");
+    }
 
     #[test]
     fn text_is_told_from_the_rest_by_what_it_does_not_have() {

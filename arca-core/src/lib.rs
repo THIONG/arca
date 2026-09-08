@@ -141,6 +141,15 @@ pub struct Entry {
     pub crc32: u32,
     pub is_dir: bool,
     pub mtime: Option<i64>,
+    // When the file was made and when it was last read. A zip only carries
+    // these if the tool that wrote it bothered with an extra field for them,
+    // which most do not, so both are usually nothing.
+    pub created: Option<i64>,
+    pub accessed: Option<i64>,
+    // The DOS attribute byte out of the external attributes: read only,
+    // hidden, system, archive. Zero when the archive was made somewhere that
+    // has no such thing.
+    pub attributes: u8,
     pub offset: u64,
     // WinZip AES: the entry is encrypted and `method` holds the real compressor,
     // read out of the 0x9901 extra field rather than the method field, which
