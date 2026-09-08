@@ -71,7 +71,10 @@ pub fn random_salt() -> Result<[u8; SALT_256]> {
 
 // Encrypts in place and returns salt, verifier and authentication code, which
 // is what wraps the entry data on disk.
-pub fn encrypt(password: &str, data: &mut [u8]) -> Result<([u8; SALT_256], [u8; VERIFIER], [u8; AUTH_CODE])> {
+pub fn encrypt(
+    password: &str,
+    data: &mut [u8],
+) -> Result<([u8; SALT_256], [u8; VERIFIER], [u8; AUTH_CODE])> {
     let salt = random_salt()?;
     let keys = derive(password, &salt);
     stream(&keys.cipher).apply_keystream(data);
@@ -108,7 +111,9 @@ pub fn decrypt(password: &str, body: &[u8]) -> Result<Vec<u8>> {
     mac.update(cipher_text);
     let tag = mac.finalize().into_bytes();
     if !constant_time_eq(auth, &tag[..AUTH_CODE]) {
-        return Err(Error::Tampered { name: "encrypted entry".into() });
+        return Err(Error::Tampered {
+            name: "encrypted entry".into(),
+        });
     }
 
     let mut plain = cipher_text.to_vec();

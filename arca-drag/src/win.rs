@@ -6,9 +6,8 @@ use std::path::PathBuf;
 
 use windows::core::{implement, Result, HRESULT, PCWSTR};
 use windows::Win32::Foundation::{
-    BOOL,
-    DATA_S_SAMEFORMATETC, DV_E_FORMATETC, DV_E_TYMED, E_NOTIMPL, HGLOBAL, OLE_E_ADVISENOTSUPPORTED,
-    POINT, S_OK,
+    BOOL, DATA_S_SAMEFORMATETC, DV_E_FORMATETC, DV_E_TYMED, E_NOTIMPL, HGLOBAL,
+    OLE_E_ADVISENOTSUPPORTED, POINT, S_OK,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES};
 use windows::Win32::System::Com::{
@@ -24,8 +23,8 @@ use windows::Win32::System::Ole::{
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::Common::STRRET;
 use windows::Win32::UI::Shell::{
-    SHCreateStdEnumFmtEtc, SHCreateStreamOnFileEx, FILEDESCRIPTORW, FILEGROUPDESCRIPTORW,
-    FD_ATTRIBUTES, FD_FILESIZE, FD_WRITESTIME,
+    SHCreateStdEnumFmtEtc, SHCreateStreamOnFileEx, FD_ATTRIBUTES, FD_FILESIZE, FD_WRITESTIME,
+    FILEDESCRIPTORW, FILEGROUPDESCRIPTORW,
 };
 
 /// What one entry looks like to the shell before anything has been extracted.
@@ -134,7 +133,10 @@ impl Source {
             name[..wide.len()].copy_from_slice(&wide);
             fd.cFileName = name;
             std::ptr::write_unaligned(
-                bytes.as_mut_ptr().add(head + each * i).cast::<FILEDESCRIPTORW>(),
+                bytes
+                    .as_mut_ptr()
+                    .add(head + each * i)
+                    .cast::<FILEDESCRIPTORW>(),
                 fd,
             );
         }
@@ -163,7 +165,9 @@ impl IDataObject_Impl for Source_Impl {
                 return Err(DV_E_FORMATETC.into());
             }
             let Some(path) = (self.deliver)(which as usize) else {
-                return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
+                return Err(windows::core::Error::from(
+                    windows::Win32::Foundation::E_FAIL,
+                ));
             };
             let wide: Vec<u16> = path
                 .as_os_str()
@@ -232,10 +236,14 @@ impl IDataObject_Impl for Source_Impl {
     /// The one that matters here: after a move, the shell reports back through
     /// this what it actually did, and that is the only notice a source ever
     /// gets that its files have been taken rather than copied.
-    fn SetData(&self, request: *const FORMATETC, medium: *const STGMEDIUM, _release: BOOL) -> Result<()> {
+    fn SetData(
+        &self,
+        request: *const FORMATETC,
+        medium: *const STGMEDIUM,
+        _release: BOOL,
+    ) -> Result<()> {
         let request = unsafe { *request };
-        if request.cfFormat == self.formats.performed
-            || request.cfFormat == self.formats.preferred
+        if request.cfFormat == self.formats.performed || request.cfFormat == self.formats.preferred
         {
             unsafe {
                 let handle = (*medium).u.hGlobal;

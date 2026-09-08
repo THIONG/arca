@@ -40,7 +40,11 @@ fn write_octal(dest: &mut [u8], value: u64) {
 fn checksum(header: &[u8; BLOCK]) -> u32 {
     let mut s: u32 = 0;
     for (i, &b) in header.iter().enumerate() {
-        s += if (148..156).contains(&i) { 32 } else { b as u32 };
+        s += if (148..156).contains(&i) {
+            32
+        } else {
+            b as u32
+        };
     }
     s
 }
@@ -240,8 +244,14 @@ mod tests {
     fn round_trip() {
         let data = b"test payload".repeat(100);
         let mut w = TarWriter::new(Vec::new());
-        w.add("dir/f.txt", data.len() as u64, 1_700_000_000, 0o644, &data[..])
-            .unwrap();
+        w.add(
+            "dir/f.txt",
+            data.len() as u64,
+            1_700_000_000,
+            0o644,
+            &data[..],
+        )
+        .unwrap();
         let buf = w.finish().unwrap();
         assert_eq!(buf.len() % BLOCK, 0);
 

@@ -119,14 +119,12 @@ mod windows_impl {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Gdi::*;
-    use windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-    };
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::Shell::{
         SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_TYPENAME,
         SHGFI_USEFILEATTRIBUTES,
     };
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 
     // Run once on the thread that owns the shell calls. A host that already
@@ -150,7 +148,11 @@ mod windows_impl {
         let text = wide(asked);
 
         let mut info = SHFILEINFOW::default();
-        let attrs = if is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
+        let attrs = if is_dir {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        };
 
         unsafe {
             // USEFILEATTRIBUTES is the flag that makes this a question about a
@@ -180,7 +182,11 @@ mod windows_impl {
         let text = wide(asked);
 
         let mut info = SHFILEINFOW::default();
-        let attrs = if is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
+        let attrs = if is_dir {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        };
 
         unsafe {
             let ok = SHGetFileInfoW(
@@ -244,7 +250,11 @@ mod windows_impl {
         for px in pixels.chunks_exact_mut(4) {
             px.swap(0, 2);
         }
-        Some(Icon { width: w, height: h, rgba: pixels })
+        Some(Icon {
+            width: w,
+            height: h,
+            rgba: pixels,
+        })
     }
 
     unsafe fn read_bits(dc: HDC, bitmap: HBITMAP, w: u32, h: u32) -> Vec<u8> {
@@ -319,7 +329,10 @@ mod tests {
         assert_eq!(file.rgba.len(), (file.width * file.height * 4) as usize);
         // Not a blank square: an icon nobody can see would pass every other
         // check here.
-        assert!(file.rgba.chunks_exact(4).any(|px| px[3] > 0), "fully transparent");
+        assert!(
+            file.rgba.chunks_exact(4).any(|px| px[3] > 0),
+            "fully transparent"
+        );
 
         let dir = lookup("thing", true).expect("folder icon");
         assert_ne!(file.rgba, dir.rgba, "a folder and a file look the same");

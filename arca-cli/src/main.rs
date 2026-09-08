@@ -1,8 +1,8 @@
 use arca_core::{Codec, Error, Level, Result};
 use arca_tar::{TarReader, TarWriter};
 use arca_zip::{compress_block, seal_block, ZipArchive, ZipWriter};
-use rayon::prelude::*;
 use clap::{Parser, Subcommand, ValueEnum};
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -39,14 +39,24 @@ enum Cmd {
         #[arg(short, long, value_enum, default_value_t = CodecArg::Auto,
               help = "Compressor. 'auto' uses deflate in .zip for compatibility")]
         codec: CodecArg,
-        #[arg(short = 'j', long, default_value_t = 0,
-              help = "Threads to use. 0 means every core")]
+        #[arg(
+            short = 'j',
+            long,
+            default_value_t = 0,
+            help = "Threads to use. 0 means every core"
+        )]
         threads: usize,
-        #[arg(short = 'p', long,
-              help = "Encrypt with AES-256. Other tools will ask for it to open the archive")]
+        #[arg(
+            short = 'p',
+            long,
+            help = "Encrypt with AES-256. Other tools will ask for it to open the archive"
+        )]
         password: Option<String>,
     },
-    #[command(visible_alias = "l", about = "List the contents without extracting them")]
+    #[command(
+        visible_alias = "l",
+        about = "List the contents without extracting them"
+    )]
     List {
         #[arg(help = "Archive to read")]
         archive: PathBuf,
@@ -62,8 +72,12 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = OnConflict::Overwrite,
               help = "What to do when the file is already in the destination")]
         on_conflict: OnConflict,
-        #[arg(short = 'j', long, default_value_t = 0,
-              help = "Threads to use. 0 means every core. Only .zip can go parallel")]
+        #[arg(
+            short = 'j',
+            long,
+            default_value_t = 0,
+            help = "Threads to use. 0 means every core. Only .zip can go parallel"
+        )]
         threads: usize,
         #[arg(short = 'p', long, help = "Password of an AES-256 encrypted archive")]
         password: Option<String>,
@@ -86,8 +100,11 @@ enum Cmd {
         password: Option<String>,
         #[arg(long, help = "New password. Leave it out to remove the encryption")]
         new: Option<String>,
-        #[arg(short = 'o', long,
-              help = "Write here instead of replacing the archive in place")]
+        #[arg(
+            short = 'o',
+            long,
+            help = "Write here instead of replacing the archive in place"
+        )]
         out: Option<PathBuf>,
     },
     #[command(about = "Measure the R1 and R2 performance requirements")]
@@ -175,7 +192,14 @@ fn run(cli: Cli) -> Result<()> {
             codec,
             threads,
             password,
-        } => create(&out, &inputs, level.into(), codec, threads, password.as_deref()),
+        } => create(
+            &out,
+            &inputs,
+            level.into(),
+            codec,
+            threads,
+            password.as_deref(),
+        ),
         Cmd::List { archive, time } => list(&archive, time),
         Cmd::Extract {
             archive,
@@ -190,7 +214,12 @@ fn run(cli: Cli) -> Result<()> {
             password,
             new,
             out,
-        } => change_password(&archive, out.as_deref(), password.as_deref(), new.as_deref()),
+        } => change_password(
+            &archive,
+            out.as_deref(),
+            password.as_deref(),
+            new.as_deref(),
+        ),
         Cmd::Bench { archive } => bench(&archive),
     }
 }
@@ -234,7 +263,9 @@ fn resolve_threads(requested: usize) -> usize {
     if requested > 0 {
         return requested;
     }
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 fn resolve_codec(c: CodecArg, format_kind: Format) -> Codec {
@@ -326,7 +357,8 @@ fn create(
                 // is a thousand rounds of PBKDF2 per entry, and doing that back
                 // in the writer would put all of them on one thread.
                 let produced: Vec<Result<Block>> = pool.install(|| {
-                    batch.par_iter()
+                    batch
+                        .par_iter()
                         .map(|&i| {
                             let data = fs::read(&files[i].0)?;
                             let (c, m, crc) = compress_block(&data, codec, level)?;
@@ -370,7 +402,11 @@ fn create(
 
     let dt = t0.elapsed();
     let final_size = fs::metadata(out)?.len();
-    let ratio = if total > 0 { 100.0 * (1.0 - final_size as f64 / total as f64) } else { 0.0 };
+    let ratio = if total > 0 {
+        100.0 * (1.0 - final_size as f64 / total as f64)
+    } else {
+        0.0
+    };
     let mbs = if dt.as_secs_f64() > 0.0 {
         total as f64 / 1_048_576.0 / dt.as_secs_f64()
     } else {
@@ -422,7 +458,11 @@ fn list(archive: &Path, time: bool) -> Result<()> {
             };
             let mut r = TarReader::new(source);
             while let Some(e) = r.next_entry()? {
-                writeln!(out, "{:>12}  {:>7}  {:>5}   {}", e.entry.size, "store", "", e.entry.name)?;
+                writeln!(
+                    out,
+                    "{:>12}  {:>7}  {:>5}   {}",
+                    e.entry.size, "store", "", e.entry.name
+                )?;
                 n += 1;
                 bytes += e.entry.size;
                 r.skip_data(&e)?;
@@ -446,8 +486,14 @@ fn list(archive: &Path, time: bool) -> Result<()> {
 // two entries with the same name the same free name.
 fn free_name(path: &Path, claimed: &HashSet<PathBuf>) -> PathBuf {
     let dir = path.parent().map(PathBuf::from).unwrap_or_default();
-    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let ext = path.extension().map(|s| format!(".{}", s.to_string_lossy())).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|s| format!(".{}", s.to_string_lossy()))
+        .unwrap_or_default();
     for n in 1..10_000u32 {
         let candidate = dir.join(format!("{stem} ({n}){ext}"));
         if !candidate.exists() && !claimed.contains(&candidate) {
@@ -611,7 +657,10 @@ fn change_password(
     let target = out.unwrap_or(archive);
     let temp = target.with_file_name(format!(
         "{}.arca-new",
-        target.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+        target
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default()
     ));
     let t0 = Instant::now();
 
@@ -678,9 +727,15 @@ fn test_archive(archive: &Path, password: Option<&str>) -> Result<()> {
     }
 
     if failures > 0 {
-        return Err(Error::Format(format!("{failures} corrupt entries out of {}", n + failures)));
+        return Err(Error::Format(format!(
+            "{failures} corrupt entries out of {}",
+            n + failures
+        )));
     }
-    println!("{n} entries verified, no errors ({:.3} s)", t0.elapsed().as_secs_f64());
+    println!(
+        "{n} entries verified, no errors ({:.3} s)",
+        t0.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -702,7 +757,11 @@ fn bench(archive: &Path) -> Result<()> {
     let r2 = best_of < 200.0;
     println!("  R2  list without extracting");
     println!("      {} entries in a {} archive", inputs, human(size));
-    println!("      {:.1} ms   target < 200 ms   {}", best_of, pass_fail(r2));
+    println!(
+        "      {:.1} ms   target < 200 ms   {}",
+        best_of,
+        pass_fail(r2)
+    );
     println!();
     println!("  R1  cold start: measured from outside, with hyperfine");
     println!("      hyperfine --warmup 20 'arca --version'");

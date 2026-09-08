@@ -1,4 +1,4 @@
-﻿#![forbid(unsafe_code)]
+#![forbid(unsafe_code)]
 
 pub mod aes;
 
@@ -28,7 +28,11 @@ struct CrcWriter<W: Write> {
 
 impl<W: Write> CrcWriter<W> {
     fn new(inner: W) -> Self {
-        CrcWriter { inner, hasher: crc32fast::Hasher::new(), written: 0 }
+        CrcWriter {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+            written: 0,
+        }
     }
     fn finalize(self) -> (W, u32, u64) {
         (self.inner, self.hasher.finalize(), self.written)
@@ -84,7 +88,9 @@ impl<R: Read + Seek> ZipArchive<R> {
                 l.skip(4, "EOCD64 disk")?;
                 let off64 = l.u64le("EOCD64 offset")?;
                 if off64 >= total {
-                    return Err(Error::Format("the Zip64 locator points past the end of the archive".into()));
+                    return Err(Error::Format(
+                        "the Zip64 locator points past the end of the archive".into(),
+                    ));
                 }
                 source.seek(SeekFrom::Start(off64))?;
                 let mut r64 = [0u8; 56];
@@ -130,7 +136,10 @@ impl<R: Read + Seek> ZipArchive<R> {
             }
         }
 
-        Ok(ZipArchive { source, entries_list })
+        Ok(ZipArchive {
+            source,
+            entries_list,
+        })
     }
 
     pub fn entries(&self) -> &[Entry] {
@@ -172,11 +181,7 @@ impl<R: Read + Seek> ZipArchive<R> {
 // can each open the file and pull a different entry at the same time. A ZIP is
 // random access through its central directory, which is what makes that
 // possible at all.
-pub fn extract_entry<R: Read + Seek, W: Write>(
-    source: &mut R,
-    e: &Entry,
-    dest: W,
-) -> Result<u64> {
+pub fn extract_entry<R: Read + Seek, W: Write>(source: &mut R, e: &Entry, dest: W) -> Result<u64> {
     extract_entry_with(source, e, dest, None)
 }
 
@@ -192,7 +197,11 @@ pub fn extract_entry_with<R: Read + Seek, W: Write>(
     // the contents. AE-1 keeps the real one, so a non-zero value still gets
     // checked either way.
     if !(e.encrypted && e.crc32 == 0) && crc_val != e.crc32 {
-        return Err(Error::Integrity { name: e.name.clone(), expected: e.crc32, found: crc_val });
+        return Err(Error::Integrity {
+            name: e.name.clone(),
+            expected: e.crc32,
+            found: crc_val,
+        });
     }
     if written != e.size {
         return Err(Error::Format(format!(
@@ -235,17 +244,16 @@ pub fn copy_compressed<R: Read + Seek, W: Write + ?Sized>(
     let mut auth = [0u8; aes::AUTH_CODE];
     bounded.read_exact(&mut auth)?;
     if !aes::auth_matches(&computed, &auth) {
-        return Err(Error::Tampered { name: e.name.clone() });
+        return Err(Error::Tampered {
+            name: e.name.clone(),
+        });
     }
     Ok(n)
 }
 
 // Reads the local header, checks it agrees with the central directory, and
 // hands back a reader stopped at the end of this entry's data.
-fn open_data<'a, R: Read + Seek>(
-    source: &'a mut R,
-    e: &Entry,
-) -> Result<io::Take<&'a mut R>> {
+fn open_data<'a, R: Read + Seek>(source: &'a mut R, e: &Entry) -> Result<io::Take<&'a mut R>> {
     source.seek(SeekFrom::Start(e.offset))?;
     let mut lfh = [0u8; LFH_FIXED];
     source.read_exact(&mut lfh)?;
@@ -276,11 +284,7 @@ fn open_data<'a, R: Read + Seek>(
 // Eats the salt and the verifier off the front of the entry and returns the
 // keys, plus how many bytes of ciphertext follow before the authentication
 // code. A wrong password stops here, before anything is decrypted.
-fn unlock<R: Read>(
-    bounded: &mut R,
-    e: &Entry,
-    password: Option<&str>,
-) -> Result<(aes::Keys, u64)> {
+fn unlock<R: Read>(bounded: &mut R, e: &Entry, password: Option<&str>) -> Result<(aes::Keys, u64)> {
     let pw = password.ok_or_else(|| {
         Error::Unsupported(format!("'{}' is encrypted and needs a password", e.name))
     })?;
@@ -327,7 +331,9 @@ fn extract_inner<R: Read + Seek, W: Write>(
         let mut auth = [0u8; aes::AUTH_CODE];
         bounded.read_exact(&mut auth)?;
         if !aes::auth_matches(&computed, &auth) {
-            return Err(Error::Tampered { name: e.name.clone() });
+            return Err(Error::Tampered {
+                name: e.name.clone(),
+            });
         }
     } else {
         decompress_into(bounded, e.method, &mut cw)?;
@@ -550,7 +556,11 @@ pub struct ZipWriter<W: Write + Seek> {
 
 impl<W: Write + Seek> ZipWriter<W> {
     pub fn new(out: W) -> Self {
-        ZipWriter { out, registros: Vec::new(), pos: 0 }
+        ZipWriter {
+            out,
+            registros: Vec::new(),
+            pos: 0,
+        }
     }
 
     pub fn add<R: Read>(
@@ -582,8 +592,18 @@ impl<W: Write + Seek> ZipWriter<W> {
         let method_code = method_of(codec);
         let offset = self.pos;
         let aes_extra = password.map(|_| aes::extra_field(method_code.code()));
-        let stored_code = if aes_extra.is_some() { aes::METHOD_AE } else { method_code.code() };
-        self.write_lfh(&name_bytes, stored_code, date_val, time_val, aes_extra.as_deref())?;
+        let stored_code = if aes_extra.is_some() {
+            aes::METHOD_AE
+        } else {
+            method_code.code()
+        };
+        self.write_lfh(
+            &name_bytes,
+            stored_code,
+            date_val,
+            time_val,
+            aes_extra.as_deref(),
+        )?;
         let extra_offset = offset + LFH_FIXED as u64 + name_bytes.len() as u64;
         let extra_len = EXTRA_Z64 + aes_extra.as_ref().map_or(0, |x| x.len());
 
@@ -612,8 +632,18 @@ impl<W: Write + Seek> ZipWriter<W> {
         };
 
         self.close_entry(
-            name_bytes, offset, extra_offset, extra_len, crc_val, comp_size, uncompressed,
-            method_code, date_val, time_val, name_str.ends_with('/'), aes_extra.is_some(),
+            name_bytes,
+            offset,
+            extra_offset,
+            extra_len,
+            crc_val,
+            comp_size,
+            uncompressed,
+            method_code,
+            date_val,
+            time_val,
+            name_str.ends_with('/'),
+            aes_extra.is_some(),
         )
     }
 
@@ -626,7 +656,15 @@ impl<W: Write + Seek> ZipWriter<W> {
         method_code: Method,
         mtime: Option<i64>,
     ) -> Result<()> {
-        self.put_block(name_str, compressed, crc_val, uncompressed, method_code, mtime, false)
+        self.put_block(
+            name_str,
+            compressed,
+            crc_val,
+            uncompressed,
+            method_code,
+            mtime,
+            false,
+        )
     }
 
     // Takes a block already through `seal_block`, so the key derivation, which
@@ -665,8 +703,18 @@ impl<W: Write + Seek> ZipWriter<W> {
         let name_bytes = check_name(name_str)?;
         let offset = self.pos;
         let aes_extra = password.map(|_| aes::extra_field(method_code.code()));
-        let stored_code = if aes_extra.is_some() { aes::METHOD_AE } else { method_code.code() };
-        self.write_lfh(&name_bytes, stored_code, date_val, time_val, aes_extra.as_deref())?;
+        let stored_code = if aes_extra.is_some() {
+            aes::METHOD_AE
+        } else {
+            method_code.code()
+        };
+        self.write_lfh(
+            &name_bytes,
+            stored_code,
+            date_val,
+            time_val,
+            aes_extra.as_deref(),
+        )?;
         let extra_offset = offset + LFH_FIXED as u64 + name_bytes.len() as u64;
         let extra_len = EXTRA_Z64 + aes_extra.as_ref().map_or(0, |x| x.len());
 
@@ -686,8 +734,18 @@ impl<W: Write + Seek> ZipWriter<W> {
         };
 
         self.close_entry(
-            name_bytes, offset, extra_offset, extra_len, stored_crc, comp_size, uncompressed,
-            method_code, date_val, time_val, name_str.ends_with('/'), password.is_some(),
+            name_bytes,
+            offset,
+            extra_offset,
+            extra_len,
+            stored_crc,
+            comp_size,
+            uncompressed,
+            method_code,
+            date_val,
+            time_val,
+            name_str.ends_with('/'),
+            password.is_some(),
         )
     }
 
@@ -706,14 +764,34 @@ impl<W: Write + Seek> ZipWriter<W> {
         let name_bytes = check_name(name_str)?;
         let offset = self.pos;
         let aes_extra = encrypted.then(|| aes::extra_field(method_code.code()));
-        let stored_code = if encrypted { aes::METHOD_AE } else { method_code.code() };
-        self.write_lfh(&name_bytes, stored_code, date_val, time_val, aes_extra.as_deref())?;
+        let stored_code = if encrypted {
+            aes::METHOD_AE
+        } else {
+            method_code.code()
+        };
+        self.write_lfh(
+            &name_bytes,
+            stored_code,
+            date_val,
+            time_val,
+            aes_extra.as_deref(),
+        )?;
         let extra_offset = offset + LFH_FIXED as u64 + name_bytes.len() as u64;
         let extra_len = EXTRA_Z64 + aes_extra.as_ref().map_or(0, |x| x.len());
         self.out.write_all(body)?;
         self.close_entry(
-            name_bytes, offset, extra_offset, extra_len, crc_val, body.len() as u64, uncompressed,
-            method_code, date_val, time_val, name_str.ends_with('/'), encrypted,
+            name_bytes,
+            offset,
+            extra_offset,
+            extra_len,
+            crc_val,
+            body.len() as u64,
+            uncompressed,
+            method_code,
+            date_val,
+            time_val,
+            name_str.ends_with('/'),
+            encrypted,
         )
     }
 
@@ -738,10 +816,22 @@ impl<W: Write + Seek> ZipWriter<W> {
         let sat_c = comp_size >= 0xFFFF_FFFF;
         self.out.seek(SeekFrom::Start(offset + 14))?;
         self.out.write_all(&crc_val.to_le_bytes())?;
-        self.out
-            .write_all(&(if sat_c { 0xFFFF_FFFFu32 } else { comp_size as u32 }).to_le_bytes())?;
-        self.out
-            .write_all(&(if sat_u { 0xFFFF_FFFFu32 } else { uncompressed as u32 }).to_le_bytes())?;
+        self.out.write_all(
+            &(if sat_c {
+                0xFFFF_FFFFu32
+            } else {
+                comp_size as u32
+            })
+            .to_le_bytes(),
+        )?;
+        self.out.write_all(
+            &(if sat_u {
+                0xFFFF_FFFFu32
+            } else {
+                uncompressed as u32
+            })
+            .to_le_bytes(),
+        )?;
         self.out.seek(SeekFrom::Start(extra_offset + 4))?;
         self.out.write_all(&uncompressed.to_le_bytes())?;
         self.out.write_all(&comp_size.to_le_bytes())?;
@@ -753,7 +843,11 @@ impl<W: Write + Seek> ZipWriter<W> {
             comp_size,
             uncompressed,
             offset,
-            method_code: if encrypted { aes::METHOD_AE } else { method_code.code() },
+            method_code: if encrypted {
+                aes::METHOD_AE
+            } else {
+                method_code.code()
+            },
             date_val,
             time_val,
             is_directory,
@@ -851,7 +945,9 @@ impl<W: Write + Seek> ZipWriter<W> {
             h.extend_from_slice(&0u16.to_le_bytes());
             h.extend_from_slice(&0u16.to_le_bytes());
             let mode: u32 = if r.is_directory { 0o040755 } else { 0o100644 };
-            h.extend_from_slice(&((mode << 16) | if r.is_directory { 0x10 } else { 0 }).to_le_bytes());
+            h.extend_from_slice(
+                &((mode << 16) | if r.is_directory { 0x10 } else { 0 }).to_le_bytes(),
+            );
             h.extend_from_slice(&(r.offset.min(0xFFFF_FFFF) as u32).to_le_bytes());
             h.extend_from_slice(&r.name_str);
             h.extend_from_slice(&extra);
@@ -861,7 +957,8 @@ impl<W: Write + Seek> ZipWriter<W> {
         }
 
         let n = self.registros.len() as u64;
-        let necesita_z64 = n > u16::MAX as u64 || cd_offset >= 0xFFFF_FFFF || cd_size >= 0xFFFF_FFFF;
+        let necesita_z64 =
+            n > u16::MAX as u64 || cd_offset >= 0xFFFF_FFFF || cd_size >= 0xFFFF_FFFF;
 
         if necesita_z64 {
             let z_off = cd_offset + cd_size;
@@ -938,7 +1035,9 @@ fn compress_stream<R: Read, S: Write>(
     match method_code {
         Method::Store => loop {
             let n = data.read(&mut buf)?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             hasher.update(&buf[..n]);
             counter.write_all(&buf[..n])?;
             uncompressed += n as u64;
@@ -947,7 +1046,9 @@ fn compress_stream<R: Read, S: Write>(
             let mut enc = DeflateEncoder::new(counter, Compression::new(level.to_flate2()));
             loop {
                 let n = data.read(&mut buf)?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 hasher.update(&buf[..n]);
                 enc.write_all(&buf[..n])?;
                 uncompressed += n as u64;
@@ -962,7 +1063,9 @@ fn compress_stream<R: Read, S: Write>(
                 let _ = enc.multithread(available_threads());
                 loop {
                     let n = data.read(&mut buf)?;
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     hasher.update(&buf[..n]);
                     enc.write_all(&buf[..n])?;
                     uncompressed += n as u64;
@@ -1001,7 +1104,9 @@ fn method_of(c: Codec) -> Method {
 
 #[cfg(feature = "codecs-native")]
 fn available_threads() -> u32 {
-    std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
 }
 
 // Writes a copy of `archive` at `out` carrying a different password, or none.
@@ -1022,7 +1127,16 @@ pub fn rewrite_password(
     new: Option<&str>,
     notify: &dyn Fn(usize, usize, &str),
 ) -> Result<u64> {
-    rewrite(archive, out, current, new, &|_| true, &keep_name, &[], notify)
+    rewrite(
+        archive,
+        out,
+        current,
+        new,
+        &|_| true,
+        &keep_name,
+        &[],
+        notify,
+    )
 }
 
 /// A file on disk waiting to go into an archive: where to read it from, the
@@ -1052,8 +1166,7 @@ pub fn add_entries(
     extra: &[Addition],
     notify: &dyn Fn(usize, usize, &str),
 ) -> Result<u64> {
-    let taken: std::collections::HashSet<&str> =
-        extra.iter().map(|a| a.name.as_str()).collect();
+    let taken: std::collections::HashSet<&str> = extra.iter().map(|a| a.name.as_str()).collect();
     rewrite(
         archive,
         out,
@@ -1080,7 +1193,16 @@ pub fn remove_entries(
     keep: &dyn Fn(&Entry) -> bool,
     notify: &dyn Fn(usize, usize, &str),
 ) -> Result<u64> {
-    rewrite(archive, out, password, password, keep, &keep_name, &[], notify)
+    rewrite(
+        archive,
+        out,
+        password,
+        password,
+        keep,
+        &keep_name,
+        &[],
+        notify,
+    )
 }
 
 /// The name an entry keeps when nothing is being renamed.
@@ -1107,7 +1229,16 @@ pub fn rename_entries(
     name: &dyn Fn(&Entry) -> String,
     notify: &dyn Fn(usize, usize, &str),
 ) -> Result<u64> {
-    rewrite(archive, out, password, password, &|_| true, name, &[], notify)
+    rewrite(
+        archive,
+        out,
+        password,
+        password,
+        &|_| true,
+        name,
+        &[],
+        notify,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1209,7 +1340,9 @@ pub fn compress_block(data: &[u8], codec: Codec, level: Level) -> Result<(Vec<u8
             }
             #[cfg(not(feature = "codecs-native"))]
             {
-                Err(Error::Unsupported("this binary was built without Zstandard".into()))
+                Err(Error::Unsupported(
+                    "this binary was built without Zstandard".into(),
+                ))
             }
         }
     }
@@ -1223,7 +1356,14 @@ mod tests {
     fn round_trip(codec: Codec, level: Level) {
         let content = b"Arca. ".repeat(5000);
         let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
-        w.add("dir/file.txt", &content[..], codec, level, Some(1_700_000_000)).unwrap();
+        w.add(
+            "dir/file.txt",
+            &content[..],
+            codec,
+            level,
+            Some(1_700_000_000),
+        )
+        .unwrap();
         let buf = w.finish().unwrap().into_inner();
 
         let mut a = ZipArchive::open(IoCursor::new(buf)).unwrap();
@@ -1254,7 +1394,14 @@ mod tests {
     #[test]
     fn corrupt_crc_is_detected() {
         let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
-        w.add("a.txt", &b"content original"[..], Codec::Store, Level::Store, None).unwrap();
+        w.add(
+            "a.txt",
+            &b"content original"[..],
+            Codec::Store,
+            Level::Store,
+            None,
+        )
+        .unwrap();
         let mut buf = w.finish().unwrap().into_inner();
         let p = LFH_FIXED + "a.txt".len() + EXTRA_Z64 + 3;
         buf[p] ^= 0xFF;
@@ -1269,9 +1416,13 @@ mod tests {
     #[test]
     fn extract_entry_with_an_entry_that_lies_does_not_panic() {
         let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
-        w.add("a.txt", &b"content"[..], Codec::Store, Level::Store, None).unwrap();
+        w.add("a.txt", &b"content"[..], Codec::Store, Level::Store, None)
+            .unwrap();
         let buf = w.finish().unwrap().into_inner();
-        let real = ZipArchive::open(IoCursor::new(buf.clone())).unwrap().entries()[0].clone();
+        let real = ZipArchive::open(IoCursor::new(buf.clone()))
+            .unwrap()
+            .entries()[0]
+            .clone();
 
         for seed in 0u64..500 {
             let mut e = real.clone();
@@ -1290,8 +1441,14 @@ mod tests {
         let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
         for i in 0..8 {
             let body = format!("entry number {i} ").repeat(40);
-            w.add(&format!("f{i}.txt"), body.as_bytes(), Codec::Deflate, Level::Normal, None)
-                .unwrap();
+            w.add(
+                &format!("f{i}.txt"),
+                body.as_bytes(),
+                Codec::Deflate,
+                Level::Normal,
+                None,
+            )
+            .unwrap();
         }
         let buf = w.finish().unwrap().into_inner();
         let mut a = ZipArchive::open(IoCursor::new(buf.clone())).unwrap();
@@ -1308,8 +1465,15 @@ mod tests {
 
     fn encrypted_archive(password: &str, codec: Codec, body: &[u8]) -> Vec<u8> {
         let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
-        w.add_with_password("secret.txt", body, codec, Level::Normal, None, Some(password))
-            .unwrap();
+        w.add_with_password(
+            "secret.txt",
+            body,
+            codec,
+            Level::Normal,
+            None,
+            Some(password),
+        )
+        .unwrap();
         w.finish().unwrap().into_inner()
     }
 
@@ -1337,7 +1501,13 @@ mod tests {
     #[test]
     fn a_password_that_is_not_ascii_round_trips() {
         let body = b"contenido".repeat(20);
-        for pw in ["contraseña", "пароль", "密码", "clave con espacios y ñ", "🔑"] {
+        for pw in [
+            "contraseña",
+            "пароль",
+            "密码",
+            "clave con espacios y ñ",
+            "🔑",
+        ] {
             let buf = encrypted_archive(pw, Codec::Deflate, &body);
             let mut a = ZipArchive::open(IoCursor::new(buf)).unwrap();
             let mut out = Vec::new();
@@ -1410,8 +1580,14 @@ mod tests {
             .map(|i| format!("contents of number {i} ").repeat(30).into_bytes())
             .collect();
         for (i, body) in bodies.iter().enumerate() {
-            w.add(&format!("f{i}.txt"), &body[..], Codec::Deflate, Level::Normal, None)
-                .unwrap();
+            w.add(
+                &format!("f{i}.txt"),
+                &body[..],
+                Codec::Deflate,
+                Level::Normal,
+                None,
+            )
+            .unwrap();
         }
         let buf = w.finish().unwrap().into_inner();
 
@@ -1432,7 +1608,14 @@ mod tests {
     #[test]
     fn removing_nothing_and_removing_everything_both_work() {
         let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
-        w.add("only.txt", &b"payload"[..], Codec::Deflate, Level::Normal, None).unwrap();
+        w.add(
+            "only.txt",
+            &b"payload"[..],
+            Codec::Deflate,
+            Level::Normal,
+            None,
+        )
+        .unwrap();
         let buf = w.finish().unwrap().into_inner();
 
         let same = keeping(&buf, &|_| true);
@@ -1459,7 +1642,9 @@ mod tests {
         assert!(!still_encrypted, "it should not be encrypted any more");
         // The compressed stream came through untouched: only the AES wrapper
         // went away, and that is exactly its own overhead.
-        let before = ZipArchive::open(IoCursor::new(encrypted)).unwrap().entries()[0]
+        let before = ZipArchive::open(IoCursor::new(encrypted))
+            .unwrap()
+            .entries()[0]
             .compressed_size;
         assert_eq!(packed, before - aes::OVERHEAD as u64);
     }
@@ -1468,7 +1653,8 @@ mod tests {
     fn putting_a_password_on_a_plain_archive() {
         let body = b"plain to begin with ".repeat(300);
         let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
-        w.add("secret.txt", &body[..], Codec::Deflate, Level::Normal, None).unwrap();
+        w.add("secret.txt", &body[..], Codec::Deflate, Level::Normal, None)
+            .unwrap();
         let plain = w.finish().unwrap().into_inner();
 
         let encrypted = rewrite(&plain, None, Some("nueva"));
@@ -1498,7 +1684,10 @@ mod tests {
     #[test]
     fn a_wrong_password_stops_the_rewrite_before_it_writes() {
         let buf = encrypted_archive("right", Codec::Deflate, b"payload");
-        let entries = ZipArchive::open(IoCursor::new(buf.clone())).unwrap().entries().to_vec();
+        let entries = ZipArchive::open(IoCursor::new(buf.clone()))
+            .unwrap()
+            .entries()
+            .to_vec();
         let mut src = IoCursor::new(buf);
         let mut sink = Vec::new();
         let r = copy_compressed(&mut src, &entries[0], &mut sink, Some("wrong"));
@@ -1523,7 +1712,10 @@ mod tests {
         let mut out = Vec::new();
         let r = a.extract_to_with(0, &mut out, Some("wrong"));
         assert!(r.is_err(), "{r:?}");
-        assert!(out.is_empty(), "nothing may be written for a wrong password");
+        assert!(
+            out.is_empty(),
+            "nothing may be written for a wrong password"
+        );
     }
 
     #[test]
@@ -1557,8 +1749,15 @@ mod tests {
     fn two_entries_with_the_same_password_do_not_share_a_keystream() {
         let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
         for n in ["a.txt", "b.txt"] {
-            w.add_with_password(n, &b"identical contents"[..], Codec::Store, Level::Store, None, Some("k"))
-                .unwrap();
+            w.add_with_password(
+                n,
+                &b"identical contents"[..],
+                Codec::Store,
+                Level::Store,
+                None,
+                Some("k"),
+            )
+            .unwrap();
         }
         let buf = w.finish().unwrap().into_inner();
         let a = ZipArchive::open(IoCursor::new(buf.clone())).unwrap();
@@ -1604,14 +1803,24 @@ mod tests {
         b.extend_from_slice(&0u32.to_le_bytes());
         b.extend_from_slice(&0u16.to_le_bytes());
         let r = ZipArchive::open(IoCursor::new(b));
-        assert!(r.is_err(), "an impossible central directory must be rejected");
+        assert!(
+            r.is_err(),
+            "an impossible central directory must be rejected"
+        );
     }
 
     #[test]
     fn many_entries() {
         let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
         for i in 0..500 {
-            w.add(&format!("f{i:04}.txt"), &b"x"[..], Codec::Deflate, Level::Normal, None).unwrap();
+            w.add(
+                &format!("f{i:04}.txt"),
+                &b"x"[..],
+                Codec::Deflate,
+                Level::Normal,
+                None,
+            )
+            .unwrap();
         }
         let buf = w.finish().unwrap().into_inner();
         let a = ZipArchive::open(IoCursor::new(buf)).unwrap();
@@ -1659,7 +1868,11 @@ mod tests {
     fn cp437_covers_all_256_bytes() {
         let todos: Vec<u8> = (0..=255u8).collect();
         let s = from_cp437(&todos);
-        assert_eq!(s.chars().count(), 256, "every byte must map to one character");
+        assert_eq!(
+            s.chars().count(),
+            256,
+            "every byte must map to one character"
+        );
         assert!(
             !s.contains('\u{FFFD}'),
             "CP437 has no gaps: no replacement character should appear"
@@ -1678,7 +1891,8 @@ mod tests {
         let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
         for name in ["notes.txt", "old/one.bin", "old/deep/two.bin"] {
             let body = format!("body of {name} ").repeat(40).into_bytes();
-            w.add(name, &body[..], Codec::Deflate, Level::Normal, None).unwrap();
+            w.add(name, &body[..], Codec::Deflate, Level::Normal, None)
+                .unwrap();
         }
         let archive = room.join("a.zip");
         std::fs::write(&archive, w.finish().unwrap().into_inner()).unwrap();
@@ -1709,7 +1923,10 @@ mod tests {
             names,
             ["a much longer name.txt", "new/one.bin", "new/deep/two.bin"]
         );
-        for (i, was) in ["notes.txt", "old/one.bin", "old/deep/two.bin"].iter().enumerate() {
+        for (i, was) in ["notes.txt", "old/one.bin", "old/deep/two.bin"]
+            .iter()
+            .enumerate()
+        {
             let mut got = Vec::new();
             a.extract_to(i, &mut got).unwrap();
             assert_eq!(got, format!("body of {was} ").repeat(40).into_bytes());
@@ -1729,7 +1946,8 @@ mod tests {
         let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
         for name in ["keep.txt", "replace.txt"] {
             let body = format!("original {name} ").repeat(40).into_bytes();
-            w.add(name, &body[..], Codec::Deflate, Level::Normal, None).unwrap();
+            w.add(name, &body[..], Codec::Deflate, Level::Normal, None)
+                .unwrap();
         }
         let archive = room.join("a.zip");
         std::fs::write(&archive, w.finish().unwrap().into_inner()).unwrap();
