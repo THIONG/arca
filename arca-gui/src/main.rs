@@ -818,6 +818,7 @@ fn extract(
 
 fn test_archive(
     archive: &Path,
+    only: Option<&HashSet<String>>,
     notify: &(dyn Fn(usize, usize, &str) + Sync),
 ) -> arca_core::Result<(usize, Vec<String>)> {
     let Some(format) = detect(archive) else {
@@ -833,7 +834,7 @@ fn test_archive(
             for i in 0..total {
                 let name = a.entries()[i].name.clone();
                 notify(i, total, &name);
-                if a.entries()[i].is_dir {
+                if a.entries()[i].is_dir || only.is_some_and(|set| !set.contains(&name)) {
                     continue;
                 }
                 match a.extract_to(i, std::io::sink()) {
@@ -848,7 +849,7 @@ fn test_archive(
             let mut i = 0usize;
             while let Some(e) = r.next_entry()? {
                 notify(i, i + 1, &e.entry.name);
-                if e.entry.is_dir {
+                if e.entry.is_dir || only.is_some_and(|set| !set.contains(&e.entry.name)) {
                     r.skip_data(&e)?;
                 } else {
                     match r.copy_data(&e, &mut std::io::sink()) {
@@ -957,7 +958,13 @@ enum Job {
         dest: Destination,
         password: Option<String>,
     },
-    Test(PathBuf),
+    Test {
+        archive: PathBuf,
+        // The names to check, or all of them. A selection is checked by walking
+        // the whole archive and skipping what is not in the set: the entries
+        // have to be read in the order they are filed anyway.
+        only: Option<HashSet<String>>,
+    },
     // Rewriting an archive with a different password, or with none.
     Password {
         archive: PathBuf,
@@ -1052,7 +1059,10 @@ fn parse_args() -> Startup {
             dest: Destination::Subfolder,
             password: None,
         }),
-        "--test" if !rest.is_empty() => Startup::Run(Job::Test(rest[0].clone())),
+        "--test" if !rest.is_empty() => Startup::Run(Job::Test {
+            archive: rest[0].clone(),
+            only: None,
+        }),
         "--add" if !rest.is_empty() => Startup::Add(rest),
         "--add-quick" if !rest.is_empty() => Startup::Run(Job::Compress {
             out: quick_output(&rest, Format::Zip),
@@ -1113,11 +1123,12 @@ fn run_job_blocking(
                 ],
             ))
         }
-        Job::Test(a) => {
-            if detect(&a).is_none() {
+        Job::Test { archive, only } => {
+            if detect(&archive).is_none() {
                 return Err(s.unknown_format.to_string());
             }
-            let (good, bad) = test_archive(&a, notify).map_err(|e| e.to_string())?;
+            let (good, bad) =
+                test_archive(&archive, only.as_ref(), notify).map_err(|e| e.to_string())?;
             if bad.is_empty() {
                 Ok(fill(s.verified_ok, &[("n", &good.to_string())]))
             } else {
@@ -1520,6 +1531,57 @@ struct Wheel {
     moved: bool,
 }
 
+/// Whether `name` answers to `mask`, where `*` stands for any run of
+/// characters and `?` for exactly one.
+///
+/// The same two wildcards WinRAR and the command line have always used, and
+/// nothing else: a mask is something people type in a hurry and a language with
+/// character classes in it would turn a typo into a silent mismatch. Case is
+/// ignored, because Windows ignores it and the names came off a Windows disk.
+///
+/// Written as a walk with one point of backtracking rather than as a recursion:
+/// `*` is the only thing that can be taken back, so remembering where the last
+/// one was and how far it had eaten is the whole of it. That is what keeps a
+/// mask of nothing but stars from taking exponential time on a long name.
+fn matches_mask(mask: &str, name: &str) -> bool {
+    let m: Vec<char> = mask.to_lowercase().chars().collect();
+    let n: Vec<char> = name.to_lowercase().chars().collect();
+    let (mut i, mut j) = (0usize, 0usize);
+    // Where to come back to: the star, and the character after which it had
+    // eaten everything up to.
+    let mut star: Option<(usize, usize)> = None;
+
+    while j < n.len() {
+        match m.get(i) {
+            Some('*') => {
+                star = Some((i, j));
+                i += 1;
+            }
+            Some('?') => {
+                i += 1;
+                j += 1;
+            }
+            Some(c) if *c == n[j] => {
+                i += 1;
+                j += 1;
+            }
+            // No match here. If a star is behind us it can swallow one more
+            // character and we try again from there; if not, there is nothing
+            // left to try.
+            _ => match star {
+                Some((si, sj)) => {
+                    i = si + 1;
+                    j = sj + 1;
+                    star = Some((si, sj + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    // Trailing stars match the empty rest of the name; anything else does not.
+    m[i..].iter().all(|c| *c == '*')
+}
+
 /// One level of the folder tree, and everything under it.
 ///
 /// A folder with nothing inside it gets no triangle, and one with something
@@ -1811,6 +1873,12 @@ struct Arca {
     // every frame: it is fifteen hundred paths split on every slash and the
     // answer only changes when the archive does.
     folders: tree::Folder,
+    // Set while the box that picks a group by name is up: true to add what
+    // matches to the selection, false to take it away.
+    picking_group: Option<bool>,
+    // The last mask typed, kept so that picking one group and then another
+    // does not mean typing it again.
+    mask: String,
     // Where the window is and how big, as of this frame. Kept so that `on_exit`
     // has something to write: it is handed no context to ask with.
     geometry: Option<[f32; 4]>,
@@ -1902,6 +1970,8 @@ impl Arca {
             band_scroll: None,
             renaming: None,
             rename_fresh: false,
+            picking_group: None,
+            mask: String::new(),
             folders: tree::Folder::default(),
             geometry: None,
             wheel: None,
@@ -2177,7 +2247,7 @@ impl Arca {
         self.view = View::Running;
         self.title = match &job {
             Job::Extract { .. } => s.extracting.to_string(),
-            Job::Test(_) => s.testing.to_string(),
+            Job::Test { .. } => s.testing.to_string(),
             Job::Password { .. } => s.changing_password.to_string(),
             Job::Delete { .. } => s.deleting.to_string(),
             Job::Rename { .. } => s.renaming.to_string(),
@@ -2186,7 +2256,7 @@ impl Arca {
         };
         self.close_when_done = !matches!(
             job,
-            Job::Test(_)
+            Job::Test { .. }
                 | Job::Password { .. }
                 | Job::Delete { .. }
                 | Job::Rename { .. }
@@ -2436,6 +2506,26 @@ impl Arca {
                     }
                 });
         });
+    }
+
+    // Everything out, beside the archive, without a word. What Alt+W does, and
+    // the row menu offers the same thing where the hand already is.
+    fn extract_here(&mut self, ctx: &egui::Context) {
+        let Some(archive) = self.archive.clone() else {
+            return;
+        };
+        self.run_job(
+            ctx,
+            Job::Extract {
+                archives: vec![archive],
+                dest: if self.into_subfolder {
+                    Destination::Subfolder
+                } else {
+                    Destination::Beside
+                },
+                password: self.archive_password.clone(),
+            },
+        );
     }
 
     fn ask_extract(&mut self, ctx: &egui::Context, only_checked: bool) {
@@ -2951,32 +3041,36 @@ impl Arca {
         // has none, which is exactly the case here. What does still arrive is
         // the key going back up, because the early return only covers the press
         // -- so that is what a paste is recognised by.
-        let (ctrl, shift, o, e, t, n, f, f5, del, cut, copy, paste) = ctx.input(|i| {
-            (
-                i.modifiers.command,
-                i.modifiers.shift,
-                i.key_pressed(egui::Key::O),
-                i.key_pressed(egui::Key::E),
-                i.key_pressed(egui::Key::T),
-                i.key_pressed(egui::Key::N),
-                i.key_pressed(egui::Key::F),
-                i.key_pressed(egui::Key::F5),
-                i.key_pressed(egui::Key::Delete),
-                i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
-                i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
-                i.events.iter().any(|e| {
-                    matches!(
-                        e,
-                        egui::Event::Key {
-                            key: egui::Key::V,
-                            pressed: false,
-                            modifiers,
-                            ..
-                        } if modifiers.command
-                    )
-                }),
-            )
-        });
+        let (ctrl, shift, o, e, t, n, f, f5, del, cut, copy, paste, plus, minus, alt_w) = ctx
+            .input(|i| {
+                (
+                    i.modifiers.command,
+                    i.modifiers.shift,
+                    i.key_pressed(egui::Key::O),
+                    i.key_pressed(egui::Key::E),
+                    i.key_pressed(egui::Key::T),
+                    i.key_pressed(egui::Key::N),
+                    i.key_pressed(egui::Key::F),
+                    i.key_pressed(egui::Key::F5),
+                    i.key_pressed(egui::Key::Delete),
+                    i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
+                    i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                    i.events.iter().any(|e| {
+                        matches!(
+                            e,
+                            egui::Event::Key {
+                                key: egui::Key::V,
+                                pressed: false,
+                                modifiers,
+                                ..
+                            } if modifiers.command
+                        )
+                    }),
+                    i.key_pressed(egui::Key::Plus),
+                    i.key_pressed(egui::Key::Minus),
+                    i.modifiers.alt && i.key_pressed(egui::Key::W),
+                )
+            });
 
         // These three carry their own modifier, so they do not wait behind the
         // Ctrl check below. They do belong to the filter box while it has the
@@ -3010,6 +3104,32 @@ impl Arca {
                 self.archive_password = keep;
             }
         }
+        // The keypad's plus and minus, which is where WinRAR has kept picking a
+        // group by name since before there were menus to put it in. Its third
+        // one, the keypad star for inverting, cannot be told from any other
+        // asterisk by the toolkit, so that one stays on Ctrl+I alone.
+        if (plus || minus) && !typing && self.archive.is_some() {
+            self.picking_group = Some(plus);
+        }
+        // Everything out, beside the archive, without asking where. The whole
+        // point of it is that it is one keystroke: the folder the archive is in
+        // is where an extraction goes nine times out of ten.
+        if alt_w && !typing {
+            if let Some(archive) = self.archive.clone() {
+                self.run_job(
+                    ctx,
+                    Job::Extract {
+                        archives: vec![archive],
+                        dest: if self.into_subfolder {
+                            Destination::Subfolder
+                        } else {
+                            Destination::Beside
+                        },
+                        password: self.archive_password.clone(),
+                    },
+                );
+            }
+        }
         if del && !typing && self.archive.is_some() {
             let names = self.selected_names();
             if !names.is_empty() {
@@ -3035,7 +3155,13 @@ impl Arca {
         // window there was no way to ask for it at all.
         if t {
             if let Some(archive) = self.archive.clone() {
-                self.run_job(ctx, Job::Test(archive));
+                self.run_job(
+                    ctx,
+                    Job::Test {
+                        archive,
+                        only: None,
+                    },
+                );
             }
         }
         if n {
@@ -3054,6 +3180,80 @@ impl Arca {
             // Nothing else here is a text box, so handing the keyboard to the
             // filter is the whole of "find".
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("filter")));
+        }
+    }
+
+    // Picking a whole group of files by what they are called: `*.txt`, `nota_?`.
+    //
+    // The two keys WinRAR has always had, on the numeric keypad, and the same
+    // box behind both: one adds what matches to what is picked and the other
+    // takes it away. It works on what is on screen, so inside a folder it is
+    // that folder and in the flat view it is the whole archive, which is what
+    // "what is on screen" means either way.
+    fn group_window(&mut self, ctx: &egui::Context) {
+        let Some(adding) = self.picking_group else {
+            return;
+        };
+        let s = self.s();
+        let mut go = false;
+        let mut cancel = false;
+        egui::Window::new(if adding {
+            s.select_group
+        } else {
+            s.deselect_group
+        })
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.label(s.mask_hint);
+            ui.add_space(6.0);
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.mask)
+                    .id(egui::Id::new("arca-mask"))
+                    .desired_width(260.0),
+            );
+            // The box has the keyboard the moment it opens: this is a thing
+            // you are typing into, not a thing you are looking at.
+            if !field.has_focus() && !field.lost_focus() {
+                field.request_focus();
+            }
+            if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                go = true;
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button(if adding {
+                        s.select_group
+                    } else {
+                        s.deselect_group
+                    })
+                    .clicked()
+                {
+                    go = true;
+                }
+                if ui.button(s.cancel).clicked() {
+                    cancel = true;
+                }
+            });
+            ui.add_space(4.0);
+        });
+        if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.picking_group = None;
+        }
+        if go {
+            self.picking_group = None;
+            let mask = self.mask.trim().to_string();
+            if mask.is_empty() {
+                return;
+            }
+            for row in self.visible_rows() {
+                if matches_mask(&mask, &row.label) {
+                    self.set_checked(&row, adding);
+                }
+            }
         }
     }
 
@@ -3462,7 +3662,13 @@ impl Arca {
             match wants {
                 Some(More::Test) => {
                     if let Some(archive) = self.archive.clone() {
-                        self.run_job(ctx, Job::Test(archive));
+                        self.run_job(
+                            ctx,
+                            Job::Test {
+                                archive,
+                                only: None,
+                            },
+                        );
                     }
                 }
                 Some(More::All) => {
@@ -3724,10 +3930,11 @@ impl Arca {
                 // The keys are spelled out rather than drawn with the arrows
                 // and the page symbols: Consolas has the four arrows and not
                 // the page ones, so half of that line came out as hollow boxes.
-                let left: [(&str, &str); 14] = [
+                let left: [(&str, &str); 16] = [
                     ("Ctrl+O", s.open),
                     ("Ctrl+N", s.compress),
                     ("Ctrl+E", s.extract_all),
+                    ("Alt+W", s.extract_here),
                     ("Ctrl+T", s.test_word),
                     ("F5", s.refresh_word),
                     ("Ctrl+F", s.find_word),
@@ -3736,6 +3943,7 @@ impl Arca {
                     ("Ctrl+I", s.invert_selection),
                     ("Esc", s.clear_selection),
                     ("Space", s.toggle_word),
+                    ("Num +  -", s.select_group),
                     ("F2", s.rename_word),
                     ("Supr", s.delete_word),
                     ("F1", s.shortcuts_title),
@@ -4454,6 +4662,12 @@ impl Arca {
     // changing folder changes the list under the cursor, so it is clamped here
     // rather than tracked separately.
     fn keyboard(&mut self, ctx: &egui::Context, rows: &[Row]) {
+        // The box that picks a group by name has just opened and does not have
+        // the keyboard yet. The key that opened it is still in this frame, and
+        // a minus is a character the list would otherwise jump to.
+        if self.picking_group.is_some() {
+            return;
+        }
         if rows.is_empty() {
             self.cursor = None;
             return;
@@ -4711,6 +4925,8 @@ impl Arca {
         // while the table still holds it.
         let wants_extract = std::cell::Cell::new(false);
         let wants_delete = std::cell::Cell::new(false);
+        let wants_here = std::cell::Cell::new(false);
+        let wants_test = std::cell::Cell::new(false);
         // The rename in progress, unpacked into pieces the row closure can hold
         // while the table still has `self`. `finish` is how the box says it is
         // done: yes to keep what was typed, no to throw it away.
@@ -5043,6 +5259,14 @@ impl Arca {
                                 wants_extract.set(true);
                                 ui.close_menu();
                             }
+                            if ui.button(format!("{}	Alt+W", s.extract_here)).clicked() {
+                                wants_here.set(true);
+                                ui.close_menu();
+                            }
+                            if ui.button(s.test_selection).clicked() {
+                                wants_test.set(true);
+                                ui.close_menu();
+                            }
                             ui.separator();
                             // The same list the header offers by being clicked, for
                             // the times the pointer is already down here. WinRAR
@@ -5242,6 +5466,23 @@ impl Arca {
         if wants_extract.get() {
             let ctx = ui.ctx().clone();
             self.ask_extract(&ctx, true);
+        }
+        if wants_here.get() {
+            let ctx = ui.ctx().clone();
+            self.extract_here(&ctx);
+        }
+        if wants_test.get() {
+            let names = self.selected_names();
+            if let Some(archive) = self.archive.clone() {
+                let ctx = ui.ctx().clone();
+                self.run_job(
+                    &ctx,
+                    Job::Test {
+                        archive,
+                        only: (!names.is_empty()).then(|| names.into_iter().collect()),
+                    },
+                );
+            }
         }
         if let Some(cut) = wants_clip.get() {
             let ctx = ui.ctx().clone();
@@ -5452,6 +5693,7 @@ impl eframe::App for Arca {
                 });
                 self.settings_window(&ctx2);
                 self.shortcuts_window(&ctx2);
+                self.group_window(&ctx2);
                 self.conflict_window(&ctx2);
                 self.password_window(&ctx2);
                 self.confirm_delete_window(&ctx2);
@@ -5583,6 +5825,35 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mask_picks_the_names_it_describes() {
+        assert!(matches_mask("*.txt", "notes.txt"));
+        assert!(
+            matches_mask("*.TXT", "notes.txt"),
+            "case is not the question"
+        );
+        assert!(!matches_mask("*.txt", "notes.txt.bak"));
+        assert!(matches_mask("nota_?.md", "nota_3.md"));
+        assert!(!matches_mask("nota_?.md", "nota_33.md"));
+        assert!(matches_mask("*", "anything at all"));
+        assert!(matches_mask("a*b*c", "axxbyyc"));
+        assert!(!matches_mask("a*b*c", "axxbyy"));
+        // A mask with nothing special in it is just a name.
+        assert!(matches_mask("leeme.txt", "leeme.txt"));
+        assert!(!matches_mask("leeme.txt", "leeme.txt.old"));
+    }
+
+    // A row of stars against a long name is the case that turns a naive
+    // recursive matcher into a hang. It has to come back in no time at all.
+    #[test]
+    fn a_mask_of_nothing_but_stars_does_not_take_all_afternoon() {
+        let name = "a".repeat(64);
+        let mask = format!("{}b", "*a".repeat(20));
+        let began = std::time::Instant::now();
+        assert!(!matches_mask(&mask, &name));
+        assert!(began.elapsed().as_millis() < 50, "backtracking ran away");
+    }
 
     // The wheel is a button as well as a wheel, and pressing one moves the
     // hand: a dead zone is the difference between a list that waits and a list
