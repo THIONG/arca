@@ -482,6 +482,46 @@ fn system_type(cache: &mut HashMap<String, Option<String>>, name: &str, is_dir: 
 // A folder of its own per archive, so two archives holding a file with the same
 // name do not overwrite each other's copy. safe_name is what keeps an entry
 // called "../../evil" from landing outside it.
+// One entry straight into memory, for looking at rather than for keeping.
+//
+// The same walk as `extract_one` without the file at the end of it: a viewer
+// that wrote to the temporary folder on the way would have extracted the thing
+// it was only supposed to show.
+fn read_entry(
+    archive: &Path,
+    index: usize,
+    out: &mut Vec<u8>,
+    password: Option<&str>,
+) -> arca_core::Result<()> {
+    let Some(format) = detect(archive) else {
+        return Err(arca_core::Error::Unsupported("unknown format".into()));
+    };
+    match format {
+        Format::Zip => {
+            let mut a = ZipArchive::open(File::open(archive)?)?;
+            a.extract_to_with(index, out, password)?;
+        }
+        _ => {
+            // A tar has no index, so the only way to one entry is through all
+            // the ones before it.
+            let mut r = TarReader::new(open_source(archive, format)?);
+            let mut at = 0usize;
+            while let Some(e) = r.next_entry()? {
+                if at == index {
+                    r.copy_data(&e, out)?;
+                    return Ok(());
+                }
+                r.skip_data(&e)?;
+                at += 1;
+            }
+            return Err(arca_core::Error::Format(
+                "that entry is not in the archive any more".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn extract_one(
     archive: &Path,
     entry: &Entry,
@@ -1531,6 +1571,103 @@ struct Wheel {
     moved: bool,
 }
 
+/// Whether a name claims to be a picture of a kind the window can draw.
+fn looks_like_picture(name: &str) -> bool {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp")
+    )
+}
+
+/// One line of a hex dump: where it starts, the bytes, and what they would be
+/// if they were letters.
+///
+/// The three columns are what makes a dump readable: the offset to point at,
+/// the bytes to read, and the letters to recognise a string in the middle of
+/// something that is not one. A dot stands for everything unprintable, which is
+/// the convention every other dump follows.
+fn hex_line(at: usize, bytes: &[u8]) -> String {
+    let mut out = format!("{at:08X}  ");
+    for i in 0..16 {
+        match bytes.get(i) {
+            Some(b) => out.push_str(&format!("{b:02X} ")),
+            None => out.push_str("   "),
+        }
+        if i == 7 {
+            out.push(' ');
+        }
+    }
+    out.push(' ');
+    for b in bytes {
+        out.push(if (0x20..0x7F).contains(b) {
+            *b as char
+        } else {
+            '.'
+        });
+    }
+    out
+}
+
+/// How a file is being looked at in the viewer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Look {
+    Text,
+    Hex,
+    Picture,
+}
+
+/// A file out of the archive, held in memory for looking at.
+///
+/// The bytes are never written to disk. Viewing something is not the same as
+/// extracting it, and a viewer that leaves a copy in the temporary folder has
+/// quietly extracted it.
+struct Viewed {
+    name: String,
+    // Shared rather than owned outright: the picture view hands these to egui
+    // on every frame, and a file of thirty megabytes copied sixty times a
+    // second is two gigabytes a second of nothing.
+    bytes: std::sync::Arc<[u8]>,
+    look: Look,
+    // Split once when the file arrives rather than on every frame: the view is
+    // drawn a line at a time and the lines have to exist to be counted.
+    lines: Vec<String>,
+    // Whether the picture loader made anything of it. Asked once, because a
+    // failed decode is as expensive as a successful one.
+    picture: bool,
+}
+
+/// The most a file can be and still be opened for looking at.
+///
+/// A viewer holds the whole thing in memory, and the point of it is a glance at
+/// a text file or a picture, not reading a database. Past this the answer is to
+/// take it out properly, which is what the rest of the window is for.
+const VIEW_LIMIT: u64 = 32 * 1024 * 1024;
+
+/// Whether these bytes are meant to be read as words.
+///
+/// Two questions, in the order that settles it fastest. A zero byte is the one
+/// thing text almost never has and binary almost always does, so it is asked
+/// first and on its own. Failing that, the balance of what is printable: a
+/// stray high byte is a name with an accent in it, a run of them is a program.
+///
+/// Only the head is read. A file that begins as text and turns into something
+/// else halfway down is a file the reader will notice by looking at it.
+fn looks_like_text(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(8192)];
+    if head.is_empty() {
+        return true;
+    }
+    if head.contains(&0) {
+        return false;
+    }
+    let odd = head
+        .iter()
+        .filter(|b| **b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r'))
+        .count();
+    odd * 20 < head.len()
+}
+
 /// Whether `name` answers to `mask`, where `*` stands for any run of
 /// characters and `?` for exactly one.
 ///
@@ -1873,6 +2010,8 @@ struct Arca {
     // every frame: it is fifteen hundred paths split on every slash and the
     // answer only changes when the archive does.
     folders: tree::Folder,
+    // The file being looked at without taking it out of the archive.
+    viewing: Option<Viewed>,
     // Set while the box that picks a group by name is up: true to add what
     // matches to the selection, false to take it away.
     picking_group: Option<bool>,
@@ -1970,6 +2109,7 @@ impl Arca {
             band_scroll: None,
             renaming: None,
             rename_fresh: false,
+            viewing: None,
             picking_group: None,
             mask: String::new(),
             folders: tree::Folder::default(),
@@ -3183,6 +3323,154 @@ impl Arca {
         }
     }
 
+    // Opens an entry for looking at, without taking it out of the archive.
+    //
+    // Read straight into memory here rather than on a thread. Everything this
+    // window does on a thread it does because it might take minutes; this is
+    // capped at a size that comes back in the time between two frames, and a
+    // progress window that flashes past is worse than a pause nobody notices.
+    fn view_entry(&mut self, index: usize) {
+        let Some(archive) = self.archive.clone() else {
+            return;
+        };
+        let Some(entry) = self.entries.get(index).cloned() else {
+            return;
+        };
+        let s = self.s();
+        if entry.is_dir {
+            return;
+        }
+        if entry.size > VIEW_LIMIT {
+            self.notice = fill(s.too_big_to_view, &[("size", &human(VIEW_LIMIT))]);
+            self.error = true;
+            return;
+        }
+        let mut bytes = Vec::with_capacity(entry.size as usize);
+        if let Err(e) = read_entry(
+            &archive,
+            index,
+            &mut bytes,
+            self.archive_password.as_deref(),
+        ) {
+            self.notice = e.to_string();
+            self.error = true;
+            return;
+        }
+
+        let name = entry.name.rsplit(['/', '\\']).next().unwrap_or(&entry.name);
+        // Asked once, and only of the names that claim to be pictures: handing
+        // every unknown file to a decoder to find out is a decoder run on
+        // whatever happens to be in the archive.
+        let picture = looks_like_picture(name)
+            && image::guess_format(&bytes).is_ok_and(|f| {
+                image::ImageReader::new(std::io::Cursor::new(&bytes))
+                    .with_guessed_format()
+                    .is_ok_and(|r| r.format() == Some(f))
+            });
+        let look = if picture {
+            Look::Picture
+        } else if looks_like_text(&bytes) {
+            Look::Text
+        } else {
+            Look::Hex
+        };
+        // Split now, once. The text is drawn a line at a time and only the
+        // lines on screen are laid out, so a log of a million lines opens as
+        // fast as a note of three.
+        let lines = String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        self.viewing = Some(Viewed {
+            name: name.to_string(),
+            bytes: bytes.into(),
+            look,
+            lines,
+            picture,
+        });
+    }
+
+    // The file being looked at, in its own window over the list.
+    fn viewer_window(&mut self, ctx: &egui::Context) {
+        let Some(view) = &mut self.viewing else {
+            return;
+        };
+        let s = i18n::strings(self.settings.lang.unwrap_or_else(Lang::from_system));
+        let mut open = true;
+        egui::Window::new(&view.name)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([760.0, 520.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut view.look, Look::Text, s.as_text);
+                    ui.selectable_value(&mut view.look, Look::Hex, s.as_hex);
+                    // Only where there is a picture to show. A tab that says
+                    // "picture" over a text file is a tab that lies.
+                    if view.picture {
+                        ui.selectable_value(&mut view.look, Look::Picture, s.as_picture);
+                    }
+                    ui.separator();
+                    ui.weak(human(view.bytes.len() as u64));
+                });
+                ui.separator();
+                match view.look {
+                    Look::Picture => {
+                        egui::ScrollArea::both().show(ui, |ui| {
+                            ui.add(
+                                egui::Image::from_bytes(
+                                    format!("bytes://{}", view.name),
+                                    egui::load::Bytes::Shared(view.bytes.clone()),
+                                )
+                                .fit_to_original_size(1.0),
+                            );
+                        });
+                    }
+                    Look::Text => {
+                        let font = egui::TextStyle::Monospace.resolve(ui.style());
+                        let tall = ui.text_style_height(&egui::TextStyle::Monospace);
+                        egui::ScrollArea::both().show_rows(
+                            ui,
+                            tall,
+                            view.lines.len(),
+                            |ui, range| {
+                                for line in &view.lines[range] {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(line).font(font.clone()),
+                                        )
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                    );
+                                }
+                            },
+                        );
+                    }
+                    Look::Hex => {
+                        let font = egui::TextStyle::Monospace.resolve(ui.style());
+                        let tall = ui.text_style_height(&egui::TextStyle::Monospace);
+                        let rows = view.bytes.len().div_ceil(16);
+                        egui::ScrollArea::both().show_rows(ui, tall, rows, |ui, range| {
+                            for row in range {
+                                let at = row * 16;
+                                let end = (at + 16).min(view.bytes.len());
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(hex_line(at, &view.bytes[at..end]))
+                                            .font(font.clone()),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Extend),
+                                );
+                            }
+                        });
+                    }
+                }
+            });
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.viewing = None;
+        }
+    }
+
     // Picking a whole group of files by what they are called: `*.txt`, `nota_?`.
     //
     // The two keys WinRAR has always had, on the numeric keypad, and the same
@@ -3930,11 +4218,12 @@ impl Arca {
                 // The keys are spelled out rather than drawn with the arrows
                 // and the page symbols: Consolas has the four arrows and not
                 // the page ones, so half of that line came out as hollow boxes.
-                let left: [(&str, &str); 16] = [
+                let left: [(&str, &str); 17] = [
                     ("Ctrl+O", s.open),
                     ("Ctrl+N", s.compress),
                     ("Ctrl+E", s.extract_all),
                     ("Alt+W", s.extract_here),
+                    ("F3   Alt+V", s.view_word),
                     ("Ctrl+T", s.test_word),
                     ("F5", s.refresh_word),
                     ("Ctrl+F", s.find_word),
@@ -4689,6 +4978,7 @@ impl Arca {
         let mut invert = false;
         let mut typed = String::new();
         let mut rename = false;
+        let mut look = false;
 
         ctx.input(|i| {
             let at = self.cursor.unwrap_or(0);
@@ -4714,6 +5004,9 @@ impl Arca {
                 }
             }
             rename = i.key_pressed(egui::Key::F2);
+            // Alt+V is what WinRAR uses; F3 is what every file manager since
+            // Norton has used for the same thing, and it is one key.
+            look = (i.modifiers.alt && i.key_pressed(egui::Key::V)) || i.key_pressed(egui::Key::F3);
             enter = i.key_pressed(egui::Key::Enter);
             space = i.key_pressed(egui::Key::Space);
             up_level = i.key_pressed(egui::Key::Backspace)
@@ -4790,6 +5083,14 @@ impl Arca {
         // in WinRAR and in the Explorer. Only a zip can be written to, so
         // anywhere else it does nothing rather than opening a box that would
         // have to say no afterwards.
+        // Looking at what is under the cursor without taking it out, which is
+        // what Alt+V has always done in WinRAR.
+        if look {
+            if let Some(i) = row.entry {
+                self.view_entry(i);
+            }
+            return;
+        }
         if rename && self.format == Format::Zip && !row.up {
             self.renaming = Some((row.path.clone(), row.label.clone()));
             self.rename_fresh = true;
@@ -4926,6 +5227,7 @@ impl Arca {
         let wants_extract = std::cell::Cell::new(false);
         let wants_delete = std::cell::Cell::new(false);
         let wants_here = std::cell::Cell::new(false);
+        let wants_view: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
         let wants_test = std::cell::Cell::new(false);
         // The rename in progress, unpacked into pieces the row closure can hold
         // while the table still has `self`. `finish` is how the box says it is
@@ -5259,6 +5561,14 @@ impl Arca {
                                 wants_extract.set(true);
                                 ui.close_menu();
                             }
+                            // Only a file has anything to look at. A folder is a
+                            // prefix on some names, not a thing with bytes.
+                            if let Some(at) = r.entry {
+                                if ui.button(format!("{}	F3", s.view_word)).clicked() {
+                                    wants_view.set(Some(at));
+                                    ui.close_menu();
+                                }
+                            }
                             if ui.button(format!("{}	Alt+W", s.extract_here)).clicked() {
                                 wants_here.set(true);
                                 ui.close_menu();
@@ -5467,6 +5777,9 @@ impl Arca {
             let ctx = ui.ctx().clone();
             self.ask_extract(&ctx, true);
         }
+        if let Some(at) = wants_view.get() {
+            self.view_entry(at);
+        }
         if wants_here.get() {
             let ctx = ui.ctx().clone();
             self.extract_here(&ctx);
@@ -5623,6 +5936,10 @@ impl eframe::App for Arca {
                 self.show_shortcuts = false;
             } else if self.show_settings {
                 self.show_settings = false;
+            // The viewer and the group box close themselves on Escape, and
+            // closing one of them is all that press was for: it must not also
+            // let go of everything that was picked underneath.
+            } else if self.viewing.is_some() || self.picking_group.is_some() {
             } else if matches!(self.view, View::Browse) && !self.busy {
                 // Nothing on top of the list any more, so it backs out of the
                 // last thing there is to back out of: what is picked.
@@ -5694,6 +6011,7 @@ impl eframe::App for Arca {
                 self.settings_window(&ctx2);
                 self.shortcuts_window(&ctx2);
                 self.group_window(&ctx2);
+                self.viewer_window(&ctx2);
                 self.conflict_window(&ctx2);
                 self.password_window(&ctx2);
                 self.confirm_delete_window(&ctx2);
@@ -5794,6 +6112,9 @@ fn main() -> eframe::Result<()> {
         "Arca",
         options,
         Box::new(move |cc| {
+            // What lets the viewer draw a picture straight from the bytes it has
+            // in memory, with no file on disk for it to point at.
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             cc.egui_ctx.set_fonts(theme::fonts());
             // Both, not just the one in use: the setting can be changed while
             // the window is open, and egui keeps a style per theme.
@@ -5825,6 +6146,23 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_is_told_from_the_rest_by_what_it_does_not_have() {
+        assert!(looks_like_text(b""), "an empty file opens as an empty page");
+        assert!(looks_like_text(b"hola\r\nque tal\ttabulado\n"));
+        assert!(
+            looks_like_text("acentos y enes: aeiou \u{f1}\u{e1}".as_bytes()),
+            "high bytes are a name with an accent, not a program"
+        );
+        assert!(
+            !looks_like_text(b"MZ\x90\x00\x03\x00\x00\x00"),
+            "a zero settles it"
+        );
+        // No zeros, but nothing readable either.
+        let noise: Vec<u8> = (1..=200u8).map(|b| b % 0x1F + 1).collect();
+        assert!(!looks_like_text(&noise));
+    }
 
     #[test]
     fn a_mask_picks_the_names_it_describes() {

@@ -39,7 +39,22 @@ eframe = { version = "0.29", default-features = false, features = [
 # Dialogos de fichero nativos. Es lo unico que toca la plataforma.
 rfd = "0.15"
 flate2.workspace = true
-egui_extras = "0.29"
+# La feature `image` trae el cargador que egui usa para dibujar una imagen
+# desde bytes en memoria, que es lo que el visor tiene: una entrada sacada del
+# archivo y nunca escrita en disco. Los formatos se eligen en el propio crate
+# `image`, mas abajo.
+egui_extras = { version = "0.29", features = ["image"] }
+
+# Solo los formatos que alguien mete en un zip y espera poder mirar. Sin las
+# features por defecto: son una docena de decodificadores y cada uno es peso en
+# el binario y superficie que mantener.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "bmp",
+    "webp",
+] }
 sys-locale = "0.3"
 
 # CF_HDROP on the system clipboard, so Ctrl+C here pastes files in the
