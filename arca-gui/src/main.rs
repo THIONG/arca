@@ -26,6 +26,14 @@ use std::time::Instant;
 
 const BUF: usize = 256 * 1024;
 const ROW_HEIGHT: f32 = 29.0;
+
+// How wide a column starts out and the least it can be pulled down to. The
+// name gets the room because it is the thing being read; the rest hold a
+// number or a word and are sized for it.
+const NAME_WIDE: f32 = 320.0;
+const NAME_LEAST: f32 = 140.0;
+const CELL_WIDE: f32 = 95.0;
+const CELL_LEAST: f32 = 60.0;
 // A second click on the same row within this opens it. Half a second, which is
 // what Windows uses for the same gesture by default.
 const DOUBLE_CLICK: f64 = 0.5;
@@ -1379,6 +1387,17 @@ struct Arca {
     // button really does come up.
     drag_settling: bool,
     band_scroll: Option<f32>,
+    // How wide each column is: the name first, then the ones that can be
+    // turned off, in the order of `Columns::ALL`.
+    //
+    // Kept here rather than left to the table because the table hangs the
+    // handle that resizes a column down its whole height. With six columns
+    // that is six invisible strips a hand's width across running the length of
+    // the list, and pressing on one of them anywhere in the rows grabbed a
+    // column edge instead of starting a selection. The handles are ours now
+    // and live in the header, where WinRAR, the Explorer and every other list
+    // of files keep them.
+    widths: Vec<f32>,
     // Set while the wheel is being used to walk the list up and down.
     wheel: Option<Wheel>,
     // The last row a left click landed on, and when. What tells a second click
@@ -1464,6 +1483,9 @@ impl Arca {
             drag_ready: None,
             drag_settling: false,
             band_scroll: None,
+            widths: std::iter::once(NAME_WIDE)
+                .chain(std::iter::repeat(CELL_WIDE).take(Columns::ALL.len()))
+                .collect(),
             wheel: None,
             last_click: None,
             cut_armed: None,
@@ -3241,6 +3263,63 @@ impl Arca {
         }
     }
 
+    // The rule between two columns, and the handle that moves it.
+    //
+    // The handle is a hand's width either side of the rule and only as tall as
+    // the header, which is where every list of files on the machine puts it.
+    // The table's own went from the header to the foot of the list, so six
+    // columns meant six invisible strips down the length of it and a press
+    // near any of them was a column edge rather than the start of a selection.
+    // The rule is still drawn the whole way down: that is what tells you which
+    // number belongs under which heading halfway down a page.
+    fn column_edges(&mut self, ui: &mut egui::Ui, heads: &[egui::Rect], slots: &[usize], foot: f32) {
+        let Some(first) = heads.first() else {
+            return;
+        };
+        let grab = ui.style().interaction.resize_grab_radius_side;
+        // The rule sits down the middle of the gap between two cells.
+        let half = ui.spacing().item_spacing.x * 0.5;
+        let quiet = ui.visuals().widgets.noninteractive.bg_stroke;
+        // Every edge is read off the left of the cell that follows it, never
+        // off the right of the cell before. A header cell reports a rectangle
+        // that has been stretched to hold what was drawn in it, so its right
+        // hand edge wanders past the column and the rules came out scattered
+        // across the words; its left is where the table put it.
+        //
+        // Counted from one, so the edge in hand is the one this cell begins
+        // with and the column it resizes is the one before. The last column
+        // has no edge of its own: it ends where the table does.
+        for i in 1..heads.len() {
+            let x = heads[i].left() - half;
+            let rect = egui::Rect::from_x_y_ranges((x - grab)..=(x + grab), first.y_range());
+            // Clicks as well as drags, so that catching the edge and letting go
+            // again does not fall through to the heading and sort the list.
+            let resp = ui.interact(
+                rect,
+                egui::Id::new(("arca-column-edge", i)),
+                egui::Sense::click_and_drag(),
+            );
+            if resp.hovered() || resp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+            }
+            if resp.dragged() {
+                if let Some(width) = slots.get(i - 1).and_then(|s| self.widths.get_mut(*s)) {
+                    let least = if slots[i - 1] == 0 { NAME_LEAST } else { CELL_LEAST };
+                    *width = (*width + resp.drag_delta().x).max(least);
+                }
+            }
+            let stroke = if resp.dragged() {
+                ui.visuals().widgets.active.bg_stroke
+            } else if resp.hovered() {
+                ui.visuals().widgets.hovered.bg_stroke
+            } else {
+                quiet
+            };
+            ui.painter()
+                .line_segment([egui::pos2(x, first.top()), egui::pos2(x, foot)], stroke);
+        }
+    }
+
     // The wheel used as a button: press it and the list follows the pointer
     // until something puts it away.
     fn wheel_scroll(&mut self, ui: &mut egui::Ui, viewport: egui::Rect, offset: f32, reach: f32) {
@@ -3839,6 +3918,20 @@ impl Arca {
             .map(|(which, _)| *which)
             .filter(|w| columns.on(*w))
             .collect();
+        // Which width belongs to each column on screen, left to right. The
+        // name is always the first, and the rest keep their own width whether
+        // they are showing or not, so turning one off and on again does not
+        // lose how wide it was pulled.
+        let slots: Vec<usize> = std::iter::once(0)
+            .chain(shown.iter().map(|w| {
+                Columns::ALL.iter().position(|(c, _)| c == w).unwrap_or(0) + 1
+            }))
+            .collect();
+        // The whole of each header cell, edge to edge: the rectangle of the
+        // cell's response, not the one `col` hands back, which is only as wide
+        // as the word inside it. This is what says where the column edges are,
+        // and the edges are where the handles go.
+        let mut heads: Vec<egui::Rect> = Vec::new();
         let toggle_column: std::cell::Cell<Option<SortColumn>> = std::cell::Cell::new(None);
         // What the row menu asked for. Cells again, and acted on after the
         // table: doing any of it inside the closure would be borrowing self
@@ -3877,7 +3970,8 @@ impl Arca {
         // heading when the eye is halfway down the page. They were taken out
         // here for a while on the grounds that they looked like a spreadsheet,
         // which was a change nobody asked for and the wrong call. The table
-        // draws them itself; nothing to do but leave its colour alone.
+        // used to draw them along with its own resize handles; they are drawn
+        // in `column_edges` now, with the handles.
         let accent = theme::cursor(ui.visuals()).color;
         let head = |ui: &mut egui::Ui, text: &str, col: SortColumn| -> egui::Response {
             let cell = ui.max_rect();
@@ -3908,7 +4002,9 @@ impl Arca {
             // Stripes, ticks and a highlight were three ways of saying the same
             // thing. What is picked is painted; the rest is left quiet.
             .striped(false)
-            .resizable(true)
+            // The table's own handles run the whole height of the list; ours
+            // are in the header. See `widths`.
+            .resizable(false)
             // Without this the cells only sense hovering, and row.response()
             // would never report a double click.
             .sense(egui::Sense::click())
@@ -3917,13 +4013,21 @@ impl Arca {
             // pull opposite ways: dragging down moves the content down, which
             // is the list scrolling up, so a downward selection ran upwards.
             .drag_to_scroll(false)
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            // Name first and wide, with the icon inside it. That is where the
-            // Explorer and every archiver put it, and a separate icon column
-            // only pushed the one thing you read away from its picture.
-            .column(Column::initial(320.0).at_least(140.0))
-            .columns(Column::initial(95.0).at_least(60.0), shown.len().saturating_sub(1))
-            .column(Column::remainder().at_least(60.0));
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+        // Name first and wide, with the icon inside it. That is where the
+        // Explorer and every archiver put it, and a separate icon column only
+        // pushed the one thing you read away from its picture.
+        //
+        // Each column is given its exact width, so that what the header hands
+        // back is what was asked for: the last one takes whatever is left, as
+        // the date does in every file list.
+        for (n, slot) in slots.iter().enumerate() {
+            builder = if n + 1 == slots.len() {
+                builder.column(Column::remainder().at_least(CELL_LEAST))
+            } else {
+                builder.column(Column::exact(self.widths[*slot]))
+            };
+        }
         // Set only while a selection drag has run off the end of the list, so
         // the rest of the time the table keeps its own scroll position.
         if let Some(y) = self.band_scroll.or(self.wheel.map(|w| w.at)) {
@@ -3948,7 +4052,8 @@ impl Arca {
                     }
                 };
                 let mut resp = None;
-                h.col(|ui| resp = Some(head(ui, s.col_name, SortColumn::Name)));
+                let (_, cell) = h.col(|ui| resp = Some(head(ui, s.col_name, SortColumn::Name)));
+                heads.push(cell.rect);
                 if let Some(r) = resp {
                     if r.clicked() {
                         requested = Some(SortColumn::Name);
@@ -3957,7 +4062,9 @@ impl Arca {
                 }
                 for which in &shown {
                     let mut resp = None;
-                    h.col(|ui| resp = Some(head(ui, Columns::label(*which, s), *which)));
+                    let (_, cell) =
+                        h.col(|ui| resp = Some(head(ui, Columns::label(*which, s), *which)));
+                    heads.push(cell.rect);
                     if let Some(r) = resp {
                         if r.clicked() {
                             requested = Some(*which);
@@ -4222,6 +4329,7 @@ impl Arca {
         // takes in, and how far down the list it currently sits: both are what
         // a drag needs to know when it reaches an edge.
         let reach = (out.content_size.y - out.inner_rect.height()).max(0.0);
+        self.column_edges(ui, &heads, &slots, out.inner_rect.bottom());
         self.rubber_band(ui, &visible, &row_rects, out.inner_rect, out.state.offset.y, reach);
         self.wheel_scroll(ui, out.inner_rect, out.state.offset.y, reach);
         if let Some(index) = opened {
