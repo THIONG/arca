@@ -2004,6 +2004,8 @@ impl GpuiShell {
             SortColumn::Method => 130.0,
             SortColumn::Saved => 82.0,
             SortColumn::Modified => 150.0,
+            SortColumn::Created | SortColumn::Accessed => 150.0,
+            SortColumn::Attributes => 105.0,
             SortColumn::Crc => 105.0,
             SortColumn::Type => 120.0,
             SortColumn::Path => 180.0,
@@ -2115,6 +2117,9 @@ impl GpuiShell {
             }
             SortColumn::Saved => format!("{:.0}%", saved_of(row) * 100.0),
             SortColumn::Modified => when(row.mtime),
+            SortColumn::Created => when(row.created),
+            SortColumn::Accessed => when(row.accessed),
+            SortColumn::Attributes => super::attribute_letters(row.attributes),
             SortColumn::Crc => {
                 if row.is_dir {
                     "—".to_string()
@@ -2150,6 +2155,9 @@ impl GpuiShell {
                 SortColumn::Method => "Method",
                 SortColumn::Saved => "Saved",
                 SortColumn::Modified => "Modified",
+                SortColumn::Created => "Created",
+                SortColumn::Accessed => "Accessed",
+                SortColumn::Attributes => "Attributes",
                 SortColumn::Crc => "CRC32",
                 SortColumn::Type => "Type",
                 SortColumn::Path => "Path",

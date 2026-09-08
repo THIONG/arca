@@ -2560,6 +2560,7 @@ impl AppController {
         self.spawn(total, move |tx| {
             let notify = |i: usize, n: usize, name: &str| {
                 let _ = tx.send(Message::Progress(i, n, name.to_string()));
+                true
             };
             let ask = conflict_asker(tx, &reply_rx);
             let result = extract(&archive, &dest, &wanted, &notify, &ask, pw.as_deref());
@@ -2730,6 +2731,12 @@ impl AppController {
                 band_scroll: None,
                 renaming: None,
                 rename_fresh: false,
+                default_password: None,
+                asking_default_password: false,
+                asking_folder: false,
+                folder_input: String::new(),
+                undo: None,
+                stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 viewing: None,
                 picking_group: None,
                 mask: String::new(),
@@ -3012,6 +3019,7 @@ impl AppController {
         self.spawn(total, move |tx| {
             let notify = |i: usize, n: usize, name: &str| {
                 let _ = tx.send(Message::Progress(i, n, name.to_string()));
+                true
             };
             let ask = conflict_asker(tx, &reply_rx);
             let _ = tx.send(
@@ -3145,6 +3153,7 @@ impl AppController {
         self.spawn(total, move |tx| {
             let notify = |i: usize, n: usize, name: &str| {
                 let _ = tx.send(Message::Progress(i, n, name.to_string()));
+                true
             };
             // A folder nobody has seen yet has nothing in it to overwrite, so
             // there is no question to put on screen.
@@ -3636,6 +3645,8 @@ impl AppController {
             Job::Password { .. } => s.changing_password.to_string(),
             Job::Delete { .. } => s.deleting.to_string(),
             Job::Rename { .. } => s.renaming.to_string(),
+            Job::CopyTo { .. } => s.copying_word.to_string(),
+            Job::NewFolder { .. } => s.adding.to_string(),
             Job::Compress { .. } => s.compressing.to_string(),
             Job::Add { .. } => s.adding.to_string(),
         };
@@ -3645,6 +3656,8 @@ impl AppController {
                 | Job::Password { .. }
                 | Job::Delete { .. }
                 | Job::Rename { .. }
+                | Job::CopyTo { .. }
+                | Job::NewFolder { .. }
                 | Job::Add { .. }
         );
         // The file on disk is about to change, so the listing has to be redone.
@@ -3675,6 +3688,7 @@ impl AppController {
         self.spawn(0, move |tx| {
             let notify = |i: usize, n: usize, name: &str| {
                 let _ = tx.send(Message::Progress(i, n, name.to_string()));
+                true
             };
             let ask = conflict_asker(tx, &reply_rx);
             let outcome = run_job_blocking(job, s, &notify, &ask);
@@ -3715,14 +3729,8 @@ impl Arca {
         let mut go: Option<String> = None;
         let folders = self.controller.state.folders.clone();
         let here = self.controller.state.current_dir.clone();
-        let root = self
-            .controller
-            .state
-            .archive
-            .as_ref()
-            .and_then(|a| a.file_name())
-            .map(|x| x.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let s = self.controller.s();
+        let mut icons = std::mem::take(&mut self.icons);
         egui::SidePanel::left("tree")
             .resizable(true)
             .default_width(220.0)
@@ -3774,23 +3782,23 @@ impl Arca {
     // a path made out of those names, and under a different page it is a path
     // that does not exist.
     fn reread_names(&mut self, ctx: &egui::Context, page: arca_zip::pages::Page) {
-        self.settings.page = page;
-        self.settings.save();
-        for e in &mut self.entries {
+        self.controller.state.settings.page = page;
+        self.controller.state.settings.save();
+        for e in &mut self.controller.state.entries {
             if e.utf8 {
                 continue;
             }
             e.name = arca_zip::pages::decode(&e.raw_name, page);
             e.is_dir = e.name.ends_with('/') || e.name.ends_with('\\');
         }
-        self.folders = tree::folders_of(&self.entries);
-        self.clear_picked();
-        self.cursor = None;
-        self.current_dir.clear();
-        self.history = vec![String::new()];
-        self.here = 0;
-        self.notice = self.summary();
-        self.error = false;
+        self.controller.state.folders = tree::folders_of(&self.controller.state.entries);
+        self.controller.clear_picked();
+        self.controller.state.cursor = None;
+        self.controller.state.current_dir.clear();
+        self.controller.state.history = vec![String::new()];
+        self.controller.state.here = 0;
+        self.controller.state.notice = self.controller.summary();
+        self.controller.state.error = false;
         ctx.request_repaint();
     }
 
@@ -3800,10 +3808,10 @@ impl Arca {
     // because making it is a rewrite of the whole archive and doing that twice
     // for one folder would be silly.
     fn new_folder_window(&mut self, ctx: &egui::Context) {
-        if !self.asking_folder {
+        if !self.controller.state.asking_folder {
             return;
         }
-        let s = self.s();
+        let s = self.controller.s();
         let mut go = false;
         let mut cancel = false;
         egui::Window::new(s.new_folder)
@@ -3815,7 +3823,7 @@ impl Arca {
                 ui.label(s.folder_name);
                 ui.add_space(6.0);
                 let field = ui.add(
-                    egui::TextEdit::singleline(&mut self.folder_input)
+                    egui::TextEdit::singleline(&mut self.controller.state.folder_input)
                         .id(egui::Id::new("arca-new-folder"))
                         .desired_width(260.0),
                 );
@@ -3837,39 +3845,39 @@ impl Arca {
                 ui.add_space(4.0);
             });
         if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.asking_folder = false;
-            self.folder_input.clear();
+            self.controller.state.asking_folder = false;
+            self.controller.state.folder_input.clear();
         }
         if go {
-            self.asking_folder = false;
-            let name = std::mem::take(&mut self.folder_input).trim().to_string();
-            let Some(archive) = self.archive.clone() else {
+            self.controller.state.asking_folder = false;
+            let name = std::mem::take(&mut self.controller.state.folder_input)
+                .trim()
+                .to_string();
+            let Some(archive) = self.controller.state.archive.clone() else {
                 return;
             };
             // The same rules a rename lives by: a name is a name and not a
             // path, and nothing here is called that already.
             if name.is_empty() || name.contains('/') || name.contains('\\') {
-                self.notice = s.bad_name.to_string();
-                self.error = true;
+                self.controller.state.notice = s.bad_name.to_string();
+                self.controller.state.error = true;
                 return;
             }
             if self
+                .controller
                 .visible_rows()
                 .iter()
                 .any(|r| r.label.eq_ignore_ascii_case(&name))
             {
-                self.notice = fill(s.name_taken, &[("name", &name)]);
-                self.error = true;
+                self.controller.state.notice = fill(s.name_taken, &[("name", &name)]);
+                self.controller.state.error = true;
                 return;
             }
-            self.run_job(
-                ctx,
-                Job::NewFolder {
-                    archive,
-                    name: format!("{}{name}/", self.current_dir),
-                    password: self.archive_password.clone(),
-                },
-            );
+            self.controller.run_job(Job::NewFolder {
+                archive,
+                name: format!("{}{name}/", self.controller.state.current_dir),
+                password: self.controller.state.archive_password.clone(),
+            });
         }
     }
 
@@ -3878,8 +3886,8 @@ impl Arca {
     // The one thing to do before a change nobody is sure about, and the reason
     // it is here rather than in the file manager is that the archive being
     // looked at is the one that gets copied: no going and finding it again.
-    fn save_copy(&mut self, ctx: &egui::Context) {
-        let Some(archive) = self.archive.clone() else {
+    fn save_copy(&mut self, _ctx: &egui::Context) {
+        let Some(archive) = self.controller.state.archive.clone() else {
             return;
         };
         let name = archive
@@ -3896,7 +3904,7 @@ impl Arca {
         if dest == archive {
             return;
         }
-        self.run_job(ctx, Job::CopyTo { archive, dest });
+        self.controller.run_job(Job::CopyTo { archive, dest });
     }
 
     // The password to try on anything that asks for one, so that a folder full
@@ -3908,10 +3916,10 @@ impl Arca {
     // encrypted archive stops being encrypted, and a program that offers to
     // remember one for you had better be clear about how long "remember" is.
     fn default_password_window(&mut self, ctx: &egui::Context) {
-        if !self.asking_default_password {
+        if !self.controller.state.asking_default_password {
             return;
         }
-        let s = self.s();
+        let s = self.controller.s();
         let mut close = false;
         let mut forget = false;
         egui::Window::new(s.default_password)
@@ -3921,9 +3929,9 @@ impl Arca {
             .show(ctx, |ui| {
                 ui.add_space(6.0);
                 let field = ui.add(
-                    egui::TextEdit::singleline(&mut self.password_input)
+                    egui::TextEdit::singleline(&mut self.controller.state.password_input)
                         .id(egui::Id::new("arca-default-password"))
-                        .password(!self.show_password)
+                        .password(!self.controller.state.show_password)
                         .desired_width(280.0)
                         .hint_text(s.password_hint),
                 );
@@ -3933,7 +3941,7 @@ impl Arca {
                 if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     close = true;
                 }
-                ui.checkbox(&mut self.show_password, s.show_password);
+                ui.checkbox(&mut self.controller.state.show_password, s.show_password);
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(s.password_kept).weak().small());
                 ui.add_space(10.0);
@@ -3943,7 +3951,7 @@ impl Arca {
                     }
                     if ui
                         .add_enabled(
-                            self.default_password.is_some(),
+                            self.controller.state.default_password.is_some(),
                             egui::Button::new(s.remove_password),
                         )
                         .clicked()
@@ -3951,27 +3959,27 @@ impl Arca {
                         forget = true;
                     }
                     if ui.button(s.cancel).clicked() {
-                        self.asking_default_password = false;
-                        self.password_input.clear();
+                        self.controller.state.asking_default_password = false;
+                        self.controller.state.password_input.clear();
                     }
                 });
                 ui.add_space(4.0);
             });
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.asking_default_password = false;
-            self.password_input.clear();
+            self.controller.state.asking_default_password = false;
+            self.controller.state.password_input.clear();
         }
         if forget {
-            self.default_password = None;
-            self.asking_default_password = false;
-            self.password_input.clear();
-            self.notice = s.password_forgotten.to_string();
-            self.error = false;
+            self.controller.state.default_password = None;
+            self.controller.state.asking_default_password = false;
+            self.controller.state.password_input.clear();
+            self.controller.state.notice = s.password_forgotten.to_string();
+            self.controller.state.error = false;
         }
         if close {
-            let given = std::mem::take(&mut self.password_input);
-            self.default_password = (!given.is_empty()).then_some(given);
-            self.asking_default_password = false;
+            let given = std::mem::take(&mut self.controller.state.password_input);
+            self.controller.state.default_password = (!given.is_empty()).then_some(given);
+            self.controller.state.asking_default_password = false;
         }
     }
 
@@ -3980,22 +3988,22 @@ impl Arca {
     // A swap of two names, because the version before the change was moved
     // aside rather than thrown away. There is one step and no more: taking it
     // back leaves nothing to take back, and the sidecar goes with it.
-    fn undo_last(&mut self, ctx: &egui::Context) {
-        let Some((archive, _)) = self.undo.take() else {
+    fn undo_last(&mut self, _ctx: &egui::Context) {
+        let Some((archive, _)) = self.controller.state.undo.take() else {
             return;
         };
         let keep = undo_path(&archive);
         if !keep.exists() {
             return;
         }
-        let pw = self.archive_password.clone();
+        let pw = self.controller.state.archive_password.clone();
         if let Err(e) = fs::remove_file(&archive).and_then(|_| fs::rename(&keep, &archive)) {
-            self.notice = e.to_string();
-            self.error = true;
+            self.controller.state.notice = e.to_string();
+            self.controller.state.error = true;
             return;
         }
-        self.open(ctx, archive);
-        self.archive_password = pw;
+        self.controller.open(archive);
+        self.controller.state.archive_password = pw;
     }
 
     // Whatever is being kept for an undo is thrown away.
@@ -4004,7 +4012,7 @@ impl Arca {
     // called `something.zip.arca-undo` sitting next to somebody's archive after
     // the program has gone is litter, whatever it was for.
     fn drop_undo(&mut self) {
-        if let Some((archive, _)) = self.undo.take() {
+        if let Some((archive, _)) = self.controller.state.undo.take() {
             let _ = fs::remove_file(undo_path(&archive));
         }
     }
@@ -4350,12 +4358,12 @@ impl Arca {
         // point of it is that it is one keystroke: the folder the archive is in
         // is where an extraction goes nine times out of ten.
         if ctrl_p && !typing {
-            self.password_input.clear();
-            self.asking_default_password = true;
+            self.controller.state.password_input.clear();
+            self.controller.state.asking_default_password = true;
         }
         // One step back from the last change to the archive, which is the step
         // anybody wants: the one they just took by mistake.
-        if undo && !typing && self.undo.is_some() {
+        if undo && !typing && self.controller.state.undo.is_some() {
             self.undo_last(ctx);
         }
         if alt_w && !typing {
@@ -4793,7 +4801,7 @@ impl Arca {
     // another, which is a lot of furniture above a list. The name of the file
     // moved to the title bar, where the name of the open document goes in every
     // other program, and the ticking buttons in beside the counts they act on.
-    fn toolbar(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+    fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let s = self.controller.s();
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -4910,7 +4918,7 @@ impl Arca {
                     }
                     if ui
                         .add_enabled(
-                            has && self.format == Format::Zip,
+                            has && self.controller.state.format == Format::Zip,
                             egui::Button::new(s.new_folder),
                         )
                         .clicked()
@@ -4933,12 +4941,17 @@ impl Arca {
                     // Named after what it would take back, because "undo" on its
                     // own asks the reader to remember what they did last.
                     let back = self
+                        .controller
+                        .state
                         .undo
                         .as_ref()
                         .map(|(_, what)| format!("{}: {}	Ctrl+Z", s.undo_word, what))
                         .unwrap_or_else(|| format!("{}	Ctrl+Z", s.undo_word));
                     if ui
-                        .add_enabled(self.undo.is_some(), egui::Button::new(back))
+                        .add_enabled(
+                            self.controller.state.undo.is_some(),
+                            egui::Button::new(back),
+                        )
                         .clicked()
                     {
                         wants = Some(More::Undo);
@@ -4966,10 +4979,10 @@ impl Arca {
                     }
                     // Only where there is an archive whose names could be read
                     // another way. A tar has none of this argument.
-                    ui.add_enabled_ui(has && self.format == Format::Zip, |ui| {
+                    ui.add_enabled_ui(has && self.controller.state.format == Format::Zip, |ui| {
                         ui.menu_button(s.name_encoding, |ui| {
                             for (page, _, label) in arca_zip::pages::Page::ALL {
-                                let on = self.settings.page == page;
+                                let on = self.controller.state.settings.page == page;
                                 if ui.selectable_label(on, label).clicked() {
                                     wants = Some(More::Page(page));
                                     ui.close_menu();
@@ -5068,13 +5081,13 @@ impl Arca {
                 }
                 Some(More::Undo) => self.undo_last(ctx),
                 Some(More::NewFolder) => {
-                    self.folder_input.clear();
-                    self.asking_folder = true;
+                    self.controller.state.folder_input.clear();
+                    self.controller.state.asking_folder = true;
                 }
                 Some(More::SaveCopy) => self.save_copy(ctx),
                 Some(More::DefaultPassword) => {
-                    self.password_input.clear();
-                    self.asking_default_password = true;
+                    self.controller.state.password_input.clear();
+                    self.controller.state.asking_default_password = true;
                 }
                 Some(More::Page(p)) => self.reread_names(ctx, p),
                 Some(More::Tree) => {
