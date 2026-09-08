@@ -1270,6 +1270,43 @@ enum More {
     Shortcuts,
 }
 
+/// Pressing the wheel drops an anchor and the list then runs towards the
+/// pointer, faster the further away it is: the gesture Windows has had since
+/// the wheel arrived, and the one every browser copies.
+#[derive(Clone, Copy)]
+struct Wheel {
+    /// Where the wheel went down. The list stands still while the pointer is
+    /// near it and runs when it is away.
+    anchor: egui::Pos2,
+    /// How far down the list is, kept here rather than read back from the
+    /// table because it moves by fractions of a pixel per frame and the table
+    /// only remembers whole scroll positions.
+    at: f32,
+    /// Whether the pointer has pulled away from the anchor yet. Letting the
+    /// wheel go after it has ends the gesture, letting it go before leaves it
+    /// running until the next click; that is what makes press-and-drag and
+    /// click-and-go both work off the one button.
+    moved: bool,
+}
+
+/// How fast the list should run, in pixels a second, for a pointer `away`
+/// pixels from the anchor. Negative runs it up.
+///
+/// Nothing at all inside a dead zone, because the wheel is a button too and a
+/// hand that presses one moves a pixel or two doing it. Past that it grows
+/// with the square of the distance: gently near the anchor, where the point is
+/// to read what goes by, and hard further out, where the point is to get to
+/// the end. Capped, because past a certain speed the only difference is how
+/// blurred it is.
+fn wheel_speed(away: f32) -> f32 {
+    const DEAD: f32 = 12.0;
+    let past = away.abs() - DEAD;
+    if past <= 0.0 {
+        return 0.0;
+    }
+    (past * past / 12.0).min(4000.0) * away.signum()
+}
+
 struct Arca {
     view: View,
     settings: Settings,
@@ -1342,6 +1379,8 @@ struct Arca {
     // button really does come up.
     drag_settling: bool,
     band_scroll: Option<f32>,
+    // Set while the wheel is being used to walk the list up and down.
+    wheel: Option<Wheel>,
     // The last row a left click landed on, and when. What tells a second click
     // on the same row from the first one of a new pair.
     last_click: Option<(usize, f64)>,
@@ -1425,6 +1464,7 @@ impl Arca {
             drag_ready: None,
             drag_settling: false,
             band_scroll: None,
+            wheel: None,
             last_click: None,
             cut_armed: None,
             cut_pending: None,
@@ -3201,6 +3241,91 @@ impl Arca {
         }
     }
 
+    // The wheel used as a button: press it and the list follows the pointer
+    // until something puts it away.
+    fn wheel_scroll(&mut self, ui: &mut egui::Ui, viewport: egui::Rect, offset: f32, reach: f32) {
+        let (pressed, released, here, elsewhere, escaped, spun, dt) = ui.input(|i| {
+            (
+                i.pointer.button_pressed(egui::PointerButton::Middle),
+                i.pointer.button_released(egui::PointerButton::Middle),
+                i.pointer.latest_pos(),
+                i.pointer.button_pressed(egui::PointerButton::Primary)
+                    || i.pointer.button_pressed(egui::PointerButton::Secondary),
+                i.key_down(egui::Key::Escape),
+                i.raw_scroll_delta.y != 0.0,
+                // A frame that took a long time -- the window came back from
+                // being hidden, say -- would otherwise jump the list a page.
+                i.stable_dt.min(0.1),
+            )
+        });
+
+        if pressed {
+            // Pressing again puts it away, the way it does in a browser.
+            self.wheel = match self.wheel {
+                Some(_) => None,
+                None => here.filter(|p| viewport.contains(*p)).map(|p| Wheel {
+                    anchor: p,
+                    at: offset,
+                    moved: false,
+                }),
+            };
+        }
+        let Some(mut wheel) = self.wheel else {
+            return;
+        };
+        // Any other button, the wheel itself turning, or Escape: all of them
+        // are somebody asking for something else.
+        if elsewhere || escaped || spun {
+            self.wheel = None;
+            return;
+        }
+        let Some(at) = here else {
+            return;
+        };
+
+        let speed = wheel_speed(at.y - wheel.anchor.y);
+        wheel.moved |= speed != 0.0;
+        if released && wheel.moved {
+            // Held down and pulled: the gesture ends where the hand lets go.
+            // Let go without having pulled and it stays on, waiting.
+            self.wheel = None;
+            return;
+        }
+        wheel.at = (wheel.at + speed * dt).clamp(0.0, reach);
+        self.wheel = Some(wheel);
+        if speed != 0.0 {
+            // Nothing else on screen is moving, so without this the list would
+            // take one step per stray mouse event instead of running.
+            ui.ctx().request_repaint();
+        }
+
+        // The anchor, left where the wheel went down: a ring with an arrow out
+        // of the top and one out of the bottom, which is what Windows draws,
+        // so it reads as the same gesture rather than as something of ours.
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        let ink = ui.visuals().weak_text_color();
+        let painter = ui.painter();
+        painter.circle(
+            wheel.anchor,
+            10.0,
+            ui.visuals().panel_fill,
+            egui::Stroke::new(1.0_f32, ink),
+        );
+        painter.circle_filled(wheel.anchor, 1.5, ink);
+        for up in [1.0_f32, -1.0] {
+            let tip = wheel.anchor.y - up * 6.5;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(wheel.anchor.x - 3.0, tip + up * 3.0),
+                    egui::pos2(wheel.anchor.x + 3.0, tip + up * 3.0),
+                    egui::pos2(wheel.anchor.x, tip),
+                ],
+                ink,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
+
     // Press on the list and drag: a rectangle follows the pointer and every row
     // it touches gets ticked, the way it works in any file list.
     //
@@ -3761,7 +3886,7 @@ impl Arca {
             .column(Column::remainder().at_least(60.0));
         // Set only while a selection drag has run off the end of the list, so
         // the rest of the time the table keeps its own scroll position.
-        if let Some(y) = self.band_scroll {
+        if let Some(y) = self.band_scroll.or(self.wheel.map(|w| w.at)) {
             builder = builder.vertical_scroll_offset(y);
         }
 
@@ -4058,6 +4183,7 @@ impl Arca {
         // a drag needs to know when it reaches an edge.
         let reach = (out.content_size.y - out.inner_rect.height()).max(0.0);
         self.rubber_band(ui, &visible, &row_rects, out.inner_rect, out.state.offset.y, reach);
+        self.wheel_scroll(ui, out.inner_rect, out.state.offset.y, reach);
         if let Some(index) = opened {
             let target = &visible[index];
             if target.is_dir {
@@ -4298,6 +4424,29 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The wheel is a button as well as a wheel, and pressing one moves the
+    // hand: a dead zone is the difference between a list that waits and a list
+    // that creeps for as long as the anchor is down.
+    #[test]
+    fn a_hand_resting_on_the_wheel_leaves_the_list_where_it_is() {
+        assert_eq!(wheel_speed(0.0), 0.0);
+        assert_eq!(wheel_speed(-8.0), 0.0);
+        assert_eq!(wheel_speed(12.0), 0.0);
+    }
+
+    #[test]
+    fn the_list_runs_the_way_the_pointer_went_and_harder_the_further_it_is() {
+        assert!(wheel_speed(40.0) > 0.0);
+        assert!(wheel_speed(-40.0) < 0.0);
+        assert!(wheel_speed(90.0) > wheel_speed(40.0));
+        // Up and down are the same gesture mirrored, and a list that ran
+        // faster one way than the other would be maddening rather than wrong.
+        assert_eq!(wheel_speed(40.0), -wheel_speed(-40.0));
+        // Far enough out and it stops getting faster: everything past here is
+        // a blur either way.
+        assert_eq!(wheel_speed(900.0), wheel_speed(2000.0));
+    }
 
     // The only arithmetic in this file that can be wrong without anyone
     // noticing: a date is either right or plausible, and plausible is worse.
