@@ -1334,6 +1334,13 @@ struct Arca {
     // Set when a press lands on a row that is already picked: the gesture is
     // still ambiguous until it has moved, and this is what it turns into.
     drag_ready: Option<usize>,
+    // Set the moment a drag out of the window finishes. `DoDragDrop` runs its
+    // own loop and swallows the release that ends it, so the toolkit comes back
+    // still believing the button is held: without this the next frame starts a
+    // selection band that has already missed its own release and can never be
+    // ended, and the list stops answering to anything. It clears when the
+    // button really does come up.
+    drag_settling: bool,
     band_scroll: Option<f32>,
     // The last row a left click landed on, and when. What tells a second click
     // on the same row from the first one of a new pair.
@@ -1416,6 +1423,7 @@ impl Arca {
             confirm_drop: None,
             band_anchor: None,
             drag_ready: None,
+            drag_settling: false,
             band_scroll: None,
             last_click: None,
             cut_armed: None,
@@ -2115,6 +2123,12 @@ impl Arca {
         // Copy only. Moving would mean taking the entries out of the archive,
         // and the one gesture that does that already asks first.
         let _ = arca_drag::drag(items, deliver, false);
+        // However it ended -- dropped, or called off with Escape -- the button
+        // that started it went up somewhere this window never saw.
+        self.drag_settling = true;
+        self.band = None;
+        self.band_anchor = None;
+        self.band_scroll = None;
         ctx.request_repaint();
     }
 
@@ -3211,6 +3225,24 @@ impl Arca {
                 i.modifiers.command,
             )
         });
+
+        // Just back from a drag out of the window, with the button still down
+        // as far as the toolkit knows. Nothing happens until it comes up for
+        // real; the press that is still on the books belongs to a gesture that
+        // is over.
+        if self.drag_settling {
+            self.band = None;
+            self.band_anchor = None;
+            self.band_scroll = None;
+            // Cleared by the button coming up, and also by a fresh press, in
+            // case the release happened over somebody else's window and this
+            // one never hears about it. Either way the gesture that
+            // `DoDragDrop` swallowed is over.
+            if !down || ui.input(|i| i.pointer.any_pressed()) {
+                self.drag_settling = false;
+            }
+            return;
+        }
 
         // Something else has the pointer: the handle that resizes a column, or
         // the scroll bar. Both are drawn over the list rather than beside it, so
