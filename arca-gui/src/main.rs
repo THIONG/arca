@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
-use tree::{children_of, draw_icon, entries_under, kind_of, parent_of, Kind, Row};
+use tree::{children_of, draw_icon, draw_icon_at, entries_under, kind_of, parent_of, Kind, Row};
 
 const BUF: usize = 256 * 1024;
 const ROW_HEIGHT: f32 = 29.0;
@@ -1863,43 +1863,163 @@ fn matches_mask(mask: &str, name: &str) -> bool {
     m[i..].iter().all(|c| *c == '*')
 }
 
-/// One level of the folder tree, and everything under it.
+/// One row of the folder tree, ready to be drawn.
+struct Twig<'a> {
+    name: &'a str,
+    path: String,
+    depth: usize,
+    kids: bool,
+    open: bool,
+    // The archive itself rather than a folder inside it, which gets the icon
+    // the desktop puts on a .zip.
+    archive: bool,
+}
+
+/// How tall a row of the tree is. Taller than a line of text, because this is a
+/// list of places to press rather than a paragraph to read.
+const TWIG_HEIGHT: f32 = 26.0;
+
+/// Draws one row of the folder tree and says what was pressed.
 ///
-/// A folder with nothing inside it gets no triangle, and one with something
-/// gets a triangle that only opens and closes: the name beside it stays a place
-/// you can go to either way, which is the difference between a tree you can
-/// walk and one you have to unfold first.
+/// The whole width answers, not the word: a navigation pane where only the
+/// letters are a target is a pane you have to aim at, and the highlight that
+/// says where you are should reach both edges or it reads as a button that
+/// happens to be lit. That is how the Explorer's own pane behaves.
+///
+/// The chevron on the right belongs to whether the folder is unfolded and
+/// nothing else. Pressing the name takes you there whether it is unfolded or
+/// not, which is the difference between a tree you can walk and one you have to
+/// open first.
+fn twig(
+    ui: &mut egui::Ui,
+    icons: &mut HashMap<String, Option<egui::TextureHandle>>,
+    twig: &Twig<'_>,
+    here: &str,
+) -> egui::Response {
+    let full = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(full, TWIG_HEIGHT), egui::Sense::click());
+    let on = here == twig.path;
+    let fill = if on {
+        ui.visuals().selection.bg_fill
+    } else if resp.hovered() {
+        ui.visuals().widgets.hovered.bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let ink = if on {
+        ui.visuals().selection.stroke.color
+    } else {
+        ui.visuals().widgets.noninteractive.fg_stroke.color
+    };
+    if fill != egui::Color32::TRANSPARENT {
+        ui.painter()
+            .rect_filled(rect, egui::Rounding::same(4.0), fill);
+    }
+
+    // Each level a thumb further in, and the icon always at the same distance
+    // from the name, so a column of names reads as a column.
+    let inset = 8.0 + twig.depth as f32 * 14.0;
+    let mid = rect.center().y;
+    let icon = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + inset + 8.0, mid),
+        egui::Vec2::splat(16.0),
+    );
+    let name = if twig.archive {
+        "archive.zip"
+    } else {
+        "folder"
+    };
+    match system_icon(ui.ctx(), icons, name, !twig.archive) {
+        Some(tex) => {
+            egui::Image::new(&tex).paint_at(ui, icon);
+        }
+        None => draw_icon_at(
+            ui,
+            icon,
+            if twig.archive {
+                Kind::Archive
+            } else {
+                Kind::Dir
+            },
+        ),
+    }
+
+    ui.painter().text(
+        egui::pos2(icon.right() + 8.0, mid),
+        egui::Align2::LEFT_CENTER,
+        twig.name,
+        egui::TextStyle::Body.resolve(ui.style()),
+        ink,
+    );
+
+    // A chevron only where there is something folded up behind it, turned down
+    // once it is open, at the far edge where every pane on this machine puts
+    // the thing that says "there is more".
+    if twig.kids {
+        let c = egui::pos2(rect.right() - 14.0, mid);
+        let (w, h) = (3.5, 5.0);
+        let points = if twig.open {
+            vec![
+                egui::pos2(c.x - h, c.y - w * 0.6),
+                egui::pos2(c.x + h, c.y - w * 0.6),
+                egui::pos2(c.x, c.y + w),
+            ]
+        } else {
+            vec![
+                egui::pos2(c.x - w * 0.6, c.y - h),
+                egui::pos2(c.x - w * 0.6, c.y + h),
+                egui::pos2(c.x + w, c.y),
+            ]
+        };
+        ui.painter().add(egui::Shape::convex_polygon(
+            points,
+            ink.gamma_multiply(0.7),
+            egui::Stroke::NONE,
+        ));
+    }
+    resp
+}
+
+/// One level of the folder tree, and everything under it.
 fn branch(
     ui: &mut egui::Ui,
+    icons: &mut HashMap<String, Option<egui::TextureHandle>>,
     folder: &tree::Folder,
     prefix: &str,
+    depth: usize,
     here: &str,
     go: &mut Option<String>,
 ) {
     for (name, kid) in &folder.kids {
         let path = format!("{prefix}{name}/");
-        let on = here == path;
-        if kid.is_empty() {
-            // Lined up with the ones that do have a triangle, so a level reads
-            // as a level rather than as a ragged edge. The triangle is an icon
-            // wide and the row puts its own gap after this, which between them
-            // come to what the header spends on the same thing.
-            ui.horizontal(|ui| {
-                ui.add_space(ui.spacing().icon_width);
-                if ui.selectable_label(on, name).clicked() {
-                    *go = Some(path.clone());
-                }
-            });
-            continue;
-        }
         let id = ui.make_persistent_id(&path);
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
-            .show_header(ui, |ui| {
-                if ui.selectable_label(on, name).clicked() {
-                    *go = Some(path.clone());
-                }
-            })
-            .body(|ui| branch(ui, kid, &path, here, go));
+        let mut state =
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+        let open = state.is_open();
+        let row = Twig {
+            name,
+            path: path.clone(),
+            depth,
+            kids: !kid.is_empty(),
+            open,
+            archive: false,
+        };
+        let resp = twig(ui, icons, &row, here);
+        if resp.clicked() {
+            // The chevron is its own target: the last stretch of the row folds
+            // and unfolds, and the rest of it goes there.
+            let at_end = ui
+                .input(|i| i.pointer.interact_pos())
+                .is_some_and(|p| p.x > resp.rect.right() - 28.0);
+            if row.kids && at_end {
+                state.toggle(ui);
+            } else {
+                *go = Some(path.clone());
+            }
+        }
+        if open && row.kids {
+            branch(ui, icons, kid, &path, depth + 1, here, go);
+        }
     }
 }
 
@@ -2477,24 +2597,38 @@ impl Arca {
         let mut go: Option<String> = None;
         let folders = self.folders.clone();
         let here = self.current_dir.clone();
-        let root = self
-            .archive
-            .as_ref()
-            .and_then(|a| a.file_name())
-            .map(|x| x.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let s = self.s();
+        // Borrowed for the panel and put back, the way the table borrows it:
+        // the rows want the desktop's own folder icon and the cache is what
+        // stops that being one question to the shell per row per frame.
+        let mut icons = std::mem::take(&mut self.icons);
         egui::SidePanel::left("tree")
             .resizable(true)
             .default_width(220.0)
             .width_range(140.0..=420.0)
             .show(ctx, |ui| {
-                egui::ScrollArea::both().show(ui, |ui| {
-                    if ui.selectable_label(here.is_empty(), root).clicked() {
-                        go = Some(String::new());
-                    }
-                    branch(ui, &folders, "", &here, &mut go);
-                });
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // The archive itself, named for what it is rather than
+                        // for the file: the path along the top already says
+                        // which archive this is, and here it is a place to go
+                        // back to.
+                        let root = Twig {
+                            name: s.archive_root,
+                            path: String::new(),
+                            depth: 0,
+                            kids: false,
+                            open: false,
+                            archive: true,
+                        };
+                        if twig(ui, &mut icons, &root, &here).clicked() {
+                            go = Some(String::new());
+                        }
+                        branch(ui, &mut icons, &folders, "", 1, &here, &mut go);
+                    });
             });
+        self.icons = icons;
         if let Some(path) = go {
             // Going to a folder while the list is showing every file at once is
             // asking for that folder, so the flat view gets out of the way

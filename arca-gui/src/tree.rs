@@ -46,8 +46,15 @@ pub fn kind_of(name: &str, is_dir: bool) -> Kind {
     }
 }
 
+/// The hand drawn icon, in the space the layout gives it.
 pub fn draw_icon(ui: &mut egui::Ui, kind: Kind) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
+    draw_icon_at(ui, rect, kind);
+}
+
+/// The same, in a rectangle the caller has already decided on: the tree places
+/// its own rows and has nowhere to allocate from.
+pub fn draw_icon_at(ui: &mut egui::Ui, rect: egui::Rect, kind: Kind) {
     let p = ui.painter();
     let c = kind.color();
     let faded = egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 110);
