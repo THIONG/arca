@@ -208,15 +208,17 @@ pub fn header_sorted(v: &Visuals) -> Color32 {
 
 /// The mark that says which way a column is sorted.
 ///
-/// Blue, and only ever blue: it is the one thing in the header that is not a
-/// word, and in the colour of the text it read as a speck of dust on the
-/// screen. This is the colour that says the list is being held a particular way
-/// round, and nothing else in the window is allowed to use it.
+/// The same white as the words beside it, and solid, rather than an accent. Two
+/// goes at a blue one came out looking like a stray pixel of some other
+/// program's colour scheme: the window is black and white, and a coloured
+/// speck in the one row that is nothing but headings has nowhere to belong. It
+/// carries at eleven pixels because it is the brightest thing on the darkest
+/// band, which is the same reason the headings themselves are legible.
 pub fn mark(v: &Visuals) -> Color32 {
     if v.dark_mode {
-        rgb(0x4C8DFF)
+        Color32::WHITE
     } else {
-        ACCENT_LIGHT
+        rgb(0x10141B)
     }
 }
 
