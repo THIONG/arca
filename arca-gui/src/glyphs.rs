@@ -99,11 +99,35 @@ pub fn draw(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) {
             // In and out is the whole difference between the two jobs, so it is
             // the whole difference between the two pictures.
             let (l, right) = (x0 + 1.5, x1 - 1.5);
-            line(painter, Pos2::new(l, y0 + 5.0), Pos2::new(l, y1 - 1.5), color, thin);
-            line(painter, Pos2::new(right, y0 + 5.0), Pos2::new(right, y1 - 1.5), color, thin);
-            line(painter, Pos2::new(l, y1 - 1.5), Pos2::new(right, y1 - 1.5), color, thin);
+            line(
+                painter,
+                Pos2::new(l, y0 + 5.0),
+                Pos2::new(l, y1 - 1.5),
+                color,
+                thin,
+            );
+            line(
+                painter,
+                Pos2::new(right, y0 + 5.0),
+                Pos2::new(right, y1 - 1.5),
+                color,
+                thin,
+            );
+            line(
+                painter,
+                Pos2::new(l, y1 - 1.5),
+                Pos2::new(right, y1 - 1.5),
+                color,
+                thin,
+            );
             let mid = (l + right) / 2.0;
-            line(painter, Pos2::new(mid, y0 + 0.5), Pos2::new(mid, y0 + 5.5), color, thin);
+            line(
+                painter,
+                Pos2::new(mid, y0 + 0.5),
+                Pos2::new(mid, y0 + 5.5),
+                color,
+                thin,
+            );
             painter.add(egui::Shape::convex_polygon(
                 vec![
                     Pos2::new(mid - 2.5, y0 + 4.0),
@@ -126,13 +150,37 @@ pub fn draw(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) {
             // family they belong to. A difference nobody can see is worse than
             // no difference.
             let (l, right) = (x0 + 1.5, x1 - 1.5);
-            line(painter, Pos2::new(l, y0 + 5.0), Pos2::new(l, y1 - 1.5), color, thin);
-            line(painter, Pos2::new(right, y0 + 5.0), Pos2::new(right, y1 - 1.5), color, thin);
-            line(painter, Pos2::new(l, y1 - 1.5), Pos2::new(right, y1 - 1.5), color, thin);
+            line(
+                painter,
+                Pos2::new(l, y0 + 5.0),
+                Pos2::new(l, y1 - 1.5),
+                color,
+                thin,
+            );
+            line(
+                painter,
+                Pos2::new(right, y0 + 5.0),
+                Pos2::new(right, y1 - 1.5),
+                color,
+                thin,
+            );
+            line(
+                painter,
+                Pos2::new(l, y1 - 1.5),
+                Pos2::new(right, y1 - 1.5),
+                color,
+                thin,
+            );
             // Rising out of the box, which is the whole difference from the
             // picture next door: that arrow goes in, this one comes out.
             let mid = (l + right) / 2.0;
-            line(painter, Pos2::new(mid, y0 + 3.0), Pos2::new(mid, y0 + 9.0), color, thin);
+            line(
+                painter,
+                Pos2::new(mid, y0 + 3.0),
+                Pos2::new(mid, y0 + 9.0),
+                color,
+                thin,
+            );
             painter.add(egui::Shape::convex_polygon(
                 vec![
                     Pos2::new(mid - 2.5, y0 + 4.0),
@@ -148,17 +196,19 @@ pub fn draw(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) {
             // as a blob with a wire over it. The shackle is a real arc rather
             // than three straight pieces, which is most of what makes it read
             // as a padlock instead of as a rectangle wearing a bracket.
-            let body = Rect::from_min_max(
-                Pos2::new(x0 + 2.0, y0 + 6.5),
-                Pos2::new(x1 - 2.0, y1 - 1.5),
-            );
+            let body =
+                Rect::from_min_max(Pos2::new(x0 + 2.0, y0 + 6.5), Pos2::new(x1 - 2.0, y1 - 1.5));
             painter.rect_stroke(body, 1.5, Stroke::new(thin, color));
             painter.circle_filled(Pos2::new(body.center().x, body.center().y), 1.2, color);
 
             let shut = matches!(glyph, Glyph::Locked);
             // Shut, the arc sits over the middle of the body. Open, it is the
             // same arc lifted and turned, hinged on its right leg.
-            let cx = if shut { body.center().x } else { body.center().x + 2.2 };
+            let cx = if shut {
+                body.center().x
+            } else {
+                body.center().x + 2.2
+            };
             let radius = 3.1;
             let bottom = y0 + 6.5;
             let steps = 12;
@@ -173,10 +223,7 @@ pub fn draw(painter: &egui::Painter, rect: Rect, glyph: Glyph, color: Color32) {
                 // like; the far one still reaches the body.
                 arc.truncate(steps - 2);
             }
-            painter.add(egui::Shape::line(
-                arc,
-                Stroke::new(1.6_f32, color),
-            ));
+            painter.add(egui::Shape::line(arc, Stroke::new(1.6_f32, color)));
         }
         Glyph::More => {
             for k in [-1.0_f32, 0.0, 1.0] {

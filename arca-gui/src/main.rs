@@ -11,11 +11,10 @@ use arca_core::{Codec, Entry, Level};
 use arca_tar::{TarReader, TarWriter};
 use arca_zip::{ZipArchive, ZipWriter};
 use eframe::egui;
-use rayon::prelude::*;
 use egui::ThemePreference;
 use egui_extras::{Column, TableBuilder};
 use i18n::{strings, Lang, Strings};
-use tree::{children_of, draw_icon, entries_under, kind_of, parent_of, Row};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -23,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
+use tree::{children_of, draw_icon, entries_under, kind_of, parent_of, Kind, Row};
 
 const BUF: usize = 256 * 1024;
 const ROW_HEIGHT: f32 = 29.0;
@@ -238,6 +238,16 @@ struct Settings {
     lang: Option<Lang>,
     theme: ThemePreference,
     columns: Columns,
+    // Every file in the archive at once, instead of one folder at a time.
+    flat: bool,
+    // The folders of the archive down the left hand side.
+    tree: bool,
+    // Where the window was left and how big: x, y, width, height. None until it
+    // has been opened once.
+    window: Option<[f32; 4]>,
+    // The archives opened lately, newest first. Paths, so that one that has
+    // since been moved can be noticed and dropped rather than opened blind.
+    recent: Vec<String>,
     // How wide each column is: the name first, then the ones that can be
     // turned off, in the order of `Columns::ALL`. A column keeps its width
     // while it is off, so turning one back on does not lose how it was set.
@@ -268,6 +278,10 @@ impl Default for Settings {
             lang: None,
             theme: ThemePreference::System,
             columns: Columns::default(),
+            flat: false,
+            tree: false,
+            window: None,
+            recent: Vec::new(),
             widths: Settings::default_widths(),
         }
     }
@@ -290,6 +304,22 @@ impl Settings {
                 ("theme", "light") => s.theme = ThemePreference::Light,
                 ("theme", "dark") => s.theme = ThemePreference::Dark,
                 ("theme", _) => s.theme = ThemePreference::System,
+                ("flat", v) => s.flat = v == "yes",
+                ("tree", v) => s.tree = v == "yes",
+                // One line each, because a path can hold anything a filename
+                // can and there is no separator left that it could not.
+                ("recent", p) if !p.is_empty() => s.recent.push(p.to_string()),
+                ("window", v) => {
+                    let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                    if let [x, y, w, h] = n[..] {
+                        // A window smaller than the minimum, or one left on a
+                        // screen that is no longer plugged in, is not a window
+                        // anybody can use.
+                        if w >= 720.0 && h >= 320.0 {
+                            s.window = Some([x, y, w, h]);
+                        }
+                    }
+                }
                 // Written since the columns could first be turned off and read
                 // by nobody, so every window opened with the six of them
                 // showing however they had been left.
@@ -344,6 +374,13 @@ impl Settings {
             .map(|(_, name)| *name)
             .collect();
         let widths: Vec<String> = self.widths.iter().map(|w| format!("{w:.1}")).collect();
+        let mut tail = String::new();
+        if let Some([x, y, w, h]) = self.window {
+            tail.push_str(&format!("window = {x:.0},{y:.0},{w:.0},{h:.0}\n"));
+        }
+        for path in &self.recent {
+            tail.push_str(&format!("recent = {path}\n"));
+        }
         let _ = fs::write(
             p,
             format!(
@@ -513,7 +550,11 @@ fn launch_with_system(path: &Path) -> arca_core::Result<()> {
 
 #[cfg(not(windows))]
 fn launch_with_system(path: &Path) -> arca_core::Result<()> {
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
     std::process::Command::new(opener)
         .arg(path)
         .spawn()
@@ -558,10 +599,18 @@ fn tool_button(
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact(&response);
         let (fill, stroke, fg) = if enabled {
-            (visuals.weak_bg_fill, visuals.bg_stroke, visuals.fg_stroke.color)
+            (
+                visuals.weak_bg_fill,
+                visuals.bg_stroke,
+                visuals.fg_stroke.color,
+            )
         } else {
             let off = ui.visuals().widgets.noninteractive;
-            (off.weak_bg_fill, off.bg_stroke, ui.visuals().weak_text_color())
+            (
+                off.weak_bg_fill,
+                off.bg_stroke,
+                ui.visuals().weak_text_color(),
+            )
         };
         ui.painter().rect(rect, visuals.rounding, fill, stroke);
         let icon = egui::Rect::from_min_size(
@@ -1033,7 +1082,11 @@ fn run_job_blocking(
     ask: &dyn Fn(&Path) -> Answer,
 ) -> std::result::Result<String, String> {
     match job {
-        Job::Extract { archives, dest, password } => {
+        Job::Extract {
+            archives,
+            dest,
+            password,
+        } => {
             if archives.is_empty() {
                 return Err(s.nothing_to_do.to_string());
             }
@@ -1175,7 +1228,11 @@ fn run_job_blocking(
             let moved = format!("{to}/");
             let rename = |name: &str| -> String {
                 if !folder {
-                    return if name == from { to.clone() } else { name.to_string() };
+                    return if name == from {
+                        to.clone()
+                    } else {
+                        name.to_string()
+                    };
                 }
                 if name == from {
                     to.clone()
@@ -1216,7 +1273,13 @@ fn run_job_blocking(
                 return Err(s.nothing_to_do.to_string());
             }
             let (from, to) = compress(
-                &out, &inputs, format, codec, level, notify, password.as_deref(),
+                &out,
+                &inputs,
+                format,
+                codec,
+                level,
+                notify,
+                password.as_deref(),
             )
             .map_err(|e| e.to_string())?;
             let pct = if from == 0 {
@@ -1292,6 +1355,7 @@ enum SortColumn {
     Modified,
     Crc,
     Type,
+    Path,
 }
 
 // Which columns the list shows. Name is not here: a list of nothing but sizes
@@ -1305,6 +1369,7 @@ struct Columns {
     modified: bool,
     crc: bool,
     type_: bool,
+    path: bool,
 }
 
 impl Default for Columns {
@@ -1319,12 +1384,13 @@ impl Default for Columns {
             modified: true,
             crc: false,
             type_: false,
+            path: false,
         }
     }
 }
 
 impl Columns {
-    const ALL: [(SortColumn, &'static str); 7] = [
+    const ALL: [(SortColumn, &'static str); 8] = [
         (SortColumn::Size, "size"),
         (SortColumn::Packed, "packed"),
         (SortColumn::Method, "method"),
@@ -1332,6 +1398,7 @@ impl Columns {
         (SortColumn::Modified, "modified"),
         (SortColumn::Crc, "crc"),
         (SortColumn::Type, "type"),
+        (SortColumn::Path, "path"),
     ];
 
     fn on(&self, which: SortColumn) -> bool {
@@ -1343,6 +1410,7 @@ impl Columns {
             SortColumn::Modified => self.modified,
             SortColumn::Crc => self.crc,
             SortColumn::Type => self.type_,
+            SortColumn::Path => self.path,
             SortColumn::Name => true,
         }
     }
@@ -1356,6 +1424,7 @@ impl Columns {
             SortColumn::Modified => self.modified = value,
             SortColumn::Crc => self.crc = value,
             SortColumn::Type => self.type_ = value,
+            SortColumn::Path => self.path = value,
             SortColumn::Name => {}
         }
     }
@@ -1369,6 +1438,7 @@ impl Columns {
             SortColumn::Modified => s.col_modified,
             SortColumn::Crc => s.col_crc,
             SortColumn::Type => s.col_type,
+            SortColumn::Path => s.col_path,
             SortColumn::Name => s.col_name,
         }
     }
@@ -1417,9 +1487,13 @@ enum View {
 
 // What the overflow button on the toolbar was asked for. A value rather than a
 // closure because the menu draws while the toolbar still holds `self`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum More {
     Test,
+    Flat,
+    Tree,
+    Open(PathBuf),
+    Forget,
     All,
     Invert,
     None_,
@@ -1444,6 +1518,79 @@ struct Wheel {
     /// running until the next click; that is what makes press-and-drag and
     /// click-and-go both work off the one button.
     moved: bool,
+}
+
+/// One level of the folder tree, and everything under it.
+///
+/// A folder with nothing inside it gets no triangle, and one with something
+/// gets a triangle that only opens and closes: the name beside it stays a place
+/// you can go to either way, which is the difference between a tree you can
+/// walk and one you have to unfold first.
+fn branch(
+    ui: &mut egui::Ui,
+    folder: &tree::Folder,
+    prefix: &str,
+    here: &str,
+    go: &mut Option<String>,
+) {
+    for (name, kid) in &folder.kids {
+        let path = format!("{prefix}{name}/");
+        let on = here == path;
+        if kid.is_empty() {
+            // Lined up with the ones that do have a triangle, so a level reads
+            // as a level rather than as a ragged edge. The triangle is an icon
+            // wide and the row puts its own gap after this, which between them
+            // come to what the header spends on the same thing.
+            ui.horizontal(|ui| {
+                ui.add_space(ui.spacing().icon_width);
+                if ui.selectable_label(on, name).clicked() {
+                    *go = Some(path.clone());
+                }
+            });
+            continue;
+        }
+        let id = ui.make_persistent_id(&path);
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+            .show_header(ui, |ui| {
+                if ui.selectable_label(on, name).clicked() {
+                    *go = Some(path.clone());
+                }
+            })
+            .body(|ui| branch(ui, kid, &path, here, go));
+    }
+}
+
+/// The folder an entry is filed in, without the name on the end. Empty at the
+/// root, which is where the archive itself is.
+fn folder_of(path: &str) -> &str {
+    match path.trim_end_matches('/').rsplit_once('/') {
+        Some((parent, _)) => parent,
+        None => "",
+    }
+}
+
+/// The way out of a folder: the row every file list keeps at the top, spelt the
+/// way every file list spells it.
+///
+/// It stands for the folder above and nothing else. There is no entry behind
+/// it, so it cannot be picked, weighed, renamed or taken out, and the list
+/// leaves it at the top however it is sorted.
+fn up_row(dir: &str) -> Row {
+    Row {
+        label: "..".to_string(),
+        path: parent_of(dir),
+        kind: Kind::Dir,
+        is_dir: true,
+        entry: None,
+        size: 0,
+        packed: 0,
+        method: "",
+        encrypted: false,
+        count: 0,
+        mtime: None,
+        crc32: 0,
+        up: true,
+    }
 }
 
 /// How wide `text` comes out in `style`, laid out on one line.
@@ -1503,6 +1650,7 @@ fn natural_width(ui: &egui::Ui, rows: &[Row], which: SortColumn, s: &Strings) ->
         // extension at a time and measuring them here would ask it about every
         // row in the folder before the column could be sized.
         SortColumn::Type => wide_of(ui, s.col_type, Body) + pad,
+        SortColumn::Path => widest(Body, &|r| folder_of(&r.path).to_string()) + pad,
     }
 }
 
@@ -1659,6 +1807,13 @@ struct Arca {
     // True for the first frame of a rename, when the box has to be given the
     // keyboard and the part of the name before the extension picked out.
     rename_fresh: bool,
+    // The folders of the archive, rebuilt when a listing arrives rather than
+    // every frame: it is fifteen hundred paths split on every slash and the
+    // answer only changes when the archive does.
+    folders: tree::Folder,
+    // Where the window is and how big, as of this frame. Kept so that `on_exit`
+    // has something to write: it is handed no context to ask with.
+    geometry: Option<[f32; 4]>,
     // Set while the wheel is being used to walk the list up and down.
     wheel: Option<Wheel>,
     // The last row a left click landed on, and when. What tells a second click
@@ -1747,6 +1902,8 @@ impl Arca {
             band_scroll: None,
             renaming: None,
             rename_fresh: false,
+            folders: tree::Folder::default(),
+            geometry: None,
             wheel: None,
             last_click: None,
             cut_armed: None,
@@ -1803,7 +1960,38 @@ impl Arca {
 
     fn visible_rows(&self) -> Vec<Row> {
         let filter = self.filter.trim().to_lowercase();
-        let mut rows = if filter.is_empty() {
+        // Flat view: every file in the archive at once, wherever it is filed.
+        // It is how you find something when you know its name and not its
+        // folder, and it is the same list a filter builds, only without one.
+        let flat = self.settings.flat && filter.is_empty();
+        let mut rows = if flat {
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !e.is_dir)
+                .map(|(i, e)| {
+                    let full = e.name.replace('\\', "/");
+                    Row {
+                        // The leaf here and the folder in its own column, the
+                        // way WinRAR splits them: a column of paths that all
+                        // begin the same way is a column you read the end of.
+                        label: full.rsplit('/').next().unwrap_or(&full).to_string(),
+                        kind: kind_of(&full, false),
+                        path: full,
+                        is_dir: false,
+                        entry: Some(i),
+                        size: e.size,
+                        packed: e.compressed_size,
+                        method: e.method.name(),
+                        encrypted: e.encrypted,
+                        count: 0,
+                        mtime: e.mtime,
+                        crc32: e.crc32,
+                        up: false,
+                    }
+                })
+                .collect()
+        } else if filter.is_empty() {
             children_of(&self.entries, &self.current_dir)
         } else {
             self.entries
@@ -1823,6 +2011,7 @@ impl Arca {
                     count: 0,
                     mtime: e.mtime,
                     crc32: e.crc32,
+                    up: false,
                 })
                 .collect()
         };
@@ -1846,11 +2035,12 @@ impl Arca {
                     .unwrap_or(std::cmp::Ordering::Equal),
                 SortColumn::Modified => x.mtime.cmp(&y.mtime),
                 SortColumn::Crc => x.crc32.cmp(&y.crc32),
-            // By extension, which is what the type is worked out from: sorting by
-            // the words themselves would need the shell asked about every entry
-            // in the archive to answer one click.
-            SortColumn::Type => arca_icons::cache_key(&x.label, x.is_dir)
-                .cmp(&arca_icons::cache_key(&y.label, y.is_dir)),
+                // By extension, which is what the type is worked out from:
+                // sorting by the words themselves would need the shell asked
+                // about every entry in the archive to answer one click.
+                SortColumn::Type => arca_icons::cache_key(&x.label, x.is_dir)
+                    .cmp(&arca_icons::cache_key(&y.label, y.is_dir)),
+                SortColumn::Path => folder_of(&x.path).cmp(folder_of(&y.path)),
             };
             if asc {
                 o
@@ -1858,6 +2048,11 @@ impl Arca {
                 o.reverse()
             }
         });
+        // Put on after the sort, because it belongs at the top whichever column
+        // the list is held by and whichever way round.
+        if !flat && filter.is_empty() && !self.current_dir.is_empty() {
+            rows.insert(0, up_row(&self.current_dir));
+        }
         rows
     }
 
@@ -1881,6 +2076,62 @@ impl Arca {
         });
     }
 
+    // The folders of the archive down the side, the way WinRAR and the Explorer
+    // both offer one.
+    //
+    // It earns its place in a deep archive, where walking to a folder six
+    // levels down and back is a dozen double clicks. Off by default: in a flat
+    // archive it would be an empty column taking a fifth of the window.
+    fn tree_panel(&mut self, ctx: &egui::Context) {
+        if !self.settings.tree || self.entries.is_empty() {
+            return;
+        }
+        let mut go: Option<String> = None;
+        let folders = self.folders.clone();
+        let here = self.current_dir.clone();
+        let root = self
+            .archive
+            .as_ref()
+            .and_then(|a| a.file_name())
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_default();
+        egui::SidePanel::left("tree")
+            .resizable(true)
+            .default_width(220.0)
+            .width_range(140.0..=420.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::both().show(ui, |ui| {
+                    if ui.selectable_label(here.is_empty(), root).clicked() {
+                        go = Some(String::new());
+                    }
+                    branch(ui, &folders, "", &here, &mut go);
+                });
+            });
+        if let Some(path) = go {
+            // Going to a folder while the list is showing every file at once is
+            // asking for that folder, so the flat view gets out of the way
+            // rather than swallowing the click.
+            if self.settings.flat {
+                self.settings.flat = false;
+                self.settings.save();
+            }
+            self.go_to(path);
+        }
+    }
+
+    // Puts an archive at the top of the recent list.
+    //
+    // Ten of them, which is about as many as anybody scans before giving up and
+    // going to the folder instead, and by path rather than by name so that two
+    // archives called backup.zip in different places stay two.
+    fn remember(&mut self, path: &Path) {
+        let text = path.to_string_lossy().to_string();
+        self.settings.recent.retain(|p| *p != text);
+        self.settings.recent.insert(0, text);
+        self.settings.recent.truncate(10);
+        self.settings.save();
+    }
+
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
         self.archive_password = None;
         // Whatever was cut belonged to the listing being replaced, and so did
@@ -1891,6 +2142,7 @@ impl Arca {
         self.cut_pending = None;
         self.notice.clear();
         self.error = false;
+        self.remember(&path);
         let ctx2 = ctx.clone();
         self.spawn(ctx, 0, move |tx| {
             let m = match list_entries(&path) {
@@ -1906,7 +2158,12 @@ impl Arca {
     // encrypted, and costs nothing next to extracting it. Asking here, before
     // any work starts, keeps the question on the window's own thread.
     fn run_job(&mut self, ctx: &egui::Context, job: Job) {
-        if let Job::Extract { archives, password: None, .. } = &job {
+        if let Job::Extract {
+            archives,
+            password: None,
+            ..
+        } = &job
+        {
             if archives.iter().any(|a| is_encrypted(a)) {
                 self.password_input.clear();
                 self.waiting_on_password = Some(Pending::Extract(Box::new(job)));
@@ -1939,13 +2196,22 @@ impl Arca {
         if let Job::Password { archive, new, .. } = &job {
             self.after_password = Some((archive.clone(), new.clone()));
         }
-        if let Job::Delete { archive, password, .. } = &job {
+        if let Job::Delete {
+            archive, password, ..
+        } = &job
+        {
             self.after_password = Some((archive.clone(), password.clone()));
         }
-        if let Job::Add { archive, password, .. } = &job {
+        if let Job::Add {
+            archive, password, ..
+        } = &job
+        {
             self.after_password = Some((archive.clone(), password.clone()));
         }
-        if let Job::Rename { archive, password, .. } = &job {
+        if let Job::Rename {
+            archive, password, ..
+        } = &job
+        {
             self.after_password = Some((archive.clone(), password.clone()));
         }
 
@@ -1987,6 +2253,7 @@ impl Arca {
                         // The buttons that work on the whole archive never
                         // looked at the ticks anyway.
                         self.checked = vec![false; v.len()];
+                        self.folders = tree::folders_of(&v);
                         self.entries = v;
                         if let Some(f) = detect(&path) {
                             self.format = f;
@@ -2199,13 +2466,18 @@ impl Arca {
                 ctx2.request_repaint();
             };
             let ask = conflict_asker(tx, &ctx2, &reply_rx);
-            let _ = tx.send(match extract(&archive, &dest, &wanted, &notify, &ask, pw.as_deref()) {
-                Ok(bytes) => Message::Done(fill(
-                    s.extracted_to,
-                    &[("size", &human(bytes)), ("dest", &dest.display().to_string())],
-                )),
-                Err(e) => Message::Failed(e.to_string()),
-            });
+            let _ = tx.send(
+                match extract(&archive, &dest, &wanted, &notify, &ask, pw.as_deref()) {
+                    Ok(bytes) => Message::Done(fill(
+                        s.extracted_to,
+                        &[
+                            ("size", &human(bytes)),
+                            ("dest", &dest.display().to_string()),
+                        ],
+                    )),
+                    Err(e) => Message::Failed(e.to_string()),
+                },
+            );
         });
     }
 
@@ -2855,41 +3127,49 @@ impl Arca {
         let setting = matches!(self.waiting_on_password, Some(Pending::NewPassword(_)));
         let mut go = false;
         let mut cancel = false;
-        egui::Window::new(if setting { s.set_password } else { s.password_needed })
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.label(if setting { s.new_password } else { s.password_hint });
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    // Asked before the field is built. The text edit swallows
-                    // Enter, and asking it afterwards never sees the key, so
-                    // the window could only be dismissed with the mouse.
-                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let field = ui.add(
-                        egui::TextEdit::singleline(&mut self.password_input)
-                            .password(!self.show_password)
-                            .desired_width(240.0),
-                    );
-                    field.request_focus();
-                    if enter {
-                        go = true;
-                    }
-                    ui.checkbox(&mut self.show_password, s.show_password);
-                });
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button(s.start).clicked() {
-                        go = true;
-                    }
-                    if ui.button(s.cancel).clicked() {
-                        cancel = true;
-                    }
-                });
-                ui.add_space(4.0);
+        egui::Window::new(if setting {
+            s.set_password
+        } else {
+            s.password_needed
+        })
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.label(if setting {
+                s.new_password
+            } else {
+                s.password_hint
             });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                // Asked before the field is built. The text edit swallows
+                // Enter, and asking it afterwards never sees the key, so
+                // the window could only be dismissed with the mouse.
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.password_input)
+                        .password(!self.show_password)
+                        .desired_width(240.0),
+                );
+                field.request_focus();
+                if enter {
+                    go = true;
+                }
+                ui.checkbox(&mut self.show_password, s.show_password);
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button(s.start).clicked() {
+                    go = true;
+                }
+                if ui.button(s.cancel).clicked() {
+                    cancel = true;
+                }
+            });
+            ui.add_space(4.0);
+        });
 
         if cancel {
             self.cancel_password();
@@ -2900,19 +3180,43 @@ impl Arca {
             match self.waiting_on_password.take() {
                 Some(Pending::Extract(job)) => {
                     if let Job::Extract { archives, dest, .. } = *job {
-                        self.run_job(ctx, Job::Extract { archives, dest, password: Some(given) });
+                        self.run_job(
+                            ctx,
+                            Job::Extract {
+                                archives,
+                                dest,
+                                password: Some(given),
+                            },
+                        );
                     }
                 }
                 Some(Pending::CurrentPassword(job)) => {
                     if let Job::Password { archive, new, .. } = *job {
                         self.archive_password = Some(given.clone());
-                        self.run_job(ctx, Job::Password { archive, current: Some(given), new });
+                        self.run_job(
+                            ctx,
+                            Job::Password {
+                                archive,
+                                current: Some(given),
+                                new,
+                            },
+                        );
                     }
                 }
                 Some(Pending::OpenArchive) => self.archive_password = Some(given),
                 Some(Pending::NewPassword(job)) => {
-                    if let Job::Password { archive, current, .. } = *job {
-                        self.run_job(ctx, Job::Password { archive, current, new: Some(given) });
+                    if let Job::Password {
+                        archive, current, ..
+                    } = *job
+                    {
+                        self.run_job(
+                            ctx,
+                            Job::Password {
+                                archive,
+                                current,
+                                new: Some(given),
+                            },
+                        );
                     }
                 }
                 None => {}
@@ -3093,11 +3397,54 @@ impl Arca {
                     {
                         wants = Some(More::Test);
                     }
+                    if ui
+                        .add_enabled(
+                            has,
+                            egui::Button::new(s.flat_view).selected(self.settings.flat),
+                        )
+                        .clicked()
+                    {
+                        wants = Some(More::Flat);
+                    }
+                    if ui
+                        .add_enabled(
+                            has,
+                            egui::Button::new(s.folder_tree).selected(self.settings.tree),
+                        )
+                        .clicked()
+                    {
+                        wants = Some(More::Tree);
+                    }
+                    // The archives opened lately. By name, with the whole path
+                    // on hover: a menu of paths is a menu nobody reads.
+                    ui.add_enabled_ui(!self.settings.recent.is_empty(), |ui| {
+                        ui.menu_button(s.recent_word, |ui| {
+                            for path in self.settings.recent.clone() {
+                                let p = PathBuf::from(&path);
+                                let leaf = p
+                                    .file_name()
+                                    .map(|x| x.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.clone());
+                                if ui.button(leaf).on_hover_text(&path).clicked() {
+                                    wants = Some(More::Open(p));
+                                    ui.close_menu();
+                                }
+                            }
+                            ui.separator();
+                            if ui.button(s.clear_history).clicked() {
+                                wants = Some(More::Forget);
+                                ui.close_menu();
+                            }
+                        });
+                    });
                     ui.separator();
                     if ui.button(format!("{}\tCtrl+A", s.select_all)).clicked() {
                         wants = Some(More::All);
                     }
-                    if ui.button(format!("{}\tCtrl+I", s.invert_selection)).clicked() {
+                    if ui
+                        .button(format!("{}\tCtrl+I", s.invert_selection))
+                        .clicked()
+                    {
                         wants = Some(More::Invert);
                     }
                     if ui.button(format!("{}\tEsc", s.clear_selection)).clicked() {
@@ -3131,6 +3478,29 @@ impl Arca {
                         self.set_checked(r, on);
                     }
                 }
+                Some(More::Flat) => {
+                    self.settings.flat = !self.settings.flat;
+                    // A flat list is a list of names with no folder over them,
+                    // so the folder each one came from has to go somewhere. It
+                    // is left on afterwards: turning the view off and on again
+                    // should not keep undoing a column the user has since
+                    // arranged.
+                    if self.settings.flat && !self.settings.columns.on(SortColumn::Path) {
+                        self.settings.columns.set(SortColumn::Path, true);
+                    }
+                    self.clear_picked();
+                    self.cursor = None;
+                    self.settings.save();
+                }
+                Some(More::Tree) => {
+                    self.settings.tree = !self.settings.tree;
+                    self.settings.save();
+                }
+                Some(More::Open(path)) => self.open(ctx, path),
+                Some(More::Forget) => {
+                    self.settings.recent.clear();
+                    self.settings.save();
+                }
                 Some(More::None_) => self.clear_picked(),
                 Some(More::Settings) => self.show_settings = true,
                 Some(More::Shortcuts) => self.show_shortcuts = true,
@@ -3161,7 +3531,15 @@ impl Arca {
             if tool_button(ui, glyphs::Glyph::Back, "", self.can_go_back(), s.back).clicked() {
                 self.go_back();
             }
-            if tool_button(ui, glyphs::Glyph::Forward, "", self.can_go_forward(), s.forward).clicked() {
+            if tool_button(
+                ui,
+                glyphs::Glyph::Forward,
+                "",
+                self.can_go_forward(),
+                s.forward,
+            )
+            .clicked()
+            {
                 self.go_forward();
             }
             if tool_button(ui, glyphs::Glyph::Up, "", !at_root, s.up).clicked() {
@@ -3174,7 +3552,8 @@ impl Arca {
             // ran out over the top of it.
             let tally = self.archive.is_some().then(|| {
                 let n = self.checked.iter().filter(|b| **b).count();
-                let shown = self.visible_rows().len();
+                // The way out of the folder is not one of the things in it.
+                let shown = self.visible_rows().iter().filter(|r| !r.up).count();
                 let all = format!(
                     "{shown} {} {} · {n} {}",
                     s.visible_of,
@@ -3295,9 +3674,7 @@ impl Arca {
                 let last = crumbs.len() - 1;
                 for (i, (name, path)) in crumbs.iter().enumerate().skip(first) {
                     if i > first {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new("›").weak()).selectable(false),
-                        );
+                        ui.add(egui::Label::new(egui::RichText::new("›").weak()).selectable(false));
                     }
                     // The one you are on is not a way to anywhere.
                     if i == last {
@@ -3666,8 +4043,8 @@ impl Arca {
                     (slots.get(i - 1).copied(), cols.get(i - 1).copied())
                 {
                     if let Some(width) = self.settings.widths.get_mut(slot) {
-                        *width = natural_width(ui, rows, which, s)
-                            .clamp(Settings::least(slot), 640.0);
+                        *width =
+                            natural_width(ui, rows, which, s).clamp(Settings::least(slot), 640.0);
                     }
                 }
                 self.settings.save();
@@ -4020,6 +4397,12 @@ impl Arca {
     }
 
     fn set_checked(&mut self, row: &Row, value: bool) {
+        // Nothing behind it, and its path is the folder above: ticking it would
+        // pick everything in the archive up to and including where you came
+        // from. Select all has to leave it alone.
+        if row.up {
+            return;
+        }
         match row.entry {
             Some(i) => self.checked[i] = value,
             None => {
@@ -4193,7 +4576,7 @@ impl Arca {
         // in WinRAR and in the Explorer. Only a zip can be written to, so
         // anywhere else it does nothing rather than opening a box that would
         // have to say no afterwards.
-        if rename && self.format == Format::Zip {
+        if rename && self.format == Format::Zip && !row.up {
             self.renaming = Some((row.path.clone(), row.label.clone()));
             self.rename_fresh = true;
             return;
@@ -4264,6 +4647,10 @@ impl Arca {
     }
 
     fn is_checked(&self, row: &Row) -> bool {
+        // The way out of the folder is not a thing that can be picked.
+        if row.up {
+            return false;
+        }
         match row.entry {
             Some(i) => self.checked[i],
             None => {
@@ -4280,9 +4667,12 @@ impl Arca {
         // frame rather than one behind.
         self.keyboard(ui.ctx(), &visible);
         if self.cursor.is_some_and(|c| c >= visible.len()) {
-            self.cursor = if visible.is_empty() { None } else { Some(visible.len() - 1) };
+            self.cursor = if visible.is_empty() {
+                None
+            } else {
+                Some(visible.len() - 1)
+            };
         }
-
 
         let mut requested: Option<SortColumn> = None;
         let mut opened: Option<usize> = None;
@@ -4304,9 +4694,11 @@ impl Arca {
         // they are showing or not, so turning one off and on again does not
         // lose how wide it was pulled.
         let slots: Vec<usize> = std::iter::once(0)
-            .chain(shown.iter().map(|w| {
-                Columns::ALL.iter().position(|(c, _)| c == w).unwrap_or(0) + 1
-            }))
+            .chain(
+                shown
+                    .iter()
+                    .map(|w| Columns::ALL.iter().position(|(c, _)| c == w).unwrap_or(0) + 1),
+            )
             .collect();
         // The whole of each header cell, edge to edge: the rectangle of the
         // cell's response, not the one `col` hands back, which is only as wide
@@ -4324,7 +4716,9 @@ impl Arca {
         // done: yes to keep what was typed, no to throw it away.
         let editing: Option<String> = self.renaming.as_ref().map(|(p, _)| p.clone());
         let typing = std::cell::RefCell::new(
-            self.renaming.as_ref().map_or(String::new(), |(_, t)| t.clone()),
+            self.renaming
+                .as_ref()
+                .map_or(String::new(), |(_, t)| t.clone()),
         );
         let fresh = std::cell::Cell::new(self.rename_fresh);
         let finish: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
@@ -4375,7 +4769,11 @@ impl Arca {
             // just a label, and the column the list is sorted by keeps a ground
             // of its own. Spread half the gap either side, the same as the fill
             // on a row, so that a lit heading reaches its neighbours.
-            let resp = ui.interact(cell, egui::Id::new(("arca-head", text)), egui::Sense::click());
+            let resp = ui.interact(
+                cell,
+                egui::Id::new(("arca-head", text)),
+                egui::Sense::click(),
+            );
             let fill = if resp.hovered() {
                 Some(ui.visuals().widgets.hovered.bg_fill)
             } else if order.0 == col {
@@ -4513,14 +4911,19 @@ impl Arca {
                     if pressing {
                         row.set_hovered(false);
                     }
-                    let cut = self.cut_names.contains(&r.path) || r.entry.is_some_and(|i| self.cut_names.contains(&self.entries[i].name));
+                    let cut = self.cut_names.contains(&r.path)
+                        || r.entry
+                            .is_some_and(|i| self.cut_names.contains(&self.entries[i].name));
                     row.col(|ui| {
                         // The system icon when the desktop has one, and the
                         // drawn one when it does not, which is every platform
                         // that is not Windows so far.
                         match system_icon(ui.ctx(), &mut icons, &r.label, r.is_dir) {
                             Some(tex) => {
-                                ui.add(egui::Image::new(&tex).fit_to_exact_size(egui::vec2(15.0, 15.0)));
+                                ui.add(
+                                    egui::Image::new(&tex)
+                                        .fit_to_exact_size(egui::vec2(15.0, 15.0)),
+                                );
                             }
                             None => draw_icon(ui, r.kind),
                         }
@@ -4548,50 +4951,66 @@ impl Arca {
                         }
                     });
                     for which in &shown {
-                        row.col(|ui| match which {
-                            SortColumn::Size => {
-                                ui.monospace(human(r.size));
+                        row.col(|ui| {
+                            // The way out of the folder has no size, no date and
+                            // no kind: it is a door, not a thing in the room.
+                            if r.up {
+                                return;
                             }
-                            SortColumn::Packed => {
-                                ui.monospace(human(r.packed));
-                            }
-                            SortColumn::Method => {
-                                if r.is_dir {
-                                    ui.weak(format!("{} {}", r.count, s.items_word));
-                                } else if r.encrypted {
-                                    ui.label(format!("AES-256 {}", r.method));
-                                } else {
-                                    ui.label(r.method);
+                            match which {
+                                SortColumn::Size => {
+                                    ui.monospace(human(r.size));
                                 }
-                            }
-                            SortColumn::Saved => {
-                                let pct = saved_of(r) * 100.0;
-                                let value = if pct.abs() < 0.5 { 0.0 } else { pct };
-                                ui.monospace(format!("{value:.0}%"));
-                            }
-                            SortColumn::Modified => {
-                                ui.monospace(when(r.mtime));
-                            }
-                            SortColumn::Crc => {
-                                // A folder has no contents of its own to sum.
-                                if r.is_dir {
-                                    ui.weak("");
-                                } else {
-                                    ui.monospace(format!("{:08X}", r.crc32));
+                                SortColumn::Packed => {
+                                    ui.monospace(human(r.packed));
                                 }
+                                SortColumn::Method => {
+                                    if r.is_dir {
+                                        ui.weak(format!("{} {}", r.count, s.items_word));
+                                    } else if r.encrypted {
+                                        ui.label(format!("AES-256 {}", r.method));
+                                    } else {
+                                        ui.label(r.method);
+                                    }
+                                }
+                                SortColumn::Saved => {
+                                    let pct = saved_of(r) * 100.0;
+                                    let value = if pct.abs() < 0.5 { 0.0 } else { pct };
+                                    ui.monospace(format!("{value:.0}%"));
+                                }
+                                SortColumn::Modified => {
+                                    ui.monospace(when(r.mtime));
+                                }
+                                SortColumn::Crc => {
+                                    // A folder has no contents of its own to sum.
+                                    if r.is_dir {
+                                        ui.weak("");
+                                    } else {
+                                        ui.monospace(format!("{:08X}", r.crc32));
+                                    }
+                                }
+                                SortColumn::Type => {
+                                    ui.add(
+                                        egui::Label::new(system_type(
+                                            &mut types.borrow_mut(),
+                                            &r.label,
+                                            r.is_dir,
+                                        ))
+                                        .selectable(false)
+                                        .truncate(),
+                                    );
+                                }
+                                SortColumn::Path => {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(folder_of(&r.path)).weak(),
+                                        )
+                                        .selectable(false)
+                                        .truncate(),
+                                    );
+                                }
+                                SortColumn::Name => {}
                             }
-                            SortColumn::Type => {
-                                ui.add(
-                                    egui::Label::new(system_type(
-                                        &mut types.borrow_mut(),
-                                        &r.label,
-                                        r.is_dir,
-                                    ))
-                                    .selectable(false)
-                                    .truncate(),
-                                );
-                            }
-                            SortColumn::Name => {}
                         });
                     }
                     // The whole row answers, not just the name: aiming at the
@@ -4599,94 +5018,104 @@ impl Arca {
                     let resp = row.response();
                     // Only what there is something behind. A menu offering
                     // things this window cannot do would be worse than none.
-                    resp.context_menu(|ui| {
-                        // Right clicking something that is not picked picks it,
-                        // which is what every file list does.
-                        if !picked.get() {
-                            clicked = Some(idx);
-                            picked.set(true);
-                        }
-                        // Written out, not the return glyph: the fonts egui ships do
-                        // not have it and it came out as an empty box.
-                        if ui.button(format!("{}	Enter", s.open_word)).clicked() {
-                            opened = Some(idx);
-                            ui.close_menu();
-                        }
-                        if ui.button(format!("{}	Ctrl+E", s.extract_selected)).clicked() {
-                            wants_extract.set(true);
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        // The same list the header offers by being clicked, for
-                        // the times the pointer is already down here. WinRAR
-                        // keeps one in its row menu too.
-                        ui.menu_button(s.sort_by, |ui| {
-                            for which in std::iter::once(SortColumn::Name).chain(shown.clone()) {
-                                let on = self.order.0 == which;
-                                let arrow = if !on {
-                                    ""
-                                } else if self.order.1 {
-                                    " \u{25B2}"
-                                } else {
-                                    " \u{25BC}"
-                                };
-                                let label = format!("{}{arrow}", Columns::label(which, s));
-                                if ui.selectable_label(on, label).clicked() {
-                                    requested = Some(which);
-                                    ui.close_menu();
-                                }
+                    // The way out of the folder has nothing behind it, so there is
+                    // nothing to offer for it: no menu rather than a menu of
+                    // things that would all do nothing.
+                    let menu_for = (!r.up).then_some(&resp);
+                    if let Some(resp) = menu_for {
+                        resp.context_menu(|ui| {
+                            // Right clicking something that is not picked picks it,
+                            // which is what every file list does.
+                            if !picked.get() {
+                                clicked = Some(idx);
+                                picked.set(true);
                             }
-                        });
-                        ui.separator();
-                        // Only a zip can be written to, so anywhere else this
-                        // is left out rather than offered and refused.
-                        if self.format == Format::Zip
-                            && ui.button(format!("{}	F2", s.rename_word)).clicked()
-                        {
-                            clicked = Some(idx);
-                            wants_rename.set(true);
-                            ui.close_menu();
-                        }
-                        if ui.button(format!("{}	Supr", s.delete_word)).clicked() {
-                            wants_delete.set(true);
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        // Only where the shell has somewhere to paste them.
-                        // Offering a copy that no other window can take would
-                        // be worse than not offering one.
-                        if clipboard::AVAILABLE {
-                            if ui.button(format!("{}	Ctrl+C", s.copy_word)).clicked() {
-                                wants_clip.set(Some(false));
+                            // Written out, not the return glyph: the fonts egui ships do
+                            // not have it and it came out as an empty box.
+                            if ui.button(format!("{}	Enter", s.open_word)).clicked() {
+                                opened = Some(idx);
                                 ui.close_menu();
                             }
-                            if ui.button(format!("{}	Ctrl+X", s.cut_word)).clicked() {
-                                wants_clip.set(Some(true));
-                                ui.close_menu();
-                            }
-                            // Always offered rather than greyed out by looking:
-                            // the clipboard is one global lock, and opening it
-                            // on every frame the menu is up to find out what is
-                            // in it would be taking it from whoever else wants
-                            // it. An empty one says so in the status bar.
-                            if ui.button(format!("{}	Ctrl+V", s.paste_word)).clicked() {
-                                wants_paste.set(true);
+                            if ui
+                                .button(format!("{}	Ctrl+E", s.extract_selected))
+                                .clicked()
+                            {
+                                wants_extract.set(true);
                                 ui.close_menu();
                             }
                             ui.separator();
-                        }
-                        if ui
-                            .button(format!("{}	Ctrl+Shift+C", s.copy_names))
-                            .clicked()
-                        {
-                            wants_copy_names.set(true);
-                            ui.close_menu();
-                        }
-                        if ui.button(format!("{}	Ctrl+A", s.select_all)).clicked() {
-                            wants_select_all.set(true);
-                            ui.close_menu();
-                        }
-                    });
+                            // The same list the header offers by being clicked, for
+                            // the times the pointer is already down here. WinRAR
+                            // keeps one in its row menu too.
+                            ui.menu_button(s.sort_by, |ui| {
+                                for which in std::iter::once(SortColumn::Name).chain(shown.clone())
+                                {
+                                    let on = self.order.0 == which;
+                                    let arrow = if !on {
+                                        ""
+                                    } else if self.order.1 {
+                                        " \u{25B2}"
+                                    } else {
+                                        " \u{25BC}"
+                                    };
+                                    let label = format!("{}{arrow}", Columns::label(which, s));
+                                    if ui.selectable_label(on, label).clicked() {
+                                        requested = Some(which);
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                            ui.separator();
+                            // Only a zip can be written to, so anywhere else this
+                            // is left out rather than offered and refused.
+                            if self.format == Format::Zip
+                                && ui.button(format!("{}	F2", s.rename_word)).clicked()
+                            {
+                                clicked = Some(idx);
+                                wants_rename.set(true);
+                                ui.close_menu();
+                            }
+                            if ui.button(format!("{}	Supr", s.delete_word)).clicked() {
+                                wants_delete.set(true);
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            // Only where the shell has somewhere to paste them.
+                            // Offering a copy that no other window can take would
+                            // be worse than not offering one.
+                            if clipboard::AVAILABLE {
+                                if ui.button(format!("{}	Ctrl+C", s.copy_word)).clicked() {
+                                    wants_clip.set(Some(false));
+                                    ui.close_menu();
+                                }
+                                if ui.button(format!("{}	Ctrl+X", s.cut_word)).clicked() {
+                                    wants_clip.set(Some(true));
+                                    ui.close_menu();
+                                }
+                                // Always offered rather than greyed out by looking:
+                                // the clipboard is one global lock, and opening it
+                                // on every frame the menu is up to find out what is
+                                // in it would be taking it from whoever else wants
+                                // it. An empty one says so in the status bar.
+                                if ui.button(format!("{}	Ctrl+V", s.paste_word)).clicked() {
+                                    wants_paste.set(true);
+                                    ui.close_menu();
+                                }
+                                ui.separator();
+                            }
+                            if ui
+                                .button(format!("{}	Ctrl+Shift+C", s.copy_names))
+                                .clicked()
+                            {
+                                wants_copy_names.set(true);
+                                ui.close_menu();
+                            }
+                            if ui.button(format!("{}	Ctrl+A", s.select_all)).clicked() {
+                                wants_select_all.set(true);
+                                ui.close_menu();
+                            }
+                        });
+                    }
                     if resp.clicked() {
                         clicked = Some(idx);
                         left_click = Some(idx);
@@ -4732,7 +5161,11 @@ impl Arca {
                 self.set_checked(&target, value);
             } else if mods.shift {
                 let from = self.cursor.unwrap_or(index);
-                let (lo, hi) = if from <= index { (from, index) } else { (index, from) };
+                let (lo, hi) = if from <= index {
+                    (from, index)
+                } else {
+                    (index, from)
+                };
                 for r in &visible[lo..=hi] {
                     self.set_checked(r, true);
                 }
@@ -4770,8 +5203,10 @@ impl Arca {
         if wants_copy_names.get() {
             let names = self.selected_names();
             if !names.is_empty() {
-                ui.ctx().copy_text(names.join("
-"));
+                ui.ctx().copy_text(names.join(
+                    "
+",
+                ));
             }
         }
         if wants_delete.get() {
@@ -4872,7 +5307,14 @@ impl Arca {
             // does.
             ui.max_rect().bottom(),
         );
-        self.rubber_band(ui, &visible, &row_rects, out.inner_rect, out.state.offset.y, reach);
+        self.rubber_band(
+            ui,
+            &visible,
+            &row_rects,
+            out.inner_rect,
+            out.state.offset.y,
+            reach,
+        );
         self.wheel_scroll(ui, out.inner_rect, out.state.offset.y, reach);
         if let Some(index) = opened {
             let target = &visible[index];
@@ -4894,7 +5336,25 @@ impl Arca {
 }
 
 impl eframe::App for Arca {
+    // Written when the window closes rather than every time it is dragged: the
+    // size and place change with every pixel of a resize and the settings file
+    // is not a thing to write sixty times a second.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.geometry.is_some() {
+            self.settings.window = self.geometry;
+            self.settings.save();
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Kept fresh every frame because `on_exit` is handed no context to ask.
+        // Only a window somebody is browsing in: the small one a job runs in
+        // would otherwise be what came back next time.
+        if matches!(self.view, View::Browse) {
+            if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                self.geometry = Some([rect.min.x, rect.min.y, rect.width(), rect.height()]);
+            }
+        }
         self.receive(ctx);
         // Getting the keyboard back is when whatever was done elsewhere has
         // been done. Only on the change, not every frame it is focused.
@@ -5002,32 +5462,33 @@ impl eframe::App for Arca {
                 egui::TopBottomPanel::bottom("status")
                     .exact_height(30.0)
                     .show(ctx, |ui| {
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    if self.busy && !self.quiet {
-                        let f = if self.total_count == 0 {
-                            0.0
-                        } else {
-                            self.done_count as f32 / self.total_count as f32
-                        };
-                        ui.add(
-                            egui::ProgressBar::new(f)
-                                .text(format!("{} / {}", self.done_count, self.total_count))
-                                .desired_width(ui.available_width()),
-                        );
-                    } else {
-                        let color = if self.error {
-                            egui::Color32::from_rgb(220, 90, 90)
-                        } else {
-                            ui.visuals().weak_text_color()
-                        };
-                        ui.colored_label(color, &self.notice);
-                    }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            if self.busy && !self.quiet {
+                                let f = if self.total_count == 0 {
+                                    0.0
+                                } else {
+                                    self.done_count as f32 / self.total_count as f32
+                                };
+                                ui.add(
+                                    egui::ProgressBar::new(f)
+                                        .text(format!("{} / {}", self.done_count, self.total_count))
+                                        .desired_width(ui.available_width()),
+                                );
+                            } else {
+                                let color = if self.error {
+                                    egui::Color32::from_rgb(220, 90, 90)
+                                } else {
+                                    ui.visuals().weak_text_color()
+                                };
+                                ui.colored_label(color, &self.notice);
+                            }
+                        });
                     });
-                });
                 // No gap under the list: it ends against the status bar, the
                 // way a file list ends against the bottom of its window
                 // everywhere else. The margin left there was the reason the
                 // rules between the columns stopped short of the foot.
+                self.tree_panel(ctx);
                 let mut frame = egui::Frame::central_panel(&ctx.style());
                 frame.inner_margin.bottom = 0.0;
                 egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
@@ -5056,10 +5517,15 @@ fn main() -> eframe::Result<()> {
     let settings = Settings::load();
     let compact = !matches!(startup, Startup::Browse(_));
 
-    let size = if compact {
-        [560.0, 300.0]
-    } else {
-        [1000.0, 660.0]
+    // The size and place the window was left at, when there is one and this is
+    // a window somebody is going to browse in. The little window a job runs in
+    // is a different shape and a different job, and giving it the browsing
+    // window's size would open a progress bar the size of a desk.
+    let remembered = (!compact).then_some(settings.window).flatten();
+    let size = match remembered {
+        Some([_, _, w, h]) => [w, h],
+        None if compact => [560.0, 300.0],
+        None => [1000.0, 660.0],
     };
     // The icon compiled into the executable covers the Explorer and the
     // shortcut, but winit does not read it for the window itself, so the title
@@ -5071,6 +5537,9 @@ fn main() -> eframe::Result<()> {
         // left to be given and the bar starts running off its own edge.
         .with_min_inner_size([720.0, 320.0])
         .with_title("Arca");
+    if let Some([x, y, _, _]) = remembered {
+        viewport = viewport.with_position([x, y]);
+    }
     if let Ok(icon) = eframe::icon_data::from_png_bytes(ICON_PNG) {
         viewport = viewport.with_icon(icon);
     }
@@ -5087,7 +5556,8 @@ fn main() -> eframe::Result<()> {
             // Both, not just the one in use: the setting can be changed while
             // the window is open, and egui keeps a style per theme.
             cc.egui_ctx.set_visuals_of(egui::Theme::Dark, theme::dark());
-            cc.egui_ctx.set_visuals_of(egui::Theme::Light, theme::light());
+            cc.egui_ctx
+                .set_visuals_of(egui::Theme::Light, theme::light());
             cc.egui_ctx.all_styles_mut(theme::style);
             cc.egui_ctx.set_theme(settings.theme);
 
@@ -5142,16 +5612,16 @@ mod tests {
     #[test]
     fn timestamps_become_the_dates_they_are() {
         for (secs, text) in [
-            (0_i64, ""),                              // no date recorded
-            (-1, ""),                                 // before the epoch: tar can hold these
+            (0_i64, ""), // no date recorded
+            (-1, ""),    // before the epoch: tar can hold these
             (1, "1970-01-01 00:00"),
-            (951_827_696, "2000-02-29 12:34"),        // leap day of a leap century
-            (1_078_012_800, "2004-02-29 00:00"),      // ordinary leap year
+            (951_827_696, "2000-02-29 12:34"), // leap day of a leap century
+            (1_078_012_800, "2004-02-29 00:00"), // ordinary leap year
             (1_709_164_800, "2024-02-29 00:00"),
-            (1_709_251_199, "2024-02-29 23:59"),      // last minute of that day
-            (1_735_689_600, "2025-01-01 00:00"),      // year boundary
+            (1_709_251_199, "2024-02-29 23:59"), // last minute of that day
+            (1_735_689_600, "2025-01-01 00:00"), // year boundary
             (1_767_225_599, "2025-12-31 23:59"),
-            (2_208_988_800, "2040-01-01 00:00"),      // past a 32-bit second count
+            (2_208_988_800, "2040-01-01 00:00"), // past a 32-bit second count
         ] {
             assert_eq!(when(Some(secs)), text, "{secs}");
         }
@@ -5170,7 +5640,10 @@ mod tests {
         // Two along the bottom and the point above them. Larger y is lower down.
         assert_eq!(up[0].y, up[1].y, "the base is level");
         assert!(up[2].y < up[0].y, "the point is above the base");
-        assert!(up[0].x < c.x && up[1].x > c.x, "the base straddles the centre");
+        assert!(
+            up[0].x < c.x && up[1].x > c.x,
+            "the base straddles the centre"
+        );
         assert_eq!(up[2].x, c.x, "the point is centred");
 
         let down = sort_mark(c, false);

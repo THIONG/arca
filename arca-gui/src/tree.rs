@@ -37,10 +37,8 @@ pub fn kind_of(name: &str, is_dir: bool) -> Kind {
         "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico" | "tif" | "tiff" => {
             Kind::Image
         }
-        "txt" | "md" | "log" | "csv" | "tsv" | "json" | "xml" | "yml" | "yaml" | "toml"
-        | "ini" | "cfg" | "conf" | "rs" | "py" | "js" | "ts" | "html" | "css" | "sh" | "ps1" => {
-            Kind::Text
-        }
+        "txt" | "md" | "log" | "csv" | "tsv" | "json" | "xml" | "yml" | "yaml" | "toml" | "ini"
+        | "cfg" | "conf" | "rs" | "py" | "js" | "ts" | "html" | "css" | "sh" | "ps1" => Kind::Text,
         "zip" | "tar" | "gz" | "tgz" | "7z" | "rar" | "xz" | "bz2" | "zst" => Kind::Archive,
         "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" => Kind::Audio,
         "mp4" | "mkv" | "avi" | "mov" | "webm" | "wmv" => Kind::Video,
@@ -55,10 +53,8 @@ pub fn draw_icon(ui: &mut egui::Ui, kind: Kind) {
     let faded = egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 110);
 
     if kind == Kind::Dir {
-        let tab = egui::Rect::from_min_size(
-            rect.left_top() + egui::vec2(1.0, 2.5),
-            egui::vec2(6.0, 2.5),
-        );
+        let tab =
+            egui::Rect::from_min_size(rect.left_top() + egui::vec2(1.0, 2.5), egui::vec2(6.0, 2.5));
         p.rect_filled(tab, 1.0, c);
         let body = egui::Rect::from_min_max(
             rect.left_top() + egui::vec2(1.0, 4.5),
@@ -98,6 +94,10 @@ pub struct Row {
     // has none of its own: it is not a thing the archive recorded.
     pub mtime: Option<i64>,
     pub crc32: u32,
+    // The way out of the folder, the row every file list keeps at the top. It
+    // is not an entry and nothing in the archive answers to it: it cannot be
+    // picked, counted, renamed or taken out, and sorting leaves it where it is.
+    pub up: bool,
 }
 
 fn normalized(e: &Entry) -> String {
@@ -144,6 +144,7 @@ pub fn children_of(entries: &[Entry], dir: &str) -> Vec<Row> {
                         count: 0,
                         mtime: e.mtime,
                         crc32: e.crc32,
+                        up: false,
                     });
                 }
             }
@@ -165,6 +166,7 @@ pub fn children_of(entries: &[Entry], dir: &str) -> Vec<Row> {
             mtime: None,
             crc32: 0,
             count,
+            up: false,
         })
         .collect();
     rows.append(&mut files);
@@ -308,5 +310,91 @@ mod tests {
         assert_eq!(kind_of("x.mkv", false), Kind::Video);
         assert_eq!(kind_of("noextension", false), Kind::Other);
         assert_eq!(kind_of("whatever", true), Kind::Dir);
+    }
+}
+
+/// The folders of an archive, one inside another.
+///
+/// Built from the names alone. A zip is a flat list of paths and a folder in
+/// one may have no entry of its own -- plenty of tools file `a/b/c.txt` and
+/// nothing for `a` or `a/b` -- so every path is walked segment by segment and
+/// what is missing is filled in. The names are held in a sorted map, which is
+/// the order they are drawn in and one less thing to sort later.
+#[derive(Default, Clone)]
+pub struct Folder {
+    pub kids: BTreeMap<String, Folder>,
+}
+
+impl Folder {
+    pub fn is_empty(&self) -> bool {
+        self.kids.is_empty()
+    }
+}
+
+pub fn folders_of(entries: &[Entry]) -> Folder {
+    let mut root = Folder::default();
+    for e in entries {
+        let full = normalized(e);
+        let dir = if e.is_dir {
+            full.trim_end_matches('/').to_string()
+        } else {
+            match full.rsplit_once('/') {
+                Some((parent, _)) => parent.to_string(),
+                None => continue,
+            }
+        };
+        if dir.is_empty() {
+            continue;
+        }
+        let mut at = &mut root;
+        for seg in dir.split('/') {
+            if seg.is_empty() {
+                continue;
+            }
+            at = at.kids.entry(seg.to_string()).or_default();
+        }
+    }
+    root
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+
+    fn entry(name: &str, is_dir: bool) -> Entry {
+        Entry {
+            name: name.to_string(),
+            size: 0,
+            compressed_size: 0,
+            method: arca_core::Method::Store,
+            mtime: None,
+            crc32: 0,
+            is_dir,
+            encrypted: false,
+            offset: 0,
+        }
+    }
+
+    // The folder nobody filed. A zip is under no obligation to carry an entry
+    // for a folder, so a tree built only from the ones that are there would
+    // have holes in exactly the archives that are hardest to walk without one.
+    #[test]
+    fn a_folder_with_no_entry_of_its_own_is_still_in_the_tree() {
+        let entries = [
+            entry("a/b/c.txt", false),
+            entry("a/other.txt", false),
+            entry("loose.txt", false),
+            entry("empty/", true),
+        ];
+        let root = folders_of(&entries);
+        let names: Vec<&String> = root.kids.keys().collect();
+        assert_eq!(
+            names,
+            ["a", "empty"],
+            "loose files bring no folder with them"
+        );
+        assert_eq!(root.kids["a"].kids.keys().collect::<Vec<_>>(), ["b"]);
+        assert!(root.kids["a"].kids["b"].is_empty());
+        assert!(root.kids["empty"].is_empty());
     }
 }
