@@ -7216,13 +7216,16 @@ impl eframe::App for Arca {
                             }
                         });
                     });
-                // No gap under the list: it ends against the status bar, the
-                // way a file list ends against the bottom of its window
-                // everywhere else. The margin left there was the reason the
-                // rules between the columns stopped short of the foot.
+                // The list fills what is left of the window, edge to edge. A
+                // file list is not a paragraph and does not want a margin: the
+                // one that was here left a strip of bare window above the
+                // headings and down both sides, so the row of names floated
+                // instead of sitting under the toolbar, and the rules between
+                // the columns stopped short of the foot. WinRAR, the Explorer
+                // and every other list of files run theirs to the edges.
                 self.tree_panel(ctx);
                 let mut frame = egui::Frame::central_panel(&ctx.style());
-                frame.inner_margin.bottom = 0.0;
+                frame.inner_margin = egui::Margin::ZERO;
                 egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
                     if self.entries.is_empty() {
                         let text = self.s().drop_here;
