@@ -3666,14 +3666,15 @@ impl Arca {
         // the other's clicks: pressing a cell of the first row sorted by that
         // column, and pressing a column name picked the first row. So the
         // header asks for an interaction of its own, under an id of its own.
-        // The rules between columns belong to the header and nowhere else.
-        // Running them the whole height of the list is what turned it into a
-        // spreadsheet; having none at all left the column names floating. So
-        // the colour the table draws them in is taken here and then cleared,
-        // and the header paints its own between one name and the next.
-        let rule = ui.visuals().widgets.noninteractive.bg_stroke;
+        // The rules between the columns run the whole height of the list, which
+        // is how WinRAR and every list of files with columns has always drawn
+        // them: they are what tells you which number belongs under which
+        // heading when the eye is halfway down the page. They were taken out
+        // here for a while on the grounds that they looked like a spreadsheet,
+        // which was a change nobody asked for and the wrong call. The table
+        // draws them itself; nothing to do but leave its colour alone.
         let accent = theme::cursor(ui.visuals()).color;
-        let head = |ui: &mut egui::Ui, text: &str, col: SortColumn, divide: bool| -> egui::Response {
+        let head = |ui: &mut egui::Ui, text: &str, col: SortColumn| -> egui::Response {
             let cell = ui.max_rect();
             // The table puts its cells in truncating mode, and a truncating
             // label takes the whole width it is offered. That is right for a
@@ -3694,21 +3695,9 @@ impl Arca {
                     egui::Stroke::NONE,
                 ));
             }
-            if divide {
-                let x = cell.right().round() + 0.5;
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(x, cell.top() + 7.0),
-                        egui::pos2(x, cell.bottom() - 7.0),
-                    ],
-                    rule,
-                );
-            }
             ui.interact(cell, egui::Id::new(("arca-head", text)), egui::Sense::click())
                 .on_hover_text(hint)
         };
-
-        ui.style_mut().visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
 
         let mut builder = TableBuilder::new(ui)
             // Stripes, ticks and a highlight were three ways of saying the same
@@ -3754,16 +3743,16 @@ impl Arca {
                     }
                 };
                 let mut resp = None;
-                h.col(|ui| resp = Some(head(ui, s.col_name, SortColumn::Name, true)));
+                h.col(|ui| resp = Some(head(ui, s.col_name, SortColumn::Name)));
                 if let Some(r) = resp {
                     if r.clicked() {
                         requested = Some(SortColumn::Name);
                     }
                     r.context_menu(|ui| menu(ui));
                 }
-                for (i, which) in shown.iter().enumerate() {
+                for which in &shown {
                     let mut resp = None;
-                    h.col(|ui| resp = Some(head(ui, Columns::label(*which, s), *which, i + 1 < shown.len())));
+                    h.col(|ui| resp = Some(head(ui, Columns::label(*which, s), *which)));
                     if let Some(r) = resp {
                         if r.clicked() {
                             requested = Some(*which);
