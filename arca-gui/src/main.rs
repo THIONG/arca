@@ -1058,6 +1058,10 @@ enum Job {
         names: Vec<String>,
         password: Option<String>,
     },
+    CopyTo {
+        archive: PathBuf,
+        dest: PathBuf,
+    },
     Rename {
         archive: PathBuf,
         // Both are full paths inside the archive, not the names on their own:
@@ -1298,6 +1302,62 @@ fn run_job_blocking(
             step_aside(&archive).map_err(|e| e.to_string())?;
             fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
             Ok(fill(s.deleted, &[("n", &gone.to_string())]))
+        }
+        Job::CopyTo { archive, dest } => {
+            // Copied by hand rather than with `fs::copy`, which says nothing
+            // until it is finished: a three gigabyte archive would be a window
+            // that had stopped answering for a minute. This one has a bar and a
+            // way out, like everything else that takes a while.
+            let total = fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
+            let name = dest
+                .file_name()
+                .map(|x| x.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let copied = (|| -> std::io::Result<u64> {
+                let mut from = BufReader::with_capacity(BUF, File::open(&archive)?);
+                let mut to = BufWriter::with_capacity(BUF, File::create(&dest)?);
+                let mut buf = vec![0u8; BUF];
+                let mut done = 0u64;
+                loop {
+                    let n = from.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    to.write_all(&buf[..n])?;
+                    done += n as u64;
+                    // The counters are whole megabytes: a bar that redraws once
+                    // per sixty-four kilobytes is a bar drawing itself instead
+                    // of the copy getting on with it.
+                    if !notify(
+                        (done / (1 << 20)) as usize,
+                        (total / (1 << 20)).max(1) as usize,
+                        &name,
+                    ) {
+                        return Err(std::io::Error::other("cancelled"));
+                    }
+                }
+                to.flush()?;
+                Ok(done)
+            })();
+            match copied {
+                Ok(bytes) => Ok(fill(
+                    s.copied_to,
+                    &[
+                        ("size", &human(bytes)),
+                        ("dest", &dest.display().to_string()),
+                    ],
+                )),
+                Err(e) => {
+                    // Half a copy is not a copy. Whatever was written goes,
+                    // whether the reason was a full disk or somebody pressing
+                    // stop.
+                    let _ = fs::remove_file(&dest);
+                    if e.to_string() == "cancelled" {
+                        return Err(arca_core::Error::Cancelled.to_string());
+                    }
+                    Err(e.to_string())
+                }
+            }
         }
         Job::Rename {
             archive,
@@ -1588,6 +1648,8 @@ enum View {
 enum More {
     Test,
     Undo,
+    SaveCopy,
+    DefaultPassword,
     Flat,
     Tree,
     Open(PathBuf),
@@ -2053,6 +2115,10 @@ struct Arca {
     // True for the first frame of a rename, when the box has to be given the
     // keyboard and the part of the name before the extension picked out.
     rename_fresh: bool,
+    // One password to try before asking, for a folder of archives all locked
+    // with the same word. Never written anywhere: see `default_password_window`.
+    default_password: Option<String>,
+    asking_default_password: bool,
     // The archive that has a previous version kept beside it, and the word for
     // what was done to it. One step back, which is the one anybody wants:
     // deeper than that and the sidecars would pile up.
@@ -2163,6 +2229,8 @@ impl Arca {
             band_scroll: None,
             renaming: None,
             rename_fresh: false,
+            default_password: None,
+            asking_default_password: false,
             undo: None,
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             viewing: None,
@@ -2389,6 +2457,108 @@ impl Arca {
         }
     }
 
+    // A copy of the archive under whatever name is chosen for it.
+    //
+    // The one thing to do before a change nobody is sure about, and the reason
+    // it is here rather than in the file manager is that the archive being
+    // looked at is the one that gets copied: no going and finding it again.
+    fn save_copy(&mut self, ctx: &egui::Context) {
+        let Some(archive) = self.archive.clone() else {
+            return;
+        };
+        let name = archive
+            .file_name()
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(&name)
+            .set_directory(archive.parent().unwrap_or(Path::new(".")))
+            .save_file()
+        else {
+            return;
+        };
+        if dest == archive {
+            return;
+        }
+        self.run_job(ctx, Job::CopyTo { archive, dest });
+    }
+
+    // The password to try on anything that asks for one, so that a folder full
+    // of archives locked with the same word is opened once and not fifteen
+    // times.
+    //
+    // In memory and nowhere else. It is never written to the settings file: a
+    // password in plain text beside the theme and the column widths is how an
+    // encrypted archive stops being encrypted, and a program that offers to
+    // remember one for you had better be clear about how long "remember" is.
+    fn default_password_window(&mut self, ctx: &egui::Context) {
+        if !self.asking_default_password {
+            return;
+        }
+        let s = self.s();
+        let mut close = false;
+        let mut forget = false;
+        egui::Window::new(s.default_password)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.password_input)
+                        .id(egui::Id::new("arca-default-password"))
+                        .password(!self.show_password)
+                        .desired_width(280.0)
+                        .hint_text(s.password_hint),
+                );
+                if !field.has_focus() && !field.lost_focus() {
+                    field.request_focus();
+                }
+                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    close = true;
+                }
+                ui.checkbox(&mut self.show_password, s.show_password);
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(s.password_kept).weak().small());
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button(s.start).clicked() {
+                        close = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            self.default_password.is_some(),
+                            egui::Button::new(s.remove_password),
+                        )
+                        .clicked()
+                    {
+                        forget = true;
+                    }
+                    if ui.button(s.cancel).clicked() {
+                        self.asking_default_password = false;
+                        self.password_input.clear();
+                    }
+                });
+                ui.add_space(4.0);
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.asking_default_password = false;
+            self.password_input.clear();
+        }
+        if forget {
+            self.default_password = None;
+            self.asking_default_password = false;
+            self.password_input.clear();
+            self.notice = s.password_forgotten.to_string();
+            self.error = false;
+        }
+        if close {
+            let given = std::mem::take(&mut self.password_input);
+            self.default_password = (!given.is_empty()).then_some(given);
+            self.asking_default_password = false;
+        }
+    }
+
     // Puts the archive back the way it was before the last change.
     //
     // A swap of two names, because the version before the change was moved
@@ -2490,6 +2660,7 @@ impl Arca {
             Job::Password { .. } => s.changing_password.to_string(),
             Job::Delete { .. } => s.deleting.to_string(),
             Job::Rename { .. } => s.renaming.to_string(),
+            Job::CopyTo { .. } => s.copying_word.to_string(),
             Job::Compress { .. } => s.compressing.to_string(),
             Job::Add { .. } => s.adding.to_string(),
         };
@@ -2499,6 +2670,7 @@ impl Arca {
                 | Job::Password { .. }
                 | Job::Delete { .. }
                 | Job::Rename { .. }
+                | Job::CopyTo { .. }
                 | Job::Add { .. }
         );
         // The file on disk is about to change, so the listing has to be redone.
@@ -2565,9 +2737,18 @@ impl Arca {
                 match m {
                     Message::Listing(path, v) => {
                         if v.iter().any(|e| e.encrypted) && self.archive_password.is_none() {
-                            self.password_input.clear();
-                            self.archive_password = None;
-                            self.waiting_on_password = Some(Pending::OpenArchive);
+                            // The one already given for everything, if there is
+                            // one. A wrong guess here is no worse than a wrong
+                            // answer to the box: whatever it was tried on says
+                            // so when it fails.
+                            match self.default_password.clone() {
+                                Some(pw) => self.archive_password = Some(pw),
+                                None => {
+                                    self.password_input.clear();
+                                    self.archive_password = None;
+                                    self.waiting_on_password = Some(Pending::OpenArchive);
+                                }
+                            }
                         }
                         // Nothing picked to begin with. It used to be
                         // everything, which was invisible while the ticks were
@@ -3311,37 +3492,55 @@ impl Arca {
         // has none, which is exactly the case here. What does still arrive is
         // the key going back up, because the early return only covers the press
         // -- so that is what a paste is recognised by.
-        let (ctrl, shift, o, e, t, n, f, f5, del, cut, copy, paste, plus, minus, alt_w, undo) = ctx
-            .input(|i| {
-                (
-                    i.modifiers.command,
-                    i.modifiers.shift,
-                    i.key_pressed(egui::Key::O),
-                    i.key_pressed(egui::Key::E),
-                    i.key_pressed(egui::Key::T),
-                    i.key_pressed(egui::Key::N),
-                    i.key_pressed(egui::Key::F),
-                    i.key_pressed(egui::Key::F5),
-                    i.key_pressed(egui::Key::Delete),
-                    i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
-                    i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
-                    i.events.iter().any(|e| {
-                        matches!(
-                            e,
-                            egui::Event::Key {
-                                key: egui::Key::V,
-                                pressed: false,
-                                modifiers,
-                                ..
-                            } if modifiers.command
-                        )
-                    }),
-                    i.key_pressed(egui::Key::Plus),
-                    i.key_pressed(egui::Key::Minus),
-                    i.modifiers.alt && i.key_pressed(egui::Key::W),
-                    i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
-                )
-            });
+        let (
+            ctrl,
+            shift,
+            o,
+            e,
+            t,
+            n,
+            f,
+            f5,
+            del,
+            cut,
+            copy,
+            paste,
+            plus,
+            minus,
+            alt_w,
+            undo,
+            ctrl_p,
+        ) = ctx.input(|i| {
+            (
+                i.modifiers.command,
+                i.modifiers.shift,
+                i.key_pressed(egui::Key::O),
+                i.key_pressed(egui::Key::E),
+                i.key_pressed(egui::Key::T),
+                i.key_pressed(egui::Key::N),
+                i.key_pressed(egui::Key::F),
+                i.key_pressed(egui::Key::F5),
+                i.key_pressed(egui::Key::Delete),
+                i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
+                i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key {
+                            key: egui::Key::V,
+                            pressed: false,
+                            modifiers,
+                            ..
+                        } if modifiers.command
+                    )
+                }),
+                i.key_pressed(egui::Key::Plus),
+                i.key_pressed(egui::Key::Minus),
+                i.modifiers.alt && i.key_pressed(egui::Key::W),
+                i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
+                i.modifiers.command && i.key_pressed(egui::Key::P),
+            )
+        });
 
         // These three carry their own modifier, so they do not wait behind the
         // Ctrl check below. They do belong to the filter box while it has the
@@ -3385,6 +3584,10 @@ impl Arca {
         // Everything out, beside the archive, without asking where. The whole
         // point of it is that it is one keystroke: the folder the archive is in
         // is where an extraction goes nine times out of ten.
+        if ctrl_p && !typing {
+            self.password_input.clear();
+            self.asking_default_password = true;
+        }
         // One step back from the last change to the archive, which is the step
         // anybody wants: the one they just took by mistake.
         if undo && !typing && self.undo.is_some() {
@@ -4021,6 +4224,19 @@ impl Arca {
                     {
                         wants = Some(More::Test);
                     }
+                    if ui
+                        .add_enabled(has, egui::Button::new(s.save_copy))
+                        .clicked()
+                    {
+                        wants = Some(More::SaveCopy);
+                    }
+                    if ui
+                        .button(format!("{}	Ctrl+P", s.default_password))
+                        .clicked()
+                    {
+                        wants = Some(More::DefaultPassword);
+                    }
+                    ui.separator();
                     // Named after what it would take back, because "undo" on its
                     // own asks the reader to remember what they did last.
                     let back = self
@@ -4137,6 +4353,11 @@ impl Arca {
                     self.settings.save();
                 }
                 Some(More::Undo) => self.undo_last(ctx),
+                Some(More::SaveCopy) => self.save_copy(ctx),
+                Some(More::DefaultPassword) => {
+                    self.password_input.clear();
+                    self.asking_default_password = true;
+                }
                 Some(More::Tree) => {
                     self.settings.tree = !self.settings.tree;
                     self.settings.save();
@@ -4369,7 +4590,7 @@ impl Arca {
                 // The keys are spelled out rather than drawn with the arrows
                 // and the page symbols: Consolas has the four arrows and not
                 // the page ones, so half of that line came out as hollow boxes.
-                let left: [(&str, &str); 18] = [
+                let left: [(&str, &str); 19] = [
                     ("Ctrl+O", s.open),
                     ("Ctrl+N", s.compress),
                     ("Ctrl+E", s.extract_all),
@@ -4380,6 +4601,7 @@ impl Arca {
                     ("Ctrl+F", s.find_word),
                     ("", ""),
                     ("Ctrl+Z", s.undo_word),
+                    ("Ctrl+P", s.default_password),
                     ("Ctrl+A", s.select_all),
                     ("Ctrl+I", s.invert_selection),
                     ("Esc", s.clear_selection),
@@ -6185,6 +6407,7 @@ impl eframe::App for Arca {
                 self.shortcuts_window(&ctx2);
                 self.group_window(&ctx2);
                 self.viewer_window(&ctx2);
+                self.default_password_window(&ctx2);
                 self.conflict_window(&ctx2);
                 self.password_window(&ctx2);
                 self.confirm_delete_window(&ctx2);
