@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
-use tree::{children_of, draw_icon, entries_under, kind_of, parent_of, Kind, Row};
+use tree::{children_of, draw_icon, draw_icon_at, entries_under, kind_of, parent_of, Kind, Row};
 
 const BUF: usize = 256 * 1024;
 const ROW_HEIGHT: f32 = 29.0;
@@ -246,6 +246,10 @@ struct Settings {
     flat: bool,
     // The folders of the archive down the left hand side.
     tree: bool,
+    // Which code page an unflagged zip has its names written in. Only the
+    // person looking at the archive can know, so it is remembered: somebody
+    // whose archives all come from one machine says it once.
+    page: arca_zip::pages::Page,
     // Where the window was left and how big: x, y, width, height. None until it
     // has been opened once.
     window: Option<[f32; 4]>,
@@ -284,6 +288,7 @@ impl Default for Settings {
             columns: Columns::default(),
             flat: false,
             tree: false,
+            page: arca_zip::pages::Page::default(),
             window: None,
             recent: Vec::new(),
             widths: Settings::default_widths(),
@@ -310,6 +315,11 @@ impl Settings {
                 ("theme", _) => s.theme = ThemePreference::System,
                 ("flat", v) => s.flat = v == "yes",
                 ("tree", v) => s.tree = v == "yes",
+                ("page", v) => {
+                    if let Some(p) = arca_zip::pages::Page::from_code(v) {
+                        s.page = p;
+                    }
+                }
                 // One line each, because a path can hold anything a filename
                 // can and there is no separator left that it could not.
                 ("recent", p) if !p.is_empty() => s.recent.push(p.to_string()),
@@ -486,6 +496,28 @@ fn system_type(cache: &mut HashMap<String, Option<String>>, name: &str, is_dir: 
 // A folder of its own per archive, so two archives holding a file with the same
 // name do not overwrite each other's copy. safe_name is what keeps an entry
 // called "../../evil" from landing outside it.
+/// Where the version before the last change is kept, so it can be put back.
+fn undo_path(archive: &Path) -> PathBuf {
+    let mut name = archive.as_os_str().to_os_string();
+    name.push(".arca-undo");
+    PathBuf::from(name)
+}
+
+/// Moves the archive out of the way instead of letting the new one overwrite
+/// it, so that the change can be taken back.
+///
+/// A move, not a copy: the file stays on the volume it was already on and
+/// nothing is read or written, so keeping the old version costs the time of a
+/// directory entry however big the archive is. What it does cost is the space,
+/// until the next change replaces it or the window closes.
+fn step_aside(archive: &Path) -> std::io::Result<()> {
+    let keep = undo_path(archive);
+    if keep.exists() {
+        fs::remove_file(&keep)?;
+    }
+    fs::rename(archive, &keep)
+}
+
 // One entry straight into memory, for looking at rather than for keeping.
 //
 // The same walk as `extract_one` without the file at the end of it: a viewer
@@ -790,7 +822,9 @@ fn extract(
     archive: &Path,
     dest: &Path,
     wanted: &[bool],
-    notify: &(dyn Fn(usize, usize, &str) + Sync),
+    // Told how far along this is, and answers whether to carry on. False is
+    // somebody pressing stop.
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
     ask: &dyn Fn(&Path) -> Answer,
     password: Option<&str>,
 ) -> arca_core::Result<u64> {
@@ -824,19 +858,23 @@ fn extract(
                     let mut f = BufWriter::with_capacity(BUF, File::create(path)?);
                     let w = arca_zip::extract_entry_with(&mut source, e, &mut f, password)?;
                     f.flush()?;
-                    notify(done.fetch_add(1, Ordering::Relaxed) + 1, total, &e.name);
+                    if !notify(done.fetch_add(1, Ordering::Relaxed) + 1, total, &e.name) {
+                        return Err(arca_core::Error::Cancelled);
+                    }
                     Ok(w)
                 })
                 .collect::<arca_core::Result<Vec<u64>>>()?;
             bytes = written.iter().sum();
-            notify(total, total, "");
+            let _ = notify(total, total, "");
         }
         _ => {
             let mut r = TarReader::new(open_source(archive, format)?);
             let total = wanted.len();
             let mut i = 0usize;
             while let Some(e) = r.next_entry()? {
-                notify(i, total, &e.entry.name);
+                if !notify(i, total, &e.entry.name) {
+                    return Err(arca_core::Error::Cancelled);
+                }
                 if !wanted.is_empty() && !wanted.get(i).copied().unwrap_or(true) {
                     r.skip_data(&e)?;
                     i += 1;
@@ -852,7 +890,7 @@ fn extract(
                 }
                 i += 1;
             }
-            notify(i, i, "");
+            let _ = notify(i, i, "");
         }
     }
     Ok(bytes)
@@ -861,7 +899,9 @@ fn extract(
 fn test_archive(
     archive: &Path,
     only: Option<&HashSet<String>>,
-    notify: &(dyn Fn(usize, usize, &str) + Sync),
+    // Told how far along this is, and answers whether to carry on. False is
+    // somebody pressing stop.
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
 ) -> arca_core::Result<(usize, Vec<String>)> {
     let Some(format) = detect(archive) else {
         return Err(arca_core::Error::Unsupported("unknown format".into()));
@@ -875,7 +915,9 @@ fn test_archive(
             let total = a.len();
             for i in 0..total {
                 let name = a.entries()[i].name.clone();
-                notify(i, total, &name);
+                if !notify(i, total, &name) {
+                    return Err(arca_core::Error::Cancelled);
+                }
                 if a.entries()[i].is_dir || only.is_some_and(|set| !set.contains(&name)) {
                     continue;
                 }
@@ -884,13 +926,15 @@ fn test_archive(
                     Err(e) => bad.push(format!("{name}: {e}")),
                 }
             }
-            notify(total, total, "");
+            let _ = notify(total, total, "");
         }
         _ => {
             let mut r = TarReader::new(open_source(archive, format)?);
             let mut i = 0usize;
             while let Some(e) = r.next_entry()? {
-                notify(i, i + 1, &e.entry.name);
+                if !notify(i, i + 1, &e.entry.name) {
+                    return Err(arca_core::Error::Cancelled);
+                }
                 if e.entry.is_dir || only.is_some_and(|set| !set.contains(&e.entry.name)) {
                     r.skip_data(&e)?;
                 } else {
@@ -901,7 +945,7 @@ fn test_archive(
                 }
                 i += 1;
             }
-            notify(i, i, "");
+            let _ = notify(i, i, "");
         }
     }
     Ok((good, bad))
@@ -938,7 +982,9 @@ fn compress(
     format: Format,
     codec: Codec,
     level: Level,
-    notify: &(dyn Fn(usize, usize, &str) + Sync),
+    // Told how far along this is, and answers whether to carry on. False is
+    // somebody pressing stop.
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
     password: Option<&str>,
 ) -> arca_core::Result<(u64, u64)> {
     if password.is_some() && format != Format::Zip {
@@ -954,7 +1000,9 @@ fn compress(
         Format::Zip => {
             let mut w = ZipWriter::new(BufWriter::with_capacity(BUF, File::create(out)?));
             for (i, (path, name)) in files.iter().enumerate() {
-                notify(i, total, name);
+                if !notify(i, total, name) {
+                    return Err(arca_core::Error::Cancelled);
+                }
                 let meta = fs::metadata(path)?;
                 let f = BufReader::with_capacity(BUF, File::open(path)?);
                 w.add_with_password(name, f, codec, level, None, password)?;
@@ -974,7 +1022,9 @@ fn compress(
             };
             let mut w = TarWriter::new(sink);
             for (i, (path, name)) in files.iter().enumerate() {
-                notify(i, total, name);
+                if !notify(i, total, name) {
+                    return Err(arca_core::Error::Cancelled);
+                }
                 let meta = fs::metadata(path)?;
                 let f = BufReader::with_capacity(BUF, File::open(path)?);
                 w.add(name, meta.len(), 0, 0o644, f)?;
@@ -983,7 +1033,7 @@ fn compress(
             w.finish()?;
         }
     }
-    notify(total, total, "");
+    let _ = notify(total, total, "");
     let final_size = fs::metadata(out).map(|m| m.len()).unwrap_or(0);
     Ok((source_bytes, final_size))
 }
@@ -1018,6 +1068,17 @@ enum Job {
     Delete {
         archive: PathBuf,
         names: Vec<String>,
+        password: Option<String>,
+    },
+    CopyTo {
+        archive: PathBuf,
+        dest: PathBuf,
+    },
+    NewFolder {
+        archive: PathBuf,
+        // The whole path with the slash already on it, worked out where the
+        // folder you are looking at is known.
+        name: String,
         password: Option<String>,
     },
     Rename {
@@ -1130,7 +1191,9 @@ fn fill(template: &str, pairs: &[(&str, &str)]) -> String {
 fn run_job_blocking(
     job: Job,
     s: &'static Strings,
-    notify: &(dyn Fn(usize, usize, &str) + Sync),
+    // Told how far along this is, and answers whether to carry on. False is
+    // somebody pressing stop.
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
     ask: &dyn Fn(&Path) -> Answer,
 ) -> std::result::Result<String, String> {
     match job {
@@ -1209,6 +1272,7 @@ fn run_job_blocking(
                 let _ = fs::remove_file(&temp);
                 return Err(e.to_string());
             }
+            step_aside(&archive).map_err(|e| e.to_string())?;
             fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
             let name = archive
                 .file_name()
@@ -1254,8 +1318,65 @@ fn run_job_blocking(
                 let _ = fs::remove_file(&temp);
                 return Err(e.to_string());
             }
+            step_aside(&archive).map_err(|e| e.to_string())?;
             fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
             Ok(fill(s.deleted, &[("n", &gone.to_string())]))
+        }
+        Job::CopyTo { archive, dest } => {
+            // Copied by hand rather than with `fs::copy`, which says nothing
+            // until it is finished: a three gigabyte archive would be a window
+            // that had stopped answering for a minute. This one has a bar and a
+            // way out, like everything else that takes a while.
+            let total = fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
+            let name = dest
+                .file_name()
+                .map(|x| x.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let copied = (|| -> std::io::Result<u64> {
+                let mut from = BufReader::with_capacity(BUF, File::open(&archive)?);
+                let mut to = BufWriter::with_capacity(BUF, File::create(&dest)?);
+                let mut buf = vec![0u8; BUF];
+                let mut done = 0u64;
+                loop {
+                    let n = from.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    to.write_all(&buf[..n])?;
+                    done += n as u64;
+                    // The counters are whole megabytes: a bar that redraws once
+                    // per sixty-four kilobytes is a bar drawing itself instead
+                    // of the copy getting on with it.
+                    if !notify(
+                        (done / (1 << 20)) as usize,
+                        (total / (1 << 20)).max(1) as usize,
+                        &name,
+                    ) {
+                        return Err(std::io::Error::other("cancelled"));
+                    }
+                }
+                to.flush()?;
+                Ok(done)
+            })();
+            match copied {
+                Ok(bytes) => Ok(fill(
+                    s.copied_to,
+                    &[
+                        ("size", &human(bytes)),
+                        ("dest", &dest.display().to_string()),
+                    ],
+                )),
+                Err(e) => {
+                    // Half a copy is not a copy. Whatever was written goes,
+                    // whether the reason was a full disk or somebody pressing
+                    // stop.
+                    let _ = fs::remove_file(&dest);
+                    if e.to_string() == "cancelled" {
+                        return Err(arca_core::Error::Cancelled.to_string());
+                    }
+                    Err(e.to_string())
+                }
+            }
         }
         Job::Rename {
             archive,
@@ -1308,6 +1429,7 @@ fn run_job_blocking(
                 let _ = fs::remove_file(&temp);
                 return Err(e.to_string());
             }
+            step_aside(&archive).map_err(|e| e.to_string())?;
             fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
             // Nothing to say: the new name is in the list, which is where the
             // eye already is. An empty word here leaves the summary of the
@@ -1370,7 +1492,7 @@ fn run_job_blocking(
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .map(|(source, name)| arca_zip::Addition {
-                    source,
+                    source: Some(source),
                     name: format!("{dir}{name}"),
                     codec,
                     level,
@@ -1392,8 +1514,43 @@ fn run_job_blocking(
                 let _ = fs::remove_file(&temp);
                 return Err(e.to_string());
             }
+            step_aside(&archive).map_err(|e| e.to_string())?;
             fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
             Ok(fill(s.added, &[("n", &n.to_string())]))
+        }
+        Job::NewFolder {
+            archive,
+            name,
+            password,
+        } => {
+            if detect(&archive) != Some(Format::Zip) {
+                return Err(s.only_zip_can_change.to_string());
+            }
+            let temp = archive.with_file_name(format!(
+                "{}.arca-new",
+                archive
+                    .file_name()
+                    .map(|x| x.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            ));
+            let extra = [arca_zip::Addition {
+                // No file behind it: a folder in a zip is a name and nothing
+                // else.
+                source: None,
+                name,
+                codec: Codec::Store,
+                level: Level::Store,
+            }];
+            let done = arca_zip::add_entries(&archive, &temp, password.as_deref(), &extra, notify);
+            if let Err(e) = done {
+                let _ = fs::remove_file(&temp);
+                return Err(e.to_string());
+            }
+            step_aside(&archive).map_err(|e| e.to_string())?;
+            fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
+            // Nothing to say: the folder is in the list, which is where the eye
+            // already is.
+            Ok(String::new())
         }
     }
 }
@@ -1409,6 +1566,9 @@ enum SortColumn {
     Crc,
     Type,
     Path,
+    Created,
+    Accessed,
+    Attributes,
 }
 
 // Which columns the list shows. Name is not here: a list of nothing but sizes
@@ -1423,6 +1583,9 @@ struct Columns {
     crc: bool,
     type_: bool,
     path: bool,
+    created: bool,
+    accessed: bool,
+    attributes: bool,
 }
 
 impl Default for Columns {
@@ -1438,12 +1601,15 @@ impl Default for Columns {
             crc: false,
             type_: false,
             path: false,
+            created: false,
+            accessed: false,
+            attributes: false,
         }
     }
 }
 
 impl Columns {
-    const ALL: [(SortColumn, &'static str); 8] = [
+    const ALL: [(SortColumn, &'static str); 11] = [
         (SortColumn::Size, "size"),
         (SortColumn::Packed, "packed"),
         (SortColumn::Method, "method"),
@@ -1452,6 +1618,9 @@ impl Columns {
         (SortColumn::Crc, "crc"),
         (SortColumn::Type, "type"),
         (SortColumn::Path, "path"),
+        (SortColumn::Created, "created"),
+        (SortColumn::Accessed, "accessed"),
+        (SortColumn::Attributes, "attributes"),
     ];
 
     fn on(&self, which: SortColumn) -> bool {
@@ -1464,6 +1633,9 @@ impl Columns {
             SortColumn::Crc => self.crc,
             SortColumn::Type => self.type_,
             SortColumn::Path => self.path,
+            SortColumn::Created => self.created,
+            SortColumn::Accessed => self.accessed,
+            SortColumn::Attributes => self.attributes,
             SortColumn::Name => true,
         }
     }
@@ -1478,6 +1650,9 @@ impl Columns {
             SortColumn::Crc => self.crc = value,
             SortColumn::Type => self.type_ = value,
             SortColumn::Path => self.path = value,
+            SortColumn::Created => self.created = value,
+            SortColumn::Accessed => self.accessed = value,
+            SortColumn::Attributes => self.attributes = value,
             SortColumn::Name => {}
         }
     }
@@ -1492,6 +1667,9 @@ impl Columns {
             SortColumn::Crc => s.col_crc,
             SortColumn::Type => s.col_type,
             SortColumn::Path => s.col_path,
+            SortColumn::Created => s.col_created,
+            SortColumn::Accessed => s.col_accessed,
+            SortColumn::Attributes => s.col_attributes,
             SortColumn::Name => s.col_name,
         }
     }
@@ -1585,6 +1763,11 @@ pub enum DropChoice {
 #[derive(Clone)]
 enum More {
     Test,
+    Undo,
+    NewFolder,
+    Page(arca_zip::pages::Page),
+    SaveCopy,
+    DefaultPassword,
     Flat,
     Tree,
     Open(PathBuf),
@@ -1613,6 +1796,20 @@ struct Wheel {
     /// running until the next click; that is what makes press-and-drag and
     /// click-and-go both work off the one button.
     moved: bool,
+}
+
+/// The DOS attribute byte as the letters every file manager has shown it with
+/// since there were file managers: read only, hidden, system, archive.
+///
+/// A dash where a bit is off rather than a shorter string, so that the column
+/// lines up down the page and the eye can read one position instead of one
+/// word. The directory bit is not shown: the list already says which rows are
+/// folders, in a way that does not need decoding.
+fn attribute_letters(bits: u8) -> String {
+    [(0x01, 'R'), (0x02, 'H'), (0x04, 'S'), (0x20, 'A')]
+        .iter()
+        .map(|(mask, letter)| if bits & mask != 0 { *letter } else { '-' })
+        .collect()
 }
 
 /// Whether a name claims to be a picture of a kind the window can draw.
@@ -1763,44 +1960,170 @@ fn matches_mask(mask: &str, name: &str) -> bool {
     m[i..].iter().all(|c| *c == '*')
 }
 
-/// One level of the folder tree, and everything under it.
+/// One row of the folder tree, ready to be drawn.
+struct Twig<'a> {
+    name: &'a str,
+    path: String,
+    depth: usize,
+    kids: bool,
+    open: bool,
+    // The archive itself rather than a folder inside it, which gets the icon
+    // the desktop puts on a .zip.
+    archive: bool,
+}
+
+/// How tall a row of the tree is. Taller than a line of text, because this is a
+/// list of places to press rather than a paragraph to read.
+const TWIG_HEIGHT: f32 = 26.0;
+
+/// Draws one row of the folder tree and says what was pressed.
 ///
-/// A folder with nothing inside it gets no triangle, and one with something
-/// gets a triangle that only opens and closes: the name beside it stays a place
-/// you can go to either way, which is the difference between a tree you can
-/// walk and one you have to unfold first.
+/// The whole width answers, not the word: a navigation pane where only the
+/// letters are a target is a pane you have to aim at, and the highlight that
+/// says where you are should reach both edges or it reads as a button that
+/// happens to be lit. That is how the Explorer's own pane behaves.
+///
+/// The chevron on the right belongs to whether the folder is unfolded and
+/// nothing else. Pressing the name takes you there whether it is unfolded or
+/// not, which is the difference between a tree you can walk and one you have to
+/// open first.
+fn twig(
+    ui: &mut egui::Ui,
+    icons: &mut HashMap<String, Option<egui::TextureHandle>>,
+    twig: &Twig<'_>,
+    here: &str,
+) -> egui::Response {
+    let full = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(full, TWIG_HEIGHT), egui::Sense::click());
+    let on = here == twig.path;
+    let fill = if on {
+        ui.visuals().selection.bg_fill
+    } else if resp.hovered() {
+        ui.visuals().widgets.hovered.bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let ink = if on {
+        ui.visuals().selection.stroke.color
+    } else {
+        ui.visuals().widgets.noninteractive.fg_stroke.color
+    };
+    if fill != egui::Color32::TRANSPARENT {
+        ui.painter()
+            .rect_filled(rect, egui::Rounding::same(4.0), fill);
+    }
+
+    // Each level a thumb further in, and the icon always at the same distance
+    // from the name, so a column of names reads as a column.
+    let inset = 8.0 + twig.depth as f32 * 14.0;
+    let mid = rect.center().y;
+    let icon = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + inset + 8.0, mid),
+        egui::Vec2::splat(16.0),
+    );
+    let name = if twig.archive {
+        "archive.zip"
+    } else {
+        "folder"
+    };
+    match system_icon(ui.ctx(), icons, name, !twig.archive) {
+        Some(tex) => {
+            egui::Image::new(&tex).paint_at(ui, icon);
+        }
+        None => draw_icon_at(
+            ui,
+            icon,
+            if twig.archive {
+                Kind::Archive
+            } else {
+                Kind::Dir
+            },
+        ),
+    }
+
+    ui.painter().text(
+        egui::pos2(icon.right() + 8.0, mid),
+        egui::Align2::LEFT_CENTER,
+        twig.name,
+        egui::TextStyle::Body.resolve(ui.style()),
+        ink,
+    );
+
+    // A chevron only where there is something folded up behind it, turned down
+    // once it is open, at the far edge where every pane on this machine puts
+    // the thing that says "there is more".
+    if twig.kids {
+        let c = egui::pos2(rect.right() - 14.0, mid);
+        let (w, h) = (3.5, 5.0);
+        let points = if twig.open {
+            vec![
+                egui::pos2(c.x - h, c.y - w * 0.6),
+                egui::pos2(c.x + h, c.y - w * 0.6),
+                egui::pos2(c.x, c.y + w),
+            ]
+        } else {
+            vec![
+                egui::pos2(c.x - w * 0.6, c.y - h),
+                egui::pos2(c.x - w * 0.6, c.y + h),
+                egui::pos2(c.x + w, c.y),
+            ]
+        };
+        ui.painter().add(egui::Shape::convex_polygon(
+            points,
+            ink.gamma_multiply(0.7),
+            egui::Stroke::NONE,
+        ));
+    }
+    resp
+}
+
+/// One level of the folder tree, and everything under it.
 fn branch(
     ui: &mut egui::Ui,
+    icons: &mut HashMap<String, Option<egui::TextureHandle>>,
     folder: &tree::Folder,
     prefix: &str,
+    depth: usize,
     here: &str,
     go: &mut Option<String>,
 ) {
     for (name, kid) in &folder.kids {
         let path = format!("{prefix}{name}/");
-        let on = here == path;
-        if kid.is_empty() {
-            // Lined up with the ones that do have a triangle, so a level reads
-            // as a level rather than as a ragged edge. The triangle is an icon
-            // wide and the row puts its own gap after this, which between them
-            // come to what the header spends on the same thing.
-            ui.horizontal(|ui| {
-                ui.add_space(ui.spacing().icon_width);
-                if ui.selectable_label(on, name).clicked() {
-                    *go = Some(path.clone());
-                }
-            });
-            continue;
-        }
         let id = ui.make_persistent_id(&path);
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
-            .show_header(ui, |ui| {
-                if ui.selectable_label(on, name).clicked() {
-                    *go = Some(path.clone());
-                }
-            })
-            .body(|ui| branch(ui, kid, &path, here, go));
+        let mut state =
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+        let open = state.is_open();
+        let row = Twig {
+            name,
+            path: path.clone(),
+            depth,
+            kids: !kid.is_empty(),
+            open,
+            archive: false,
+        };
+        let resp = twig(ui, icons, &row, here);
+        if resp.clicked() {
+            // The chevron is its own target: the last stretch of the row folds
+            // and unfolds, and the rest of it goes there.
+            let at_end = ui
+                .input(|i| i.pointer.interact_pos())
+                .is_some_and(|p| p.x > resp.rect.right() - 28.0);
+            if row.kids && at_end {
+                state.toggle(ui);
+            } else {
+                *go = Some(path.clone());
+            }
+        }
+        if open && row.kids {
+            branch(ui, icons, kid, &path, depth + 1, here, go);
+        }
     }
+}
+
+/// Whether a name is a folder's, which in a zip is the slash on the end of it
+/// and nothing else. Both slashes, because archives from Windows use theirs.
+fn is_folder_name(name: &str) -> bool {
+    name.ends_with('/') || name.ends_with('\\')
 }
 
 /// The folder an entry is filed in, without the name on the end. Empty at the
@@ -1831,6 +2154,9 @@ fn up_row(dir: &str) -> Row {
         encrypted: false,
         count: 0,
         mtime: None,
+        created: None,
+        accessed: None,
+        attributes: 0,
         crc32: 0,
         up: true,
     }
@@ -1894,6 +2220,9 @@ fn natural_width(ui: &egui::Ui, rows: &[Row], which: SortColumn, s: &Strings) ->
         // row in the folder before the column could be sized.
         SortColumn::Type => wide_of(ui, s.col_type, Body) + pad,
         SortColumn::Path => widest(Body, &|r| folder_of(&r.path).to_string()) + pad,
+        SortColumn::Created => widest(Monospace, &|r| when(r.created)) + pad,
+        SortColumn::Accessed => widest(Monospace, &|r| when(r.accessed)) + pad,
+        SortColumn::Attributes => wide_of(ui, "RHSA", Monospace) + pad,
     }
 }
 
@@ -2049,6 +2378,21 @@ struct AppState {
     // True for the first frame of a rename, when the box has to be given the
     // keyboard and the part of the name before the extension picked out.
     rename_fresh: bool,
+    // One password to try before asking, for a folder of archives all locked
+    // with the same word. Never written anywhere: see `default_password_window`.
+    default_password: Option<String>,
+    asking_default_password: bool,
+    // Set while the box that asks for a new folder's name is up, and what has
+    // been typed into it.
+    asking_folder: bool,
+    folder_input: String,
+    // The archive that has a previous version kept beside it, and the word for
+    // what was done to it. One step back, which is the one anybody wants:
+    // deeper than that and the sidecars would pile up.
+    undo: Option<(PathBuf, &'static str)>,
+    // Raised to ask whatever is running to stop where it is. Shared with the
+    // thread doing the work, which reads it every time it reports progress.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     // The folders of the archive, rebuilt when a listing arrives rather than
     // every frame: it is fifteen hundred paths split on every slash and the
     // answer only changes when the archive does.
@@ -3018,6 +3362,9 @@ impl AppController {
                         encrypted: e.encrypted,
                         count: 0,
                         mtime: e.mtime,
+                        created: e.created,
+                        accessed: e.accessed,
+                        attributes: e.attributes,
                         crc32: e.crc32,
                         up: false,
                     }
@@ -3043,6 +3390,9 @@ impl AppController {
                     encrypted: e.encrypted,
                     count: 0,
                     mtime: e.mtime,
+                    created: e.created,
+                    accessed: e.accessed,
+                    attributes: e.attributes,
                     crc32: e.crc32,
                     up: false,
                 })
@@ -3074,6 +3424,9 @@ impl AppController {
                 SortColumn::Type => arca_icons::cache_key(&x.label, x.is_dir)
                     .cmp(&arca_icons::cache_key(&y.label, y.is_dir)),
                 SortColumn::Path => folder_of(&x.path).cmp(folder_of(&y.path)),
+                SortColumn::Created => x.created.cmp(&y.created),
+                SortColumn::Accessed => x.accessed.cmp(&y.accessed),
+                SortColumn::Attributes => x.attributes.cmp(&y.attributes),
             };
             if asc {
                 o
@@ -3375,13 +3728,28 @@ impl Arca {
             .default_width(220.0)
             .width_range(140.0..=420.0)
             .show(ctx, |ui| {
-                egui::ScrollArea::both().show(ui, |ui| {
-                    if ui.selectable_label(here.is_empty(), root).clicked() {
-                        go = Some(String::new());
-                    }
-                    branch(ui, &folders, "", &here, &mut go);
-                });
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // The archive itself, named for what it is rather than
+                        // for the file: the path along the top already says
+                        // which archive this is, and here it is a place to go
+                        // back to.
+                        let root = Twig {
+                            name: s.archive_root,
+                            path: String::new(),
+                            depth: 0,
+                            kids: false,
+                            open: false,
+                            archive: true,
+                        };
+                        if twig(ui, &mut icons, &root, &here).clicked() {
+                            go = Some(String::new());
+                        }
+                        branch(ui, &mut icons, &folders, "", 1, &here, &mut go);
+                    });
             });
+        self.icons = icons;
         if let Some(path) = go {
             // Going to a folder while the list is showing every file at once is
             // asking for that folder, so the flat view gets out of the way
@@ -3391,6 +3759,253 @@ impl Arca {
                 self.controller.state.settings.save();
             }
             self.controller.go_to(path);
+        }
+    }
+
+    // Reads the names again in a different code page.
+    //
+    // Nothing is written and the archive is not touched: the bytes of every
+    // name were kept as the archive spells them, and this decides again what
+    // they mean. Entries the archive marked as UTF-8 are left alone -- there is
+    // no question about those and reading them any other way would break the
+    // ones that were right.
+    //
+    // The listing goes back to the root afterwards. The folder you were in was
+    // a path made out of those names, and under a different page it is a path
+    // that does not exist.
+    fn reread_names(&mut self, ctx: &egui::Context, page: arca_zip::pages::Page) {
+        self.settings.page = page;
+        self.settings.save();
+        for e in &mut self.entries {
+            if e.utf8 {
+                continue;
+            }
+            e.name = arca_zip::pages::decode(&e.raw_name, page);
+            e.is_dir = e.name.ends_with('/') || e.name.ends_with('\\');
+        }
+        self.folders = tree::folders_of(&self.entries);
+        self.clear_picked();
+        self.cursor = None;
+        self.current_dir.clear();
+        self.history = vec![String::new()];
+        self.here = 0;
+        self.notice = self.summary();
+        self.error = false;
+        ctx.request_repaint();
+    }
+
+    // A folder made inside the archive, in the one you are looking at.
+    //
+    // Asked for in a box rather than made as "New folder" and renamed after,
+    // because making it is a rewrite of the whole archive and doing that twice
+    // for one folder would be silly.
+    fn new_folder_window(&mut self, ctx: &egui::Context) {
+        if !self.asking_folder {
+            return;
+        }
+        let s = self.s();
+        let mut go = false;
+        let mut cancel = false;
+        egui::Window::new(s.new_folder)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.label(s.folder_name);
+                ui.add_space(6.0);
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.folder_input)
+                        .id(egui::Id::new("arca-new-folder"))
+                        .desired_width(260.0),
+                );
+                if !field.has_focus() && !field.lost_focus() {
+                    field.request_focus();
+                }
+                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    go = true;
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button(s.new_folder).clicked() {
+                        go = true;
+                    }
+                    if ui.button(s.cancel).clicked() {
+                        cancel = true;
+                    }
+                });
+                ui.add_space(4.0);
+            });
+        if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.asking_folder = false;
+            self.folder_input.clear();
+        }
+        if go {
+            self.asking_folder = false;
+            let name = std::mem::take(&mut self.folder_input).trim().to_string();
+            let Some(archive) = self.archive.clone() else {
+                return;
+            };
+            // The same rules a rename lives by: a name is a name and not a
+            // path, and nothing here is called that already.
+            if name.is_empty() || name.contains('/') || name.contains('\\') {
+                self.notice = s.bad_name.to_string();
+                self.error = true;
+                return;
+            }
+            if self
+                .visible_rows()
+                .iter()
+                .any(|r| r.label.eq_ignore_ascii_case(&name))
+            {
+                self.notice = fill(s.name_taken, &[("name", &name)]);
+                self.error = true;
+                return;
+            }
+            self.run_job(
+                ctx,
+                Job::NewFolder {
+                    archive,
+                    name: format!("{}{name}/", self.current_dir),
+                    password: self.archive_password.clone(),
+                },
+            );
+        }
+    }
+
+    // A copy of the archive under whatever name is chosen for it.
+    //
+    // The one thing to do before a change nobody is sure about, and the reason
+    // it is here rather than in the file manager is that the archive being
+    // looked at is the one that gets copied: no going and finding it again.
+    fn save_copy(&mut self, ctx: &egui::Context) {
+        let Some(archive) = self.archive.clone() else {
+            return;
+        };
+        let name = archive
+            .file_name()
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(&name)
+            .set_directory(archive.parent().unwrap_or(Path::new(".")))
+            .save_file()
+        else {
+            return;
+        };
+        if dest == archive {
+            return;
+        }
+        self.run_job(ctx, Job::CopyTo { archive, dest });
+    }
+
+    // The password to try on anything that asks for one, so that a folder full
+    // of archives locked with the same word is opened once and not fifteen
+    // times.
+    //
+    // In memory and nowhere else. It is never written to the settings file: a
+    // password in plain text beside the theme and the column widths is how an
+    // encrypted archive stops being encrypted, and a program that offers to
+    // remember one for you had better be clear about how long "remember" is.
+    fn default_password_window(&mut self, ctx: &egui::Context) {
+        if !self.asking_default_password {
+            return;
+        }
+        let s = self.s();
+        let mut close = false;
+        let mut forget = false;
+        egui::Window::new(s.default_password)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.password_input)
+                        .id(egui::Id::new("arca-default-password"))
+                        .password(!self.show_password)
+                        .desired_width(280.0)
+                        .hint_text(s.password_hint),
+                );
+                if !field.has_focus() && !field.lost_focus() {
+                    field.request_focus();
+                }
+                if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    close = true;
+                }
+                ui.checkbox(&mut self.show_password, s.show_password);
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(s.password_kept).weak().small());
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button(s.start).clicked() {
+                        close = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            self.default_password.is_some(),
+                            egui::Button::new(s.remove_password),
+                        )
+                        .clicked()
+                    {
+                        forget = true;
+                    }
+                    if ui.button(s.cancel).clicked() {
+                        self.asking_default_password = false;
+                        self.password_input.clear();
+                    }
+                });
+                ui.add_space(4.0);
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.asking_default_password = false;
+            self.password_input.clear();
+        }
+        if forget {
+            self.default_password = None;
+            self.asking_default_password = false;
+            self.password_input.clear();
+            self.notice = s.password_forgotten.to_string();
+            self.error = false;
+        }
+        if close {
+            let given = std::mem::take(&mut self.password_input);
+            self.default_password = (!given.is_empty()).then_some(given);
+            self.asking_default_password = false;
+        }
+    }
+
+    // Puts the archive back the way it was before the last change.
+    //
+    // A swap of two names, because the version before the change was moved
+    // aside rather than thrown away. There is one step and no more: taking it
+    // back leaves nothing to take back, and the sidecar goes with it.
+    fn undo_last(&mut self, ctx: &egui::Context) {
+        let Some((archive, _)) = self.undo.take() else {
+            return;
+        };
+        let keep = undo_path(&archive);
+        if !keep.exists() {
+            return;
+        }
+        let pw = self.archive_password.clone();
+        if let Err(e) = fs::remove_file(&archive).and_then(|_| fs::rename(&keep, &archive)) {
+            self.notice = e.to_string();
+            self.error = true;
+            return;
+        }
+        self.open(ctx, archive);
+        self.archive_password = pw;
+    }
+
+    // Whatever is being kept for an undo is thrown away.
+    //
+    // Called when the window closes and when the archive is left behind: a file
+    // called `something.zip.arca-undo` sitting next to somebody's archive after
+    // the program has gone is litter, whatever it was for.
+    fn drop_undo(&mut self) {
+        if let Some((archive, _)) = self.undo.take() {
+            let _ = fs::remove_file(undo_path(&archive));
         }
     }
 
@@ -3642,36 +4257,55 @@ impl Arca {
         // has none, which is exactly the case here. What does still arrive is
         // the key going back up, because the early return only covers the press
         // -- so that is what a paste is recognised by.
-        let (ctrl, shift, o, e, t, n, f, f5, del, cut, copy, paste, plus, minus, alt_w) = ctx
-            .input(|i| {
-                (
-                    i.modifiers.command,
-                    i.modifiers.shift,
-                    i.key_pressed(egui::Key::O),
-                    i.key_pressed(egui::Key::E),
-                    i.key_pressed(egui::Key::T),
-                    i.key_pressed(egui::Key::N),
-                    i.key_pressed(egui::Key::F),
-                    i.key_pressed(egui::Key::F5),
-                    i.key_pressed(egui::Key::Delete),
-                    i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
-                    i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
-                    i.events.iter().any(|e| {
-                        matches!(
-                            e,
-                            egui::Event::Key {
-                                key: egui::Key::V,
-                                pressed: false,
-                                modifiers,
-                                ..
-                            } if modifiers.command
-                        )
-                    }),
-                    i.key_pressed(egui::Key::Plus),
-                    i.key_pressed(egui::Key::Minus),
-                    i.modifiers.alt && i.key_pressed(egui::Key::W),
-                )
-            });
+        let (
+            ctrl,
+            shift,
+            o,
+            e,
+            t,
+            n,
+            f,
+            f5,
+            del,
+            cut,
+            copy,
+            paste,
+            plus,
+            minus,
+            alt_w,
+            undo,
+            ctrl_p,
+        ) = ctx.input(|i| {
+            (
+                i.modifiers.command,
+                i.modifiers.shift,
+                i.key_pressed(egui::Key::O),
+                i.key_pressed(egui::Key::E),
+                i.key_pressed(egui::Key::T),
+                i.key_pressed(egui::Key::N),
+                i.key_pressed(egui::Key::F),
+                i.key_pressed(egui::Key::F5),
+                i.key_pressed(egui::Key::Delete),
+                i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
+                i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key {
+                            key: egui::Key::V,
+                            pressed: false,
+                            modifiers,
+                            ..
+                        } if modifiers.command
+                    )
+                }),
+                i.key_pressed(egui::Key::Plus),
+                i.key_pressed(egui::Key::Minus),
+                i.modifiers.alt && i.key_pressed(egui::Key::W),
+                i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
+                i.modifiers.command && i.key_pressed(egui::Key::P),
+            )
+        });
 
         // These three carry their own modifier, so they do not wait behind the
         // Ctrl check below. They do belong to the filter box while it has the
@@ -3715,6 +4349,15 @@ impl Arca {
         // Everything out, beside the archive, without asking where. The whole
         // point of it is that it is one keystroke: the folder the archive is in
         // is where an extraction goes nine times out of ten.
+        if ctrl_p && !typing {
+            self.password_input.clear();
+            self.asking_default_password = true;
+        }
+        // One step back from the last change to the archive, which is the step
+        // anybody wants: the one they just took by mistake.
+        if undo && !typing && self.undo.is_some() {
+            self.undo_last(ctx);
+        }
         if alt_w && !typing {
             if let Some(archive) = self.controller.state.archive.clone() {
                 self.controller.run_job(Job::Extract {
@@ -4267,6 +4910,42 @@ impl Arca {
                     }
                     if ui
                         .add_enabled(
+                            has && self.format == Format::Zip,
+                            egui::Button::new(s.new_folder),
+                        )
+                        .clicked()
+                    {
+                        wants = Some(More::NewFolder);
+                    }
+                    if ui
+                        .add_enabled(has, egui::Button::new(s.save_copy))
+                        .clicked()
+                    {
+                        wants = Some(More::SaveCopy);
+                    }
+                    if ui
+                        .button(format!("{}	Ctrl+P", s.default_password))
+                        .clicked()
+                    {
+                        wants = Some(More::DefaultPassword);
+                    }
+                    ui.separator();
+                    // Named after what it would take back, because "undo" on its
+                    // own asks the reader to remember what they did last.
+                    let back = self
+                        .undo
+                        .as_ref()
+                        .map(|(_, what)| format!("{}: {}	Ctrl+Z", s.undo_word, what))
+                        .unwrap_or_else(|| format!("{}	Ctrl+Z", s.undo_word));
+                    if ui
+                        .add_enabled(self.undo.is_some(), egui::Button::new(back))
+                        .clicked()
+                    {
+                        wants = Some(More::Undo);
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
                             has,
                             egui::Button::new(s.flat_view)
                                 .selected(self.controller.state.settings.flat),
@@ -4285,6 +4964,19 @@ impl Arca {
                     {
                         wants = Some(More::Tree);
                     }
+                    // Only where there is an archive whose names could be read
+                    // another way. A tar has none of this argument.
+                    ui.add_enabled_ui(has && self.format == Format::Zip, |ui| {
+                        ui.menu_button(s.name_encoding, |ui| {
+                            for (page, _, label) in arca_zip::pages::Page::ALL {
+                                let on = self.settings.page == page;
+                                if ui.selectable_label(on, label).clicked() {
+                                    wants = Some(More::Page(page));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    });
                     // The archives opened lately. By name, with the whole path
                     // on hover: a menu of paths is a menu nobody reads.
                     ui.add_enabled_ui(!self.controller.state.settings.recent.is_empty(), |ui| {
@@ -4374,6 +5066,17 @@ impl Arca {
                     self.controller.state.cursor = None;
                     self.controller.state.settings.save();
                 }
+                Some(More::Undo) => self.undo_last(ctx),
+                Some(More::NewFolder) => {
+                    self.folder_input.clear();
+                    self.asking_folder = true;
+                }
+                Some(More::SaveCopy) => self.save_copy(ctx),
+                Some(More::DefaultPassword) => {
+                    self.password_input.clear();
+                    self.asking_default_password = true;
+                }
+                Some(More::Page(p)) => self.reread_names(ctx, p),
                 Some(More::Tree) => {
                     self.controller.state.settings.tree = !self.controller.state.settings.tree;
                     self.controller.state.settings.save();
@@ -4629,7 +5332,7 @@ impl Arca {
                 // The keys are spelled out rather than drawn with the arrows
                 // and the page symbols: Consolas has the four arrows and not
                 // the page ones, so half of that line came out as hollow boxes.
-                let left: [(&str, &str); 17] = [
+                let left: [(&str, &str); 19] = [
                     ("Ctrl+O", s.open),
                     ("Ctrl+N", s.compress),
                     ("Ctrl+E", s.extract_all),
@@ -4639,6 +5342,8 @@ impl Arca {
                     ("F5", s.refresh_word),
                     ("Ctrl+F", s.find_word),
                     ("", ""),
+                    ("Ctrl+Z", s.undo_word),
+                    ("Ctrl+P", s.default_password),
                     ("Ctrl+A", s.select_all),
                     ("Ctrl+I", s.invert_selection),
                     ("Esc", s.clear_selection),
@@ -5806,6 +6511,15 @@ impl Arca {
                                         .truncate(),
                                     );
                                 }
+                                SortColumn::Created => {
+                                    ui.monospace(when(r.created));
+                                }
+                                SortColumn::Accessed => {
+                                    ui.monospace(when(r.accessed));
+                                }
+                                SortColumn::Attributes => {
+                                    ui.monospace(attribute_letters(r.attributes));
+                                }
                                 SortColumn::Path => {
                                     ui.add(
                                         egui::Label::new(
@@ -6318,6 +7032,8 @@ impl eframe::App for Arca {
                 self.shortcuts_window(&ctx2);
                 self.group_window(&ctx2);
                 self.viewer_window(&ctx2);
+                self.default_password_window(&ctx2);
+                self.new_folder_window(&ctx2);
                 self.conflict_window(&ctx2);
                 self.password_window(&ctx2);
                 self.confirm_delete_window(&ctx2);
@@ -6464,6 +7180,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_attribute_letters_hold_their_places() {
+        assert_eq!(attribute_letters(0), "----");
+        assert_eq!(attribute_letters(0x01), "R---");
+        assert_eq!(attribute_letters(0x20), "---A");
+        assert_eq!(attribute_letters(0x01 | 0x02 | 0x04 | 0x20), "RHSA");
+        // The directory bit is the list's job, not this column's.
+        assert_eq!(attribute_letters(0x10), "----");
+    }
 
     #[test]
     fn text_is_told_from_the_rest_by_what_it_does_not_have() {

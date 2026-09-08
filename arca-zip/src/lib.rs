@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod aes;
+pub mod pages;
 
 use arca_core::{limits, Codec, Cursor, Entry, Error, Level, Method, Result};
 use flate2::write::DeflateEncoder;
@@ -421,6 +422,117 @@ fn from_cp437(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The two times a zip does not have room for in its header.
+#[derive(Default, PartialEq, Eq, Debug)]
+struct Times {
+    created: Option<i64>,
+    accessed: Option<i64>,
+}
+
+/// A Windows FILETIME as seconds since 1970.
+///
+/// It counts hundreds of nanoseconds from the first day of 1601, which is a
+/// unit and an epoch nothing else uses. Zero means "not recorded" rather than
+/// the year 1601, which is what every tool that writes one of these means by
+/// leaving it empty.
+fn filetime_to_unix(ticks: u64) -> Option<i64> {
+    if ticks == 0 {
+        return None;
+    }
+    Some((ticks / 10_000_000) as i64 - 11_644_473_600)
+}
+
+/// Reads the creation and access times out of an entry's extra fields.
+///
+/// Two spellings, because the two halves of the world that write zips do not
+/// agree. Windows writes 0x000A, a block of three Windows FILETIMEs; the unix
+/// tools write 0x5455, a flag byte saying which of the three are there followed
+/// by that many 32-bit unix times. Neither is required and most archives carry
+/// neither, so the answer is usually nothing at all.
+///
+/// Anything malformed is skipped rather than refused. These fields are a
+/// courtesy from whoever wrote the archive and a wrong one is not a reason to
+/// stop reading it.
+fn read_times(extra: &[u8]) -> Times {
+    let mut out = Times::default();
+    let mut x = Cursor::new(extra);
+    while x.remaining() >= 4 {
+        let Ok(id) = x.u16le("extra field id") else {
+            break;
+        };
+        let Ok(size_val) = x.u16le("extra field size") else {
+            break;
+        };
+        let size_val = size_val as usize;
+        if size_val > x.remaining() {
+            break;
+        }
+        let Ok(body) = x.bytes(size_val, "extra field body") else {
+            break;
+        };
+        match id {
+            // NTFS: four reserved bytes, then tagged blocks. Tag 1 holds the
+            // three times in the order the file system keeps them.
+            0x000A => {
+                let mut n = Cursor::new(body);
+                if n.skip(4, "reserved").is_err() {
+                    continue;
+                }
+                while n.remaining() >= 4 {
+                    let (Ok(tag), Ok(len)) = (n.u16le("tag"), n.u16le("tag size")) else {
+                        break;
+                    };
+                    let len = len as usize;
+                    if len > n.remaining() {
+                        break;
+                    }
+                    if tag == 0x0001 && len >= 24 {
+                        let Ok(block) = n.bytes(len, "times") else {
+                            break;
+                        };
+                        let mut t = Cursor::new(block);
+                        let _mtime = t.u64le("mtime");
+                        if let Ok(v) = t.u64le("atime") {
+                            out.accessed = filetime_to_unix(v);
+                        }
+                        if let Ok(v) = t.u64le("ctime") {
+                            out.created = filetime_to_unix(v);
+                        }
+                        break;
+                    }
+                    if n.skip(len, "tag body").is_err() {
+                        break;
+                    }
+                }
+            }
+            // Extended timestamp: one flag byte, then the times that are
+            // present, always in the order modified, accessed, created.
+            0x5455 => {
+                let mut e = Cursor::new(body);
+                let Ok(first) = e.bytes(1, "flags") else {
+                    continue;
+                };
+                let flags = first[0];
+                if flags & 1 != 0 && e.remaining() >= 4 {
+                    let _ = e.u32le("mtime");
+                }
+                if flags & 2 != 0 && e.remaining() >= 4 {
+                    if let Ok(v) = e.u32le("atime") {
+                        out.accessed = Some(v as i32 as i64);
+                    }
+                }
+                if flags & 4 != 0 && e.remaining() >= 4 {
+                    if let Ok(v) = e.u32le("ctime") {
+                        out.created = Some(v as i32 as i64);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn read_central_header(c: &mut Cursor<'_>) -> Result<Entry> {
     if c.u32le("central directory signature")? != SIG_CD {
         return Err(Error::Format("invalid entry signature".into()));
@@ -437,7 +549,7 @@ fn read_central_header(c: &mut Cursor<'_>) -> Result<Entry> {
     let x_len = c.u16le("extra field length")? as usize;
     let k_len = c.u16le("comment length")? as usize;
     c.skip(4, "disk and internal attributes")?;
-    let _ext_attr = c.u32le("external attributes")?;
+    let ext_attr = c.u32le("external attributes")?;
     let mut offset = c.u32le("local offset")? as u64;
 
     if n_len > limits::MAX_NAME {
@@ -514,21 +626,30 @@ fn read_central_header(c: &mut Cursor<'_>) -> Result<Entry> {
         }
     };
 
-    let name = if flags & 0x800 != 0 {
+    let utf8 = flags & 0x800 != 0;
+    let name = if utf8 {
         String::from_utf8_lossy(name_bytes).into_owned()
     } else {
         from_cp437(name_bytes)
     };
     let is_dir = name.ends_with('/') || name.ends_with('\\');
+    let times = read_times(extra);
 
     Ok(Entry {
         name,
+        raw_name: name_bytes.to_vec(),
+        utf8,
         size: uncompressed,
         compressed_size: comp_size,
         method,
         crc32: crc_val,
         is_dir,
         mtime: arca_core::dos_to_unix(date_val, time_val),
+        created: times.created,
+        accessed: times.accessed,
+        // The low byte of the external attributes is the DOS byte, whatever
+        // system made the archive claims to be.
+        attributes: (ext_attr & 0xFF) as u8,
         offset,
         encrypted,
     })
@@ -1125,7 +1246,10 @@ pub fn rewrite_password(
     out: &std::path::Path,
     current: Option<&str>,
     new: Option<&str>,
-    notify: &dyn Fn(usize, usize, &str),
+    // Told how far along this is, and answers whether to carry on: false is
+    // somebody pressing stop, and the rewrite gives up where it stands rather
+    // than finishing a copy nobody is waiting for.
+    notify: &dyn Fn(usize, usize, &str) -> bool,
 ) -> Result<u64> {
     rewrite(
         archive,
@@ -1144,7 +1268,10 @@ pub fn rewrite_password(
 /// with the file rather than sitting in the call so a paste can use whatever
 /// the window is set to without the rewrite having to know about it.
 pub struct Addition {
-    pub source: std::path::PathBuf,
+    // The file to read the bytes from, or nothing at all: a folder in a zip is
+    // an entry with no contents and a slash on the end of its name, and there
+    // is no file on disk behind one that somebody has just asked for.
+    pub source: Option<std::path::PathBuf>,
     pub name: String,
     pub codec: Codec,
     pub level: Level,
@@ -1164,7 +1291,10 @@ pub fn add_entries(
     out: &std::path::Path,
     password: Option<&str>,
     extra: &[Addition],
-    notify: &dyn Fn(usize, usize, &str),
+    // Told how far along this is, and answers whether to carry on: false is
+    // somebody pressing stop, and the rewrite gives up where it stands rather
+    // than finishing a copy nobody is waiting for.
+    notify: &dyn Fn(usize, usize, &str) -> bool,
 ) -> Result<u64> {
     let taken: std::collections::HashSet<&str> = extra.iter().map(|a| a.name.as_str()).collect();
     rewrite(
@@ -1191,7 +1321,10 @@ pub fn remove_entries(
     out: &std::path::Path,
     password: Option<&str>,
     keep: &dyn Fn(&Entry) -> bool,
-    notify: &dyn Fn(usize, usize, &str),
+    // Told how far along this is, and answers whether to carry on: false is
+    // somebody pressing stop, and the rewrite gives up where it stands rather
+    // than finishing a copy nobody is waiting for.
+    notify: &dyn Fn(usize, usize, &str) -> bool,
 ) -> Result<u64> {
     rewrite(
         archive,
@@ -1227,7 +1360,10 @@ pub fn rename_entries(
     out: &std::path::Path,
     password: Option<&str>,
     name: &dyn Fn(&Entry) -> String,
-    notify: &dyn Fn(usize, usize, &str),
+    // Told how far along this is, and answers whether to carry on: false is
+    // somebody pressing stop, and the rewrite gives up where it stands rather
+    // than finishing a copy nobody is waiting for.
+    notify: &dyn Fn(usize, usize, &str) -> bool,
 ) -> Result<u64> {
     rewrite(
         archive,
@@ -1250,7 +1386,10 @@ fn rewrite(
     keep: &dyn Fn(&Entry) -> bool,
     name: &dyn Fn(&Entry) -> String,
     extra: &[Addition],
-    notify: &dyn Fn(usize, usize, &str),
+    // Told how far along this is, and answers whether to carry on: false is
+    // somebody pressing stop, and the rewrite gives up where it stands rather
+    // than finishing a copy nobody is waiting for.
+    notify: &dyn Fn(usize, usize, &str) -> bool,
 ) -> Result<u64> {
     use std::fs::File;
     use std::io::{BufReader, BufWriter};
@@ -1266,7 +1405,9 @@ fn rewrite(
     let mut bytes = 0u64;
 
     for (i, e) in entries.iter().enumerate() {
-        notify(i, total, &e.name);
+        if !notify(i, total, &e.name) {
+            return Err(Error::Cancelled);
+        }
         // Directories hold nothing, and no other tool encrypts them either.
         let pw = if e.is_dir { None } else { new };
         let crc = if e.encrypted && e.crc32 == 0 {
@@ -1285,14 +1426,26 @@ fn rewrite(
     // The new ones last, so copying what was already there stays one straight
     // pass over the source file instead of one interleaved with compression.
     for (i, a) in extra.iter().enumerate() {
-        notify(entries.len() + i, total, &a.name);
-        let meta = std::fs::metadata(&a.source)?;
+        if !notify(entries.len() + i, total, &a.name) {
+            return Err(Error::Cancelled);
+        }
+        let Some(from) = &a.source else {
+            // A folder: nothing to read, nothing to compress, and the slash on
+            // the end of the name is what makes it one.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs() as i64);
+            w.add_with_password(&a.name, io::empty(), Codec::Store, Level::Store, now, None)?;
+            continue;
+        };
+        let meta = std::fs::metadata(from)?;
         let mtime = meta.modified().ok().and_then(|t| {
             t.duration_since(std::time::UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_secs() as i64)
         });
-        let f = BufReader::with_capacity(STREAM_BUF, File::open(&a.source)?);
+        let f = BufReader::with_capacity(STREAM_BUF, File::open(from)?);
         w.add_with_password(&a.name, f, a.codec, a.level, mtime, new)?;
         bytes += meta.len();
     }
@@ -1305,7 +1458,7 @@ fn rewrite(
         }
         check.extract_to_with(i, io::sink(), new)?;
     }
-    notify(total, total, "");
+    let _ = notify(total, total, "");
     Ok(bytes)
 }
 
@@ -1913,7 +2066,7 @@ mod tests {
                     e.name.clone()
                 }
             },
-            &|_, _, _| {},
+            &|_, _, _| true,
         )
         .unwrap();
 
@@ -1931,6 +2084,150 @@ mod tests {
             a.extract_to(i, &mut got).unwrap();
             assert_eq!(got, format!("body of {was} ").repeat(40).into_bytes());
         }
+
+        let _ = std::fs::remove_dir_all(&room);
+    }
+
+    // The two extra fields that carry a creation and an access time, in the two
+    // spellings that exist. Both are optional and most archives have neither,
+    // so the thing worth checking is that a field that is there is read right
+    // and a field that is broken is stepped over rather than believed.
+    #[test]
+    fn the_times_a_zip_hides_in_its_extra_fields_come_back_out() {
+        // NTFS: id 0x000A, four reserved bytes, tag 1 of 24 bytes holding
+        // modified, accessed and created as Windows FILETIMEs.
+        let mut ntfs = Vec::new();
+        ntfs.extend_from_slice(&0x000Au16.to_le_bytes());
+        ntfs.extend_from_slice(&32u16.to_le_bytes());
+        ntfs.extend_from_slice(&0u32.to_le_bytes());
+        ntfs.extend_from_slice(&1u16.to_le_bytes());
+        ntfs.extend_from_slice(&24u16.to_le_bytes());
+        // 2026-09-08 00:00:00 UTC, and two round hours either side of it.
+        let base = 1_788_912_000i64;
+        for t in [base, base + 3600, base - 3600] {
+            let ticks = (t + 11_644_473_600) as u64 * 10_000_000;
+            ntfs.extend_from_slice(&ticks.to_le_bytes());
+        }
+        let got = read_times(&ntfs);
+        assert_eq!(got.accessed, Some(base + 3600));
+        assert_eq!(got.created, Some(base - 3600));
+
+        // Extended timestamp: id 0x5455, a flag byte saying which of the three
+        // follow, then that many 32-bit unix times in a fixed order.
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&0x5455u16.to_le_bytes());
+        // One flag byte and three four byte times.
+        ext.extend_from_slice(&13u16.to_le_bytes());
+        ext.push(0b0000_0111);
+        for t in [base, base + 60, base - 60] {
+            ext.extend_from_slice(&(t as i32).to_le_bytes());
+        }
+        let got = read_times(&ext);
+        assert_eq!(got.accessed, Some(base + 60));
+        assert_eq!(got.created, Some(base - 60));
+
+        // A zero FILETIME is how a tool says it did not record one, not the
+        // year 1601.
+        let mut empty = ntfs.clone();
+        for b in empty.iter_mut().skip(12).take(24) {
+            *b = 0;
+        }
+        assert_eq!(read_times(&empty), Times::default());
+
+        // Nothing at all, and rubbish, both come back with nothing rather than
+        // with a wrong answer or a panic.
+        assert_eq!(read_times(&[]), Times::default());
+        assert_eq!(
+            read_times(&[0x0A, 0x00, 0xFF, 0xFF, 1, 2, 3]),
+            Times::default()
+        );
+    }
+
+    // A folder is an entry with nothing in it and a slash on the end, which is
+    // the only way a zip has of recording one. Worth its own test because there
+    // is no file on disk behind it: everything else in the writer starts by
+    // opening something.
+    #[test]
+    fn a_folder_goes_in_as_an_empty_entry_with_a_slash() {
+        let room = std::env::temp_dir().join(format!("arca-mkdir-{}", std::process::id()));
+        std::fs::create_dir_all(&room).unwrap();
+
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        w.add(
+            "keep.txt",
+            &b"hola"[..],
+            Codec::Deflate,
+            Level::Normal,
+            None,
+        )
+        .unwrap();
+        let archive = room.join("a.zip");
+        std::fs::write(&archive, w.finish().unwrap().into_inner()).unwrap();
+
+        let out = room.join("b.zip");
+        let extra = [Addition {
+            source: None,
+            name: "nueva carpeta/".into(),
+            codec: Codec::Store,
+            level: Level::Store,
+        }];
+        add_entries(&archive, &out, None, &extra, &|_, _, _| true).unwrap();
+
+        let a = ZipArchive::open(std::fs::File::open(&out).unwrap()).unwrap();
+        let made = a
+            .entries()
+            .iter()
+            .find(|e| e.name == "nueva carpeta/")
+            .expect("the folder is in the archive");
+        assert!(made.is_dir, "and the archive knows it is one");
+        assert_eq!(made.size, 0);
+
+        let _ = std::fs::remove_dir_all(&room);
+    }
+
+    // Stopping halfway has to leave the archive exactly as it was. Every one of
+    // these builds a new file beside the old one and swaps at the end, so what
+    // this really checks is that the giving up happens before the swap and that
+    // it says so instead of returning a half written archive as a success.
+    #[test]
+    fn giving_up_halfway_leaves_the_original_where_it_was() {
+        let room = std::env::temp_dir().join(format!("arca-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&room).unwrap();
+
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        for i in 0..6 {
+            let body = format!("entry {i} ").repeat(40).into_bytes();
+            w.add(
+                &format!("f{i}.txt"),
+                &body[..],
+                Codec::Deflate,
+                Level::Normal,
+                None,
+            )
+            .unwrap();
+        }
+        let archive = room.join("a.zip");
+        let before = w.finish().unwrap().into_inner();
+        std::fs::write(&archive, &before).unwrap();
+
+        let out = room.join("b.zip");
+        let stopped = rename_entries(
+            &archive,
+            &out,
+            None,
+            &|e| format!("new-{}", e.name),
+            // Three through, then stop.
+            &|i, _, _| i < 3,
+        );
+        assert!(
+            matches!(stopped, Err(Error::Cancelled)),
+            "stopping is its own answer, not a success and not a failure"
+        );
+        assert_eq!(
+            std::fs::read(&archive).unwrap(),
+            before,
+            "the archive being rewritten is never the one being written to"
+        );
 
         let _ = std::fs::remove_dir_all(&room);
     }
@@ -1956,20 +2253,20 @@ mod tests {
         std::fs::write(&fresh, b"brand new bytes".repeat(50)).unwrap();
         let extra = [
             Addition {
-                source: fresh.clone(),
+                source: Some(fresh.clone()),
                 name: "replace.txt".into(),
                 codec: Codec::Deflate,
                 level: Level::Normal,
             },
             Addition {
-                source: fresh.clone(),
+                source: Some(fresh.clone()),
                 name: "sub/added.bin".into(),
                 codec: Codec::Store,
                 level: Level::Store,
             },
         ];
         let out = room.join("b.zip");
-        add_entries(&archive, &out, None, &extra, &|_, _, _| {}).unwrap();
+        add_entries(&archive, &out, None, &extra, &|_, _, _| true).unwrap();
 
         let mut a = ZipArchive::open(std::fs::File::open(&out).unwrap()).unwrap();
         let names: Vec<String> = a.entries().iter().map(|e| e.name.clone()).collect();

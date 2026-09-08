@@ -664,7 +664,7 @@ fn change_password(
     ));
     let t0 = Instant::now();
 
-    let bytes = match arca_zip::rewrite_password(archive, &temp, current, new, &|_, _, _| {}) {
+    let bytes = match arca_zip::rewrite_password(archive, &temp, current, new, &|_, _, _| true) {
         Ok(b) => b,
         Err(e) => {
             let _ = fs::remove_file(&temp);

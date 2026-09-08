@@ -46,8 +46,15 @@ pub fn kind_of(name: &str, is_dir: bool) -> Kind {
     }
 }
 
+/// The hand drawn icon, in the space the layout gives it.
 pub fn draw_icon(ui: &mut egui::Ui, kind: Kind) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
+    draw_icon_at(ui, rect, kind);
+}
+
+/// The same, in a rectangle the caller has already decided on: the tree places
+/// its own rows and has nowhere to allocate from.
+pub fn draw_icon_at(ui: &mut egui::Ui, rect: egui::Rect, kind: Kind) {
     let p = ui.painter();
     let c = kind.color();
     let faded = egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 110);
@@ -93,6 +100,9 @@ pub struct Row {
     // Straight off the entry, for the columns that can be turned on. A folder
     // has none of its own: it is not a thing the archive recorded.
     pub mtime: Option<i64>,
+    pub created: Option<i64>,
+    pub accessed: Option<i64>,
+    pub attributes: u8,
     pub crc32: u32,
     // The way out of the folder, the row every file list keeps at the top. It
     // is not an entry and nothing in the archive answers to it: it cannot be
@@ -143,6 +153,9 @@ pub fn children_of(entries: &[Entry], dir: &str) -> Vec<Row> {
                         encrypted: e.encrypted,
                         count: 0,
                         mtime: e.mtime,
+                        created: e.created,
+                        accessed: e.accessed,
+                        attributes: e.attributes,
                         crc32: e.crc32,
                         up: false,
                     });
@@ -163,7 +176,12 @@ pub fn children_of(entries: &[Entry], dir: &str) -> Vec<Row> {
             packed,
             method: "",
             encrypted: false,
+            // A folder in the list is made up out of the names under it, not
+            // read from an entry: there is nothing of its own to report.
             mtime: None,
+            created: None,
+            accessed: None,
+            attributes: 0,
             crc32: 0,
             count,
             up: false,
@@ -197,6 +215,8 @@ mod tests {
 
     fn entry(name: &str, is_dir: bool, size: u64) -> Entry {
         Entry {
+            raw_name: name.as_bytes().to_vec(),
+            utf8: true,
             name: name.to_string(),
             size,
             compressed_size: size,
@@ -204,6 +224,9 @@ mod tests {
             crc32: 0,
             is_dir,
             mtime: None,
+            created: None,
+            accessed: None,
+            attributes: 0,
             offset: 0,
             encrypted: false,
         }
@@ -363,6 +386,8 @@ mod folder_tests {
 
     fn entry(name: &str, is_dir: bool) -> Entry {
         Entry {
+            raw_name: name.as_bytes().to_vec(),
+            utf8: true,
             name: name.to_string(),
             size: 0,
             compressed_size: 0,
@@ -370,6 +395,9 @@ mod folder_tests {
             mtime: None,
             crc32: 0,
             is_dir,
+            created: None,
+            accessed: None,
+            attributes: 0,
             encrypted: false,
             offset: 0,
         }
