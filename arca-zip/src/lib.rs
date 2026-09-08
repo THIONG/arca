@@ -1125,7 +1125,10 @@ pub fn rewrite_password(
     out: &std::path::Path,
     current: Option<&str>,
     new: Option<&str>,
-    notify: &dyn Fn(usize, usize, &str),
+    // Told how far along this is, and answers whether to carry on: false is
+    // somebody pressing stop, and the rewrite gives up where it stands rather
+    // than finishing a copy nobody is waiting for.
+    notify: &dyn Fn(usize, usize, &str) -> bool,
 ) -> Result<u64> {
     rewrite(
         archive,
@@ -1164,7 +1167,10 @@ pub fn add_entries(
     out: &std::path::Path,
     password: Option<&str>,
     extra: &[Addition],
-    notify: &dyn Fn(usize, usize, &str),
+    // Told how far along this is, and answers whether to carry on: false is
+    // somebody pressing stop, and the rewrite gives up where it stands rather
+    // than finishing a copy nobody is waiting for.
+    notify: &dyn Fn(usize, usize, &str) -> bool,
 ) -> Result<u64> {
     let taken: std::collections::HashSet<&str> = extra.iter().map(|a| a.name.as_str()).collect();
     rewrite(
@@ -1191,7 +1197,10 @@ pub fn remove_entries(
     out: &std::path::Path,
     password: Option<&str>,
     keep: &dyn Fn(&Entry) -> bool,
-    notify: &dyn Fn(usize, usize, &str),
+    // Told how far along this is, and answers whether to carry on: false is
+    // somebody pressing stop, and the rewrite gives up where it stands rather
+    // than finishing a copy nobody is waiting for.
+    notify: &dyn Fn(usize, usize, &str) -> bool,
 ) -> Result<u64> {
     rewrite(
         archive,
@@ -1227,7 +1236,10 @@ pub fn rename_entries(
     out: &std::path::Path,
     password: Option<&str>,
     name: &dyn Fn(&Entry) -> String,
-    notify: &dyn Fn(usize, usize, &str),
+    // Told how far along this is, and answers whether to carry on: false is
+    // somebody pressing stop, and the rewrite gives up where it stands rather
+    // than finishing a copy nobody is waiting for.
+    notify: &dyn Fn(usize, usize, &str) -> bool,
 ) -> Result<u64> {
     rewrite(
         archive,
@@ -1250,7 +1262,10 @@ fn rewrite(
     keep: &dyn Fn(&Entry) -> bool,
     name: &dyn Fn(&Entry) -> String,
     extra: &[Addition],
-    notify: &dyn Fn(usize, usize, &str),
+    // Told how far along this is, and answers whether to carry on: false is
+    // somebody pressing stop, and the rewrite gives up where it stands rather
+    // than finishing a copy nobody is waiting for.
+    notify: &dyn Fn(usize, usize, &str) -> bool,
 ) -> Result<u64> {
     use std::fs::File;
     use std::io::{BufReader, BufWriter};
@@ -1266,7 +1281,9 @@ fn rewrite(
     let mut bytes = 0u64;
 
     for (i, e) in entries.iter().enumerate() {
-        notify(i, total, &e.name);
+        if !notify(i, total, &e.name) {
+            return Err(Error::Cancelled);
+        }
         // Directories hold nothing, and no other tool encrypts them either.
         let pw = if e.is_dir { None } else { new };
         let crc = if e.encrypted && e.crc32 == 0 {
@@ -1285,7 +1302,9 @@ fn rewrite(
     // The new ones last, so copying what was already there stays one straight
     // pass over the source file instead of one interleaved with compression.
     for (i, a) in extra.iter().enumerate() {
-        notify(entries.len() + i, total, &a.name);
+        if !notify(entries.len() + i, total, &a.name) {
+            return Err(Error::Cancelled);
+        }
         let meta = std::fs::metadata(&a.source)?;
         let mtime = meta.modified().ok().and_then(|t| {
             t.duration_since(std::time::UNIX_EPOCH)
@@ -1305,7 +1324,7 @@ fn rewrite(
         }
         check.extract_to_with(i, io::sink(), new)?;
     }
-    notify(total, total, "");
+    let _ = notify(total, total, "");
     Ok(bytes)
 }
 
@@ -1913,7 +1932,7 @@ mod tests {
                     e.name.clone()
                 }
             },
-            &|_, _, _| {},
+            &|_, _, _| true,
         )
         .unwrap();
 
@@ -1931,6 +1950,53 @@ mod tests {
             a.extract_to(i, &mut got).unwrap();
             assert_eq!(got, format!("body of {was} ").repeat(40).into_bytes());
         }
+
+        let _ = std::fs::remove_dir_all(&room);
+    }
+
+    // Stopping halfway has to leave the archive exactly as it was. Every one of
+    // these builds a new file beside the old one and swaps at the end, so what
+    // this really checks is that the giving up happens before the swap and that
+    // it says so instead of returning a half written archive as a success.
+    #[test]
+    fn giving_up_halfway_leaves_the_original_where_it_was() {
+        let room = std::env::temp_dir().join(format!("arca-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&room).unwrap();
+
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        for i in 0..6 {
+            let body = format!("entry {i} ").repeat(40).into_bytes();
+            w.add(
+                &format!("f{i}.txt"),
+                &body[..],
+                Codec::Deflate,
+                Level::Normal,
+                None,
+            )
+            .unwrap();
+        }
+        let archive = room.join("a.zip");
+        let before = w.finish().unwrap().into_inner();
+        std::fs::write(&archive, &before).unwrap();
+
+        let out = room.join("b.zip");
+        let stopped = rename_entries(
+            &archive,
+            &out,
+            None,
+            &|e| format!("new-{}", e.name),
+            // Three through, then stop.
+            &|i, _, _| i < 3,
+        );
+        assert!(
+            matches!(stopped, Err(Error::Cancelled)),
+            "stopping is its own answer, not a success and not a failure"
+        );
+        assert_eq!(
+            std::fs::read(&archive).unwrap(),
+            before,
+            "the archive being rewritten is never the one being written to"
+        );
 
         let _ = std::fs::remove_dir_all(&room);
     }
@@ -1969,7 +2035,7 @@ mod tests {
             },
         ];
         let out = room.join("b.zip");
-        add_entries(&archive, &out, None, &extra, &|_, _, _| {}).unwrap();
+        add_entries(&archive, &out, None, &extra, &|_, _, _| true).unwrap();
 
         let mut a = ZipArchive::open(std::fs::File::open(&out).unwrap()).unwrap();
         let names: Vec<String> = a.entries().iter().map(|e| e.name.clone()).collect();

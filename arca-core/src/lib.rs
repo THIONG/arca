@@ -25,6 +25,10 @@ pub enum Error {
         name: String,
     },
     Unsupported(String),
+    // Somebody pressed stop. Not a failure: nothing is wrong with the archive
+    // and nothing needs reporting, so callers that clean up after themselves
+    // can tell this apart from a real error and say so plainly.
+    Cancelled,
 }
 
 impl fmt::Display for Error {
@@ -46,6 +50,7 @@ impl fmt::Display for Error {
                 "'{name}' did not pass its authentication code: the archive was altered after it was encrypted"
             ),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
+            Error::Cancelled => write!(f, "cancelled"),
         }
     }
 }

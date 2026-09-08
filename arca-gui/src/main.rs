@@ -482,6 +482,28 @@ fn system_type(cache: &mut HashMap<String, Option<String>>, name: &str, is_dir: 
 // A folder of its own per archive, so two archives holding a file with the same
 // name do not overwrite each other's copy. safe_name is what keeps an entry
 // called "../../evil" from landing outside it.
+/// Where the version before the last change is kept, so it can be put back.
+fn undo_path(archive: &Path) -> PathBuf {
+    let mut name = archive.as_os_str().to_os_string();
+    name.push(".arca-undo");
+    PathBuf::from(name)
+}
+
+/// Moves the archive out of the way instead of letting the new one overwrite
+/// it, so that the change can be taken back.
+///
+/// A move, not a copy: the file stays on the volume it was already on and
+/// nothing is read or written, so keeping the old version costs the time of a
+/// directory entry however big the archive is. What it does cost is the space,
+/// until the next change replaces it or the window closes.
+fn step_aside(archive: &Path) -> std::io::Result<()> {
+    let keep = undo_path(archive);
+    if keep.exists() {
+        fs::remove_file(&keep)?;
+    }
+    fs::rename(archive, &keep)
+}
+
 // One entry straight into memory, for looking at rather than for keeping.
 //
 // The same walk as `extract_one` without the file at the end of it: a viewer
@@ -788,7 +810,9 @@ fn extract(
     archive: &Path,
     dest: &Path,
     wanted: &[bool],
-    notify: &(dyn Fn(usize, usize, &str) + Sync),
+    // Told how far along this is, and answers whether to carry on. False is
+    // somebody pressing stop.
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
     ask: &dyn Fn(&Path) -> Answer,
     password: Option<&str>,
 ) -> arca_core::Result<u64> {
@@ -822,19 +846,23 @@ fn extract(
                     let mut f = BufWriter::with_capacity(BUF, File::create(path)?);
                     let w = arca_zip::extract_entry_with(&mut source, e, &mut f, password)?;
                     f.flush()?;
-                    notify(done.fetch_add(1, Ordering::Relaxed) + 1, total, &e.name);
+                    if !notify(done.fetch_add(1, Ordering::Relaxed) + 1, total, &e.name) {
+                        return Err(arca_core::Error::Cancelled);
+                    }
                     Ok(w)
                 })
                 .collect::<arca_core::Result<Vec<u64>>>()?;
             bytes = written.iter().sum();
-            notify(total, total, "");
+            let _ = notify(total, total, "");
         }
         _ => {
             let mut r = TarReader::new(open_source(archive, format)?);
             let total = wanted.len();
             let mut i = 0usize;
             while let Some(e) = r.next_entry()? {
-                notify(i, total, &e.entry.name);
+                if !notify(i, total, &e.entry.name) {
+                    return Err(arca_core::Error::Cancelled);
+                }
                 if !wanted.is_empty() && !wanted.get(i).copied().unwrap_or(true) {
                     r.skip_data(&e)?;
                     i += 1;
@@ -850,7 +878,7 @@ fn extract(
                 }
                 i += 1;
             }
-            notify(i, i, "");
+            let _ = notify(i, i, "");
         }
     }
     Ok(bytes)
@@ -859,7 +887,9 @@ fn extract(
 fn test_archive(
     archive: &Path,
     only: Option<&HashSet<String>>,
-    notify: &(dyn Fn(usize, usize, &str) + Sync),
+    // Told how far along this is, and answers whether to carry on. False is
+    // somebody pressing stop.
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
 ) -> arca_core::Result<(usize, Vec<String>)> {
     let Some(format) = detect(archive) else {
         return Err(arca_core::Error::Unsupported("unknown format".into()));
@@ -873,7 +903,9 @@ fn test_archive(
             let total = a.len();
             for i in 0..total {
                 let name = a.entries()[i].name.clone();
-                notify(i, total, &name);
+                if !notify(i, total, &name) {
+                    return Err(arca_core::Error::Cancelled);
+                }
                 if a.entries()[i].is_dir || only.is_some_and(|set| !set.contains(&name)) {
                     continue;
                 }
@@ -882,13 +914,15 @@ fn test_archive(
                     Err(e) => bad.push(format!("{name}: {e}")),
                 }
             }
-            notify(total, total, "");
+            let _ = notify(total, total, "");
         }
         _ => {
             let mut r = TarReader::new(open_source(archive, format)?);
             let mut i = 0usize;
             while let Some(e) = r.next_entry()? {
-                notify(i, i + 1, &e.entry.name);
+                if !notify(i, i + 1, &e.entry.name) {
+                    return Err(arca_core::Error::Cancelled);
+                }
                 if e.entry.is_dir || only.is_some_and(|set| !set.contains(&e.entry.name)) {
                     r.skip_data(&e)?;
                 } else {
@@ -899,7 +933,7 @@ fn test_archive(
                 }
                 i += 1;
             }
-            notify(i, i, "");
+            let _ = notify(i, i, "");
         }
     }
     Ok((good, bad))
@@ -936,7 +970,9 @@ fn compress(
     format: Format,
     codec: Codec,
     level: Level,
-    notify: &(dyn Fn(usize, usize, &str) + Sync),
+    // Told how far along this is, and answers whether to carry on. False is
+    // somebody pressing stop.
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
     password: Option<&str>,
 ) -> arca_core::Result<(u64, u64)> {
     if password.is_some() && format != Format::Zip {
@@ -952,7 +988,9 @@ fn compress(
         Format::Zip => {
             let mut w = ZipWriter::new(BufWriter::with_capacity(BUF, File::create(out)?));
             for (i, (path, name)) in files.iter().enumerate() {
-                notify(i, total, name);
+                if !notify(i, total, name) {
+                    return Err(arca_core::Error::Cancelled);
+                }
                 let meta = fs::metadata(path)?;
                 let f = BufReader::with_capacity(BUF, File::open(path)?);
                 w.add_with_password(name, f, codec, level, None, password)?;
@@ -972,7 +1010,9 @@ fn compress(
             };
             let mut w = TarWriter::new(sink);
             for (i, (path, name)) in files.iter().enumerate() {
-                notify(i, total, name);
+                if !notify(i, total, name) {
+                    return Err(arca_core::Error::Cancelled);
+                }
                 let meta = fs::metadata(path)?;
                 let f = BufReader::with_capacity(BUF, File::open(path)?);
                 w.add(name, meta.len(), 0, 0o644, f)?;
@@ -981,7 +1021,7 @@ fn compress(
             w.finish()?;
         }
     }
-    notify(total, total, "");
+    let _ = notify(total, total, "");
     let final_size = fs::metadata(out).map(|m| m.len()).unwrap_or(0);
     Ok((source_bytes, final_size))
 }
@@ -1128,7 +1168,9 @@ fn fill(template: &str, pairs: &[(&str, &str)]) -> String {
 fn run_job_blocking(
     job: Job,
     s: &'static Strings,
-    notify: &(dyn Fn(usize, usize, &str) + Sync),
+    // Told how far along this is, and answers whether to carry on. False is
+    // somebody pressing stop.
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
     ask: &dyn Fn(&Path) -> Answer,
 ) -> std::result::Result<String, String> {
     match job {
@@ -1207,6 +1249,7 @@ fn run_job_blocking(
                 let _ = fs::remove_file(&temp);
                 return Err(e.to_string());
             }
+            step_aside(&archive).map_err(|e| e.to_string())?;
             fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
             let name = archive
                 .file_name()
@@ -1252,6 +1295,7 @@ fn run_job_blocking(
                 let _ = fs::remove_file(&temp);
                 return Err(e.to_string());
             }
+            step_aside(&archive).map_err(|e| e.to_string())?;
             fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
             Ok(fill(s.deleted, &[("n", &gone.to_string())]))
         }
@@ -1306,6 +1350,7 @@ fn run_job_blocking(
                 let _ = fs::remove_file(&temp);
                 return Err(e.to_string());
             }
+            step_aside(&archive).map_err(|e| e.to_string())?;
             fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
             // Nothing to say: the new name is in the list, which is where the
             // eye already is. An empty word here leaves the summary of the
@@ -1390,6 +1435,7 @@ fn run_job_blocking(
                 let _ = fs::remove_file(&temp);
                 return Err(e.to_string());
             }
+            step_aside(&archive).map_err(|e| e.to_string())?;
             fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
             Ok(fill(s.added, &[("n", &n.to_string())]))
         }
@@ -1541,6 +1587,7 @@ enum View {
 #[derive(Clone)]
 enum More {
     Test,
+    Undo,
     Flat,
     Tree,
     Open(PathBuf),
@@ -2006,6 +2053,13 @@ struct Arca {
     // True for the first frame of a rename, when the box has to be given the
     // keyboard and the part of the name before the extension picked out.
     rename_fresh: bool,
+    // The archive that has a previous version kept beside it, and the word for
+    // what was done to it. One step back, which is the one anybody wants:
+    // deeper than that and the sidecars would pile up.
+    undo: Option<(PathBuf, &'static str)>,
+    // Raised to ask whatever is running to stop where it is. Shared with the
+    // thread doing the work, which reads it every time it reports progress.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     // The folders of the archive, rebuilt when a listing arrives rather than
     // every frame: it is fifteen hundred paths split on every slash and the
     // answer only changes when the archive does.
@@ -2109,6 +2163,8 @@ impl Arca {
             band_scroll: None,
             renaming: None,
             rename_fresh: false,
+            undo: None,
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             viewing: None,
             picking_group: None,
             mask: String::new(),
@@ -2279,6 +2335,10 @@ impl Arca {
         self.total_count = total;
         self.current_file.clear();
         self.started = Some(Instant::now());
+        // A fresh flag for a fresh job, rather than lowering the old one: the
+        // thread that was told to stop may still be on its way out, and it must
+        // not read this one and carry on.
+        self.stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             work(&tx);
@@ -2329,6 +2389,40 @@ impl Arca {
         }
     }
 
+    // Puts the archive back the way it was before the last change.
+    //
+    // A swap of two names, because the version before the change was moved
+    // aside rather than thrown away. There is one step and no more: taking it
+    // back leaves nothing to take back, and the sidecar goes with it.
+    fn undo_last(&mut self, ctx: &egui::Context) {
+        let Some((archive, _)) = self.undo.take() else {
+            return;
+        };
+        let keep = undo_path(&archive);
+        if !keep.exists() {
+            return;
+        }
+        let pw = self.archive_password.clone();
+        if let Err(e) = fs::remove_file(&archive).and_then(|_| fs::rename(&keep, &archive)) {
+            self.notice = e.to_string();
+            self.error = true;
+            return;
+        }
+        self.open(ctx, archive);
+        self.archive_password = pw;
+    }
+
+    // Whatever is being kept for an undo is thrown away.
+    //
+    // Called when the window closes and when the archive is left behind: a file
+    // called `something.zip.arca-undo` sitting next to somebody's archive after
+    // the program has gone is litter, whatever it was for.
+    fn drop_undo(&mut self) {
+        if let Some((archive, _)) = self.undo.take() {
+            let _ = fs::remove_file(undo_path(&archive));
+        }
+    }
+
     // Puts an archive at the top of the recent list.
     //
     // Ten of them, which is about as many as anybody scans before giving up and
@@ -2352,6 +2446,11 @@ impl Arca {
         self.cut_pending = None;
         self.notice.clear();
         self.error = false;
+        // A different archive means the last change is not on the table any
+        // more, and the copy kept for it is just a file in somebody's folder.
+        if self.undo.as_ref().is_some_and(|(a, _)| *a != path) {
+            self.drop_undo();
+        }
         self.remember(&path);
         let ctx2 = ctx.clone();
         self.spawn(ctx, 0, move |tx| {
@@ -2424,14 +2523,29 @@ impl Arca {
         {
             self.after_password = Some((archive.clone(), password.clone()));
         }
+        // The four that build the archive again leave the old one beside it.
+        // What is kept here is the word for the change, so that offering to
+        // take it back can say what it would be taking back.
+        let words = self.s();
+        self.undo = match &job {
+            Job::Delete { archive, .. } => Some((archive.clone(), words.delete_word)),
+            Job::Rename { archive, .. } => Some((archive.clone(), words.rename_word)),
+            Job::Add { archive, .. } => Some((archive.clone(), words.add_to_archive)),
+            Job::Password { archive, .. } => Some((archive.clone(), words.password_word)),
+            _ => None,
+        };
 
         let (reply_tx, reply_rx) = channel::<Answer>();
         self.replies = Some(reply_tx);
         let ctx2 = ctx.clone();
+        let stop = self.stop.clone();
         self.spawn(ctx, 0, move |tx| {
             let notify = |i: usize, n: usize, name: &str| {
                 let _ = tx.send(Message::Progress(i, n, name.to_string()));
                 ctx2.request_repaint();
+                // The answer to "carry on?". Read on every step because that is
+                // the only place a long job looks up from what it is doing.
+                !stop.load(Ordering::Relaxed)
             };
             let ask = conflict_asker(tx, &ctx2, &reply_rx);
             let outcome = run_job_blocking(job, s, &notify, &ask);
@@ -2499,8 +2613,16 @@ impl Arca {
                         finished_ok = true;
                     }
                     Message::Failed(text) => {
-                        self.notice = text;
-                        self.error = true;
+                        // Stopping is not failing. Nothing is wrong with the
+                        // archive and there is nothing to report in red: the
+                        // rewrite gave up before it swapped anything.
+                        let quit = text == arca_core::Error::Cancelled.to_string();
+                        self.notice = if quit {
+                            self.s().stopped.to_string()
+                        } else {
+                            text
+                        };
+                        self.error = !quit;
                         self.busy = false;
                         close = true;
                     }
@@ -2690,10 +2812,14 @@ impl Arca {
         let (reply_tx, reply_rx) = channel::<Answer>();
         self.replies = Some(reply_tx);
         let ctx2 = ctx.clone();
+        let stop = self.stop.clone();
         self.spawn(ctx, total, move |tx| {
             let notify = |i: usize, n: usize, name: &str| {
                 let _ = tx.send(Message::Progress(i, n, name.to_string()));
                 ctx2.request_repaint();
+                // The answer to "carry on?". Read on every step because that is
+                // the only place a long job looks up from what it is doing.
+                !stop.load(Ordering::Relaxed)
             };
             let ask = conflict_asker(tx, &ctx2, &reply_rx);
             let _ = tx.send(
@@ -2833,10 +2959,14 @@ impl Arca {
         let pw = self.archive_password.clone();
         self.close_when_done = false;
         let ctx2 = ctx.clone();
+        let stop = self.stop.clone();
         self.spawn(ctx, total, move |tx| {
             let notify = |i: usize, n: usize, name: &str| {
                 let _ = tx.send(Message::Progress(i, n, name.to_string()));
                 ctx2.request_repaint();
+                // The answer to "carry on?". Read on every step because that is
+                // the only place a long job looks up from what it is doing.
+                !stop.load(Ordering::Relaxed)
             };
             // A folder nobody has seen yet has nothing in it to overwrite, so
             // there is no question to put on screen.
@@ -3181,7 +3311,7 @@ impl Arca {
         // has none, which is exactly the case here. What does still arrive is
         // the key going back up, because the early return only covers the press
         // -- so that is what a paste is recognised by.
-        let (ctrl, shift, o, e, t, n, f, f5, del, cut, copy, paste, plus, minus, alt_w) = ctx
+        let (ctrl, shift, o, e, t, n, f, f5, del, cut, copy, paste, plus, minus, alt_w, undo) = ctx
             .input(|i| {
                 (
                     i.modifiers.command,
@@ -3209,6 +3339,7 @@ impl Arca {
                     i.key_pressed(egui::Key::Plus),
                     i.key_pressed(egui::Key::Minus),
                     i.modifiers.alt && i.key_pressed(egui::Key::W),
+                    i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
                 )
             });
 
@@ -3254,6 +3385,11 @@ impl Arca {
         // Everything out, beside the archive, without asking where. The whole
         // point of it is that it is one keystroke: the folder the archive is in
         // is where an extraction goes nine times out of ten.
+        // One step back from the last change to the archive, which is the step
+        // anybody wants: the one they just took by mistake.
+        if undo && !typing && self.undo.is_some() {
+            self.undo_last(ctx);
+        }
         if alt_w && !typing {
             if let Some(archive) = self.archive.clone() {
                 self.run_job(
@@ -3885,6 +4021,20 @@ impl Arca {
                     {
                         wants = Some(More::Test);
                     }
+                    // Named after what it would take back, because "undo" on its
+                    // own asks the reader to remember what they did last.
+                    let back = self
+                        .undo
+                        .as_ref()
+                        .map(|(_, what)| format!("{}: {}	Ctrl+Z", s.undo_word, what))
+                        .unwrap_or_else(|| format!("{}	Ctrl+Z", s.undo_word));
+                    if ui
+                        .add_enabled(self.undo.is_some(), egui::Button::new(back))
+                        .clicked()
+                    {
+                        wants = Some(More::Undo);
+                    }
+                    ui.separator();
                     if ui
                         .add_enabled(
                             has,
@@ -3986,6 +4136,7 @@ impl Arca {
                     self.cursor = None;
                     self.settings.save();
                 }
+                Some(More::Undo) => self.undo_last(ctx),
                 Some(More::Tree) => {
                     self.settings.tree = !self.settings.tree;
                     self.settings.save();
@@ -4218,7 +4369,7 @@ impl Arca {
                 // The keys are spelled out rather than drawn with the arrows
                 // and the page symbols: Consolas has the four arrows and not
                 // the page ones, so half of that line came out as hollow boxes.
-                let left: [(&str, &str); 17] = [
+                let left: [(&str, &str); 18] = [
                     ("Ctrl+O", s.open),
                     ("Ctrl+N", s.compress),
                     ("Ctrl+E", s.extract_all),
@@ -4228,6 +4379,7 @@ impl Arca {
                     ("F5", s.refresh_word),
                     ("Ctrl+F", s.find_word),
                     ("", ""),
+                    ("Ctrl+Z", s.undo_word),
                     ("Ctrl+A", s.select_all),
                     ("Ctrl+I", s.invert_selection),
                     ("Esc", s.clear_selection),
@@ -4407,6 +4559,26 @@ impl Arca {
                     .weak()
                     .small(),
             );
+        }
+
+        // A way out of anything that is going to take a while. The work stops
+        // at the next entry rather than the next byte, so a single enormous
+        // file still has to finish being read; everything else gives up at
+        // once. The button goes quiet after it is pressed, because the job is
+        // over as far as the person pressing it is concerned.
+        if self.busy {
+            ui.add_space(12.0);
+            let asked = self.stop.load(std::sync::atomic::Ordering::Relaxed);
+            if ui
+                .add_enabled(!asked, egui::Button::new(s.cancel))
+                .clicked()
+            {
+                self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if asked {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(s.stopping).weak());
+            }
         }
 
         if !self.busy {
@@ -5894,6 +6066,7 @@ impl eframe::App for Arca {
     // size and place change with every pixel of a resize and the settings file
     // is not a thing to write sixty times a second.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.drop_undo();
         if self.geometry.is_some() {
             self.settings.window = self.geometry;
             self.settings.save();
