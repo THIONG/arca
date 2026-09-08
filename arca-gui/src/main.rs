@@ -69,6 +69,31 @@ fn detect(p: &Path) -> Option<Format> {
     }
 }
 
+// The little triangle beside a column name that says which way it is sorted.
+// Ascending points up, which is what a file list means by it everywhere: the
+// smallest, the earliest, the first alphabetically, at the top.
+//
+// The one thing to get wrong here is the sign. Screen coordinates grow
+// downwards, so the apex of an upward triangle sits at a SMALLER y than its
+// base, and writing it the other way round gives a mark that says the opposite
+// of what the list is doing without anything else looking amiss.
+fn sort_mark(c: egui::Pos2, ascending: bool) -> [egui::Pos2; 3] {
+    let (w, h) = (3.8_f32, 2.4_f32);
+    if ascending {
+        [
+            egui::pos2(c.x - w, c.y + h),
+            egui::pos2(c.x + w, c.y + h),
+            egui::pos2(c.x, c.y - h),
+        ]
+    } else {
+        [
+            egui::pos2(c.x - w, c.y - h),
+            egui::pos2(c.x + w, c.y - h),
+            egui::pos2(c.x, c.y + h),
+        ]
+    }
+}
+
 // How many folders at the front of the path have to go behind the "…" for the
 // rest to fit in `room`. Drops from the front, because the folders you are
 // nearest are the ones worth seeing, and never drops the last one: the folder
@@ -3641,28 +3666,48 @@ impl Arca {
         // the other's clicks: pressing a cell of the first row sorted by that
         // column, and pressing a column name picked the first row. So the
         // header asks for an interaction of its own, under an id of its own.
-        let head = |ui: &mut egui::Ui, text: &str, col: SortColumn| -> egui::Response {
-            let arrow = if order.0 != col {
-                ""
-            } else if order.1 {
-                " ^"
-            } else {
-                " v"
-            };
+        // The rules between columns belong to the header and nowhere else.
+        // Running them the whole height of the list is what turned it into a
+        // spreadsheet; having none at all left the column names floating. So
+        // the colour the table draws them in is taken here and then cleared,
+        // and the header paints its own between one name and the next.
+        let rule = ui.visuals().widgets.noninteractive.bg_stroke;
+        let accent = theme::cursor(ui.visuals()).color;
+        let head = |ui: &mut egui::Ui, text: &str, col: SortColumn, divide: bool| -> egui::Response {
             let cell = ui.max_rect();
-            ui.add(
-                egui::Label::new(egui::RichText::new(format!("{text}{arrow}")).strong())
-                    .selectable(false),
-            );
+            // The table puts its cells in truncating mode, and a truncating
+            // label takes the whole width it is offered. That is right for a
+            // file name and wrong for a column heading: it left no room beside
+            // the word, so the mark that says which way the sort runs was
+            // allocated past the edge of the cell and clipped away.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            ui.add(egui::Label::new(egui::RichText::new(text).strong()).selectable(false));
+            if order.0 == col {
+                // A small triangle beside the name rather than a caret typed
+                // into it: "Name ^" put a character in the middle of a word
+                // that was never part of the word.
+                let (mark, _) =
+                    ui.allocate_exact_size(egui::vec2(11.0, 11.0), egui::Sense::hover());
+                ui.painter().add(egui::Shape::convex_polygon(
+                    sort_mark(mark.center(), order.1).to_vec(),
+                    accent,
+                    egui::Stroke::NONE,
+                ));
+            }
+            if divide {
+                let x = cell.right().round() + 0.5;
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(x, cell.top() + 7.0),
+                        egui::pos2(x, cell.bottom() - 7.0),
+                    ],
+                    rule,
+                );
+            }
             ui.interact(cell, egui::Id::new(("arca-head", text)), egui::Sense::click())
                 .on_hover_text(hint)
         };
 
-        // The rules the table draws between its columns run the whole height of
-        // the list, which turns a file list into a spreadsheet. They are drawn
-        // in this colour, so making it nothing inside the table removes them
-        // and leaves the separators outside it alone. What is left is enough:
-        // the header names the columns and the numbers line up under them.
         ui.style_mut().visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
 
         let mut builder = TableBuilder::new(ui)
@@ -3709,16 +3754,16 @@ impl Arca {
                     }
                 };
                 let mut resp = None;
-                h.col(|ui| resp = Some(head(ui, s.col_name, SortColumn::Name)));
+                h.col(|ui| resp = Some(head(ui, s.col_name, SortColumn::Name, true)));
                 if let Some(r) = resp {
                     if r.clicked() {
                         requested = Some(SortColumn::Name);
                     }
                     r.context_menu(|ui| menu(ui));
                 }
-                for which in &shown {
+                for (i, which) in shown.iter().enumerate() {
                     let mut resp = None;
-                    h.col(|ui| resp = Some(head(ui, Columns::label(*which, s), *which)));
+                    h.col(|ui| resp = Some(head(ui, Columns::label(*which, s), *which, i + 1 < shown.len())));
                     if let Some(r) = resp {
                         if r.clicked() {
                             requested = Some(*which);
@@ -4245,6 +4290,31 @@ mod tests {
 
     // A folder keeps its whole name and a file loses its extension, and the
     // shell extension has a copy of this that has to agree.
+    // Which way the sort mark points is a sign, and a sign is the one thing you
+    // cannot check by looking at a screenshot of a list with one row in it.
+    #[test]
+    fn the_sort_mark_points_up_when_the_sort_goes_up() {
+        let c = egui::pos2(50.0, 50.0);
+
+        let up = sort_mark(c, true);
+        // Two along the bottom and the point above them. Larger y is lower down.
+        assert_eq!(up[0].y, up[1].y, "the base is level");
+        assert!(up[2].y < up[0].y, "the point is above the base");
+        assert!(up[0].x < c.x && up[1].x > c.x, "the base straddles the centre");
+        assert_eq!(up[2].x, c.x, "the point is centred");
+
+        let down = sort_mark(c, false);
+        assert_eq!(down[0].y, down[1].y);
+        assert!(down[2].y > down[0].y, "the point is below the base");
+
+        // One is the other turned over, and neither leaves the little square it
+        // is drawn in.
+        assert_eq!(up[2].y - c.y, -(down[2].y - c.y));
+        for p in up.iter().chain(down.iter()) {
+            assert!((p.x - c.x).abs() <= 5.5 && (p.y - c.y).abs() <= 5.5);
+        }
+    }
+
     // The path row is the one place the window can run out of width, and it did:
     // a deep folder pushed the trail out over the count at the other end.
     #[test]
