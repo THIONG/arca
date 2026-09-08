@@ -3857,8 +3857,10 @@ impl Arca {
 
 
         let mut requested: Option<SortColumn> = None;
-        // Where each header cell ended up. What says where the column edges
-        // are, which is where the handles that resize them belong.
+        // The whole of each header cell, edge to edge: the rectangle of its
+        // response, not the one `col` hands back, which is only as wide as the
+        // word inside it. What says where the column edges are, which is where
+        // the handles that resize them belong.
         let mut heads: Vec<egui::Rect> = Vec::new();
         let mut opened: Option<usize> = None;
         let mut clicked: Option<usize> = None;
@@ -3983,8 +3985,8 @@ impl Arca {
                     }
                 };
                 let mut resp = None;
-                let (cell, _) = h.col(|ui| resp = Some(head(ui, s.col_name, SortColumn::Name)));
-                heads.push(cell);
+                let (_, cell) = h.col(|ui| resp = Some(head(ui, s.col_name, SortColumn::Name)));
+                heads.push(cell.rect);
                 if let Some(r) = resp {
                     if r.clicked() {
                         requested = Some(SortColumn::Name);
@@ -3993,9 +3995,9 @@ impl Arca {
                 }
                 for which in &shown {
                     let mut resp = None;
-                    let (cell, _) =
+                    let (_, cell) =
                         h.col(|ui| resp = Some(head(ui, Columns::label(*which, s), *which)));
-                    heads.push(cell);
+                    heads.push(cell.rect);
                     if let Some(r) = resp {
                         if r.clicked() {
                             requested = Some(*which);
