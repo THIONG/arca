@@ -28,16 +28,30 @@ const ACCENT_LIGHT: Color32 = rgb(0x2A55B8);
 const R_WIDGET: f32 = 4.0;
 const R_WINDOW: f32 = 8.0;
 
+/// Black and white, and the accent.
+///
+/// The tinted greys the light theme is built on were tried here too and the
+/// window came out looking like every other dark window; black gives the list
+/// the ground a page has, and on the screens people have now it is a colour in
+/// its own right rather than the absence of one. The greys above it are
+/// neutral to match: a blue-grey next to true black reads as a stain.
+///
+/// The ladder is deliberately short -- black, then three steps for the panels
+/// and buttons -- because contrast is doing the work here that a hue does
+/// elsewhere. What is picked is still the brand blue: a window with nothing
+/// but white in it has no way of saying which of two white things matters.
 pub fn dark() -> Visuals {
     let mut v = Visuals::dark();
-    v.panel_fill = rgb(0x14161D);
-    v.window_fill = rgb(0x1A1D26);
-    v.extreme_bg_color = rgb(0x0E1015);
-    v.code_bg_color = rgb(0x0E1015);
+    v.panel_fill = Color32::BLACK;
+    // A shade off black, so that a dialog over the list reads as being over it
+    // rather than cut out of it. The border does the rest.
+    v.window_fill = rgb(0x0C0C0C);
+    v.extreme_bg_color = Color32::BLACK;
+    v.code_bg_color = rgb(0x0C0C0C);
     // Only just off the panel. A stripe you can name the colour of is a stripe
     // that competes with the selection.
-    v.faint_bg_color = rgb(0x191C24);
-    v.window_stroke = Stroke::new(1.0_f32, rgb(0x2A2F3D));
+    v.faint_bg_color = rgb(0x0C0C0C);
+    v.window_stroke = Stroke::new(1.0_f32, rgb(0x333333));
     v.selection.bg_fill = rgb(0x2D5CB8);
     // Not an outline colour, whatever the name says: egui_extras reads this and
     // makes it the text colour of a picked row. A pale blue here left the sizes
@@ -50,21 +64,23 @@ pub fn dark() -> Visuals {
 
     let w = &mut v.widgets;
     // noninteractive.fg_stroke is the body text of the whole window, not a
-    // disabled colour: egui reads `text_color()` straight out of it.
-    w.noninteractive.bg_fill = rgb(0x1A1D26);
-    w.noninteractive.weak_bg_fill = rgb(0x1A1D26);
-    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, rgb(0x21252E));
-    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, rgb(0xD9DEE8));
+    // disabled colour: egui reads `text_color()` straight out of it. White,
+    // since that is the whole point of a black window; the rules and edges
+    // that share this group get their own dark grey below.
+    w.noninteractive.bg_fill = rgb(0x0C0C0C);
+    w.noninteractive.weak_bg_fill = rgb(0x0C0C0C);
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, rgb(0x262626));
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
 
-    w.inactive.bg_fill = rgb(0x242833);
-    w.inactive.weak_bg_fill = rgb(0x242833);
-    w.inactive.bg_stroke = Stroke::new(1.0_f32, rgb(0x30364a));
-    w.inactive.fg_stroke = Stroke::new(1.0_f32, rgb(0xD9DEE8));
+    w.inactive.bg_fill = rgb(0x161616);
+    w.inactive.weak_bg_fill = rgb(0x161616);
+    w.inactive.bg_stroke = Stroke::new(1.0_f32, rgb(0x2E2E2E));
+    w.inactive.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
 
-    w.hovered.bg_fill = rgb(0x2E3444);
-    w.hovered.weak_bg_fill = rgb(0x2E3444);
+    w.hovered.bg_fill = rgb(0x232323);
+    w.hovered.weak_bg_fill = rgb(0x232323);
     w.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT_DARK);
-    w.hovered.fg_stroke = Stroke::new(1.0_f32, rgb(0xF2F4F8));
+    w.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
 
     // `active` is the pressed state and also where egui takes `strong` text
     // from, so its foreground has to be the brightest thing here rather than
@@ -74,10 +90,10 @@ pub fn dark() -> Visuals {
     w.active.bg_stroke = Stroke::new(1.0_f32, rgb(0x6E9BEA));
     w.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
 
-    w.open.bg_fill = rgb(0x2E3444);
-    w.open.weak_bg_fill = rgb(0x2E3444);
-    w.open.bg_stroke = Stroke::new(1.0_f32, rgb(0x30364A));
-    w.open.fg_stroke = Stroke::new(1.0_f32, rgb(0xD9DEE8));
+    w.open.bg_fill = rgb(0x232323);
+    w.open.weak_bg_fill = rgb(0x232323);
+    w.open.bg_stroke = Stroke::new(1.0_f32, rgb(0x2E2E2E));
+    w.open.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
 
     round(&mut v);
     v
