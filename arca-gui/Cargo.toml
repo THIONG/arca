@@ -7,6 +7,19 @@ license.workspace = true
 authors.workspace = true
 description = "Interfaz grafica de Arca"
 
+[features]
+default = []
+# The production egui binary remains the default. GPUI is an opt-in shell built
+# on the GPUI Kit release train, which is versioned on crates.io and locked by
+# Cargo.lock rather than by a zed git rev.
+# Feature-specific MSRV: Rust 1.97.1 (the package default remains 1.75).
+gpui = [
+    "dep:gpui",
+    "dep:gpui_platform",
+    "dep:gpui-component",
+    "dep:gpui-kit-assets",
+]
+
 [[bin]]
 name = "arca-gui"
 path = "src/main.rs"
@@ -57,12 +70,40 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 sys-locale = "0.3"
 
+# GPUI comes from the GPUI Kit release train (`gpui-pre*`), not from a zed git
+# rev. gpui-component is built against `gpui-pre ^0.3`, and a git pin here would
+# put two copies of gpui in the graph, which does not link. Renaming the
+# packages back to `gpui` / `gpui_platform` keeps every `use gpui::...` intact.
+gpui = { package = "gpui-pre", version = "0.3", default-features = false, optional = true }
+gpui-component = { version = "0.6", optional = true }
+# The icon set gpui-component's `IconName` resolves against. It is already in
+# the tree as a gpui-component dependency; naming it here is what lets
+# `application()` be handed the asset source.
+gpui-kit-assets = { version = "0.6", optional = true }
+
 # CF_HDROP on the system clipboard, so Ctrl+C here pastes files in the
 # Explorer. A thin wrapper over the four clipboard calls Win32 has; taking the
 # `windows` crate for it would pull a far larger dependency in for the same
 # work, and writing it by hand would mean unsafe in a crate that forbids it.
 [target."cfg(windows)".dependencies]
 clipboard-win = "5"
+
+[target."cfg(windows)".dependencies.gpui_platform]
+package = "gpui-pre-platform"
+version = "0.3"
+optional = true
+
+[target.'cfg(target_os = "linux")'.dependencies.gpui_platform]
+package = "gpui-pre-platform"
+version = "0.3"
+features = ["wayland", "x11"]
+optional = true
+
+[target.'cfg(target_os = "macos")'.dependencies.gpui_platform]
+package = "gpui-pre-platform"
+version = "0.3"
+features = ["font-kit"]
+optional = true
 
 [target."cfg(windows)".build-dependencies]
 winresource = "0.1"
