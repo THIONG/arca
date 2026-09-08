@@ -1,6 +1,13 @@
 # Portar `AppController` al `main.rs` de hoy
 
-Estado: análisis hecho, transformación sin empezar.
+Estado: transformación hecha; `cargo test --workspace`, `cargo test -p arca-gui --features gpui` y `cargo fmt -p arca-gui -- --check` pasan.
+
+Hecho en esta tanda:
+
+- `AppState` + `AppController` separados de `Arca`; la superficie egui conserva sus gestos y texturas.
+- `AppAction` + `dispatch` disponibles para egui y GPUI.
+- `spawn` y los métodos de trabajo ya no dependen de `egui::Context`.
+- `gpui_shell` usa `tree::Folder` y `state.folders`, sin caché duplicada.
 
 ## Dónde está cada cosa
 

@@ -3,6 +3,10 @@
 
 mod clipboard;
 mod glyphs;
+#[cfg(feature = "gpui")]
+mod gpui_shell;
+#[cfg(feature = "gpui")]
+mod gpui_theme;
 mod i18n;
 mod theme;
 mod tree;
@@ -697,7 +701,6 @@ pub enum Answer {
 // stick, so the question is asked once and not per file.
 fn conflict_asker<'a>(
     tx: &'a Sender<Message>,
-    ctx: &'a egui::Context,
     replies: &'a std::sync::mpsc::Receiver<Answer>,
 ) -> impl Fn(&Path) -> Answer + 'a {
     let sticky = std::cell::Cell::new(None::<Answer>);
@@ -711,7 +714,6 @@ fn conflict_asker<'a>(
         {
             return Answer::Cancel;
         }
-        ctx.request_repaint();
         let answer = replies.recv().unwrap_or(Answer::Cancel);
         if matches!(
             answer,
@@ -1536,6 +1538,48 @@ enum View {
     Running,
 }
 
+enum AppAction {
+    Open(PathBuf),
+    Run(Job),
+    Extract { only_checked: bool },
+    ExtractTo { only_checked: bool, dest: PathBuf },
+    PrepareCompress(Vec<PathBuf>),
+    SetFilter(String),
+    SelectAllVisible,
+    InvertVisible,
+    Add(Vec<PathBuf>),
+    Drop(Vec<PathBuf>),
+    Copy { cut: bool },
+    Paste,
+    OpenFile(usize),
+    Navigate(String),
+    Back,
+    Forward,
+    SetChecked { row: Row, value: bool },
+    ClearSelection,
+    Sort(SortColumn),
+    ToggleColumn(SortColumn),
+    SetLanguage(Option<Lang>),
+    SetTheme(ThemePreference),
+    AnswerConflict(Answer),
+    CancelPassword,
+    SetPasswordInput(String),
+    SubmitPassword(String),
+    TogglePasswordVisibility,
+    BeginPasswordChange,
+    RequestDelete,
+    ConfirmDelete(bool),
+    AnswerDrop(DropChoice),
+    CancelJob,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DropChoice {
+    Open,
+    Add,
+    Cancel,
+}
+
 // What the overflow button on the toolbar was asked for. A value rather than a
 // closure because the menu draws while the toolbar still holds `self`.
 #[derive(Clone)]
@@ -1925,7 +1969,7 @@ fn wheel_speed(away: f32) -> f32 {
     (past * past / 12.0).min(4000.0) * away.signum()
 }
 
-struct Arca {
+struct AppState {
     view: View,
     settings: Settings,
     archive: Option<PathBuf>,
@@ -1949,6 +1993,7 @@ struct Arca {
     output_name: String,
     close_when_done: bool,
     title: String,
+    window_title: String,
     current_dir: String,
     show_settings: bool,
     conflict: Option<String>,
@@ -1976,13 +2021,11 @@ struct Arca {
     // checkboxes but no cursor. None means nothing is focused yet.
     cursor: Option<usize>,
     // One texture per extension, filled the first time a kind is seen.
-    icons: HashMap<String, Option<egui::TextureHandle>>,
     // The desktop's word for each kind of file, by extension. See `system_type`.
     types: HashMap<String, Option<String>>,
     // Where a rubber band started, and what was ticked before it did. The
     // second is what lets the band be recomputed from scratch every frame, so
     // dragging back over a row lets go of it again.
-    band: Option<egui::Pos2>,
     band_base: Vec<bool>,
     // The row the drag started on, and the scroll position it is dragging the
     // list to when it runs off an edge. Row numbers rather than places on
@@ -2022,7 +2065,6 @@ struct Arca {
     // has something to write: it is handed no context to ask with.
     geometry: Option<[f32; 4]>,
     // Set while the wheel is being used to walk the list up and down.
-    wheel: Option<Wheel>,
     // The last row a left click landed on, and when. What tells a second click
     // on the same row from the first one of a new pair.
     last_click: Option<(usize, f64)>,
@@ -2055,103 +2097,314 @@ struct Arca {
     quiet: bool,
 }
 
-impl Arca {
+struct AppController {
+    state: AppState,
+}
+
+struct Arca {
+    controller: AppController,
+    icons: HashMap<String, Option<egui::TextureHandle>>,
+    band: Option<egui::Pos2>,
+    wheel: Option<Wheel>,
+}
+
+impl AppController {
+    fn dispatch(&mut self, action: AppAction) {
+        match action {
+            AppAction::Open(path) => self.open(path),
+            AppAction::Run(job) => self.run_job(job),
+            AppAction::Extract { only_checked } => self.ask_extract(only_checked),
+            AppAction::ExtractTo { only_checked, dest } => {
+                self.start_extract_to(only_checked, dest)
+            }
+            AppAction::PrepareCompress(paths) => self.prepare_compress(paths),
+            AppAction::SetFilter(filter) => self.state.filter = filter,
+            AppAction::SelectAllVisible => self.select_all_visible(),
+            AppAction::InvertVisible => self.invert_visible(),
+            AppAction::Add(paths) => self.add_files(paths),
+            AppAction::Drop(paths) => self.dropped(paths),
+            AppAction::Copy { cut } => self.copy_to_clipboard(cut),
+            AppAction::Paste => self.paste_from_clipboard(),
+            AppAction::OpenFile(index) => self.open_file(index),
+            AppAction::Navigate(path) => self.go_to(path),
+            AppAction::Back => self.go_back(),
+            AppAction::Forward => self.go_forward(),
+            AppAction::SetChecked { row, value } => self.set_checked(&row, value),
+            AppAction::ClearSelection => self.clear_picked(),
+            AppAction::Sort(column) => self.sort_by(column),
+            AppAction::ToggleColumn(column) => {
+                let on = self.state.settings.columns.on(column);
+                self.state.settings.columns.set(column, !on);
+                self.state.settings.save();
+            }
+            AppAction::SetLanguage(lang) => {
+                self.state.settings.lang = lang;
+                self.state.settings.save();
+            }
+            AppAction::SetTheme(theme) => {
+                self.state.settings.theme = theme;
+                self.state.settings.save();
+            }
+            AppAction::AnswerConflict(answer) => {
+                if let Some(tx) = &self.state.replies {
+                    let _ = tx.send(answer);
+                }
+                self.state.conflict = None;
+            }
+            AppAction::CancelPassword => self.cancel_password(),
+            AppAction::SetPasswordInput(password) => self.state.password_input = password,
+            AppAction::SubmitPassword(password) => self.submit_password(password),
+            AppAction::TogglePasswordVisibility => {
+                self.state.show_password = !self.state.show_password
+            }
+            AppAction::BeginPasswordChange => self.begin_password_change(),
+            AppAction::RequestDelete => self.request_delete(),
+            AppAction::ConfirmDelete(confirmed) => self.confirm_delete(confirmed),
+            AppAction::AnswerDrop(choice) => self.answer_drop(choice),
+            AppAction::CancelJob => {}
+        }
+    }
+
+    fn begin_password_change(&mut self) {
+        let Some(archive) = self.state.archive.clone() else {
+            return;
+        };
+        if self.state.format != Format::Zip || self.state.busy {
+            return;
+        }
+        let job = Job::Password {
+            archive,
+            current: self.state.archive_password.clone(),
+            new: None,
+        };
+        self.state.password_input.clear();
+        if self.state.entries.iter().any(|entry| entry.encrypted)
+            && self.state.archive_password.is_none()
+        {
+            self.state.waiting_on_password = Some(Pending::CurrentPassword(Box::new(job)));
+        } else {
+            self.run_job(job);
+        }
+    }
+
+    fn sort_by(&mut self, column: SortColumn) {
+        if self.state.order.0 == column {
+            self.state.order.1 = !self.state.order.1;
+        } else {
+            self.state.order = (column, true);
+        }
+    }
+
+    fn start_extract_to(&mut self, only_checked: bool, mut dest: PathBuf) {
+        let Some(archive) = self.state.archive.clone() else {
+            return;
+        };
+        if self.state.into_subfolder {
+            dest = dest.join(archive_stem(&archive));
+        }
+        let wanted = if only_checked {
+            self.state.checked.clone()
+        } else {
+            vec![true; self.state.entries.len()]
+        };
+        let s = self.s();
+        let total = wanted.iter().filter(|b| **b).count();
+        let pw = self.state.archive_password.clone();
+        self.state.close_when_done = false;
+        let (reply_tx, reply_rx) = channel::<Answer>();
+        self.state.replies = Some(reply_tx);
+        self.spawn(total, move |tx| {
+            let notify = |i: usize, n: usize, name: &str| {
+                let _ = tx.send(Message::Progress(i, n, name.to_string()));
+            };
+            let ask = conflict_asker(tx, &reply_rx);
+            let result = extract(&archive, &dest, &wanted, &notify, &ask, pw.as_deref());
+            let _ = tx.send(match result {
+                Ok(bytes) => Message::Done(fill(
+                    s.extracted_to,
+                    &[
+                        ("size", &human(bytes)),
+                        ("dest", &dest.display().to_string()),
+                    ],
+                )),
+                Err(e) => Message::Failed(e.to_string()),
+            });
+        });
+    }
+
+    fn submit_password(&mut self, password: String) {
+        if password.is_empty() {
+            return;
+        }
+        let Some(pending) = self.state.waiting_on_password.take() else {
+            return;
+        };
+        self.state.password_input.clear();
+        self.state.show_password = false;
+        match pending {
+            Pending::Extract(job) => {
+                if let Job::Extract { archives, dest, .. } = *job {
+                    self.run_job(Job::Extract {
+                        archives,
+                        dest,
+                        password: Some(password),
+                    });
+                }
+            }
+            Pending::OpenArchive => self.state.archive_password = Some(password),
+            Pending::NewPassword(job) => {
+                if let Job::Password {
+                    archive, current, ..
+                } = *job
+                {
+                    self.run_job(Job::Password {
+                        archive,
+                        current,
+                        new: Some(password),
+                    });
+                }
+            }
+            Pending::CurrentPassword(job) => {
+                if let Job::Password { archive, new, .. } = *job {
+                    self.state.archive_password = Some(password.clone());
+                    self.run_job(Job::Password {
+                        archive,
+                        current: Some(password),
+                        new,
+                    });
+                }
+            }
+        }
+    }
+
+    fn prepare_compress(&mut self, inputs: Vec<PathBuf>) {
+        if inputs.is_empty() {
+            return;
+        }
+        self.state.output_name = quick_output(&inputs, self.state.format)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.state.pending_inputs = inputs;
+        self.state.view = View::Add;
+    }
+    fn select_all_visible(&mut self) {
+        for row in self.visible_rows() {
+            self.set_checked(&row, true);
+        }
+    }
+    fn invert_visible(&mut self) {
+        let rows = self.visible_rows();
+        let values: Vec<bool> = rows.iter().map(|r| !self.is_checked(r)).collect();
+        for (r, v) in rows.iter().zip(values) {
+            self.set_checked(r, v);
+        }
+    }
+    fn request_delete(&mut self) {
+        let names = self.selected_names();
+        if !names.is_empty() {
+            self.state.confirm_delete = Some(names);
+        }
+    }
+    fn confirm_delete(&mut self, yes: bool) {
+        if let Some(names) = self.state.confirm_delete.take() {
+            if yes {
+                if let Some(archive) = self.state.archive.clone() {
+                    self.run_job(Job::Delete {
+                        archive,
+                        names,
+                        password: self.state.archive_password.clone(),
+                    });
+                }
+            }
+        }
+    }
+    fn answer_drop(&mut self, choice: DropChoice) {
+        if let Some(paths) = self.state.confirm_drop.take() {
+            match choice {
+                DropChoice::Open => {
+                    if let Some(p) = paths.into_iter().next() {
+                        self.open(p);
+                    }
+                }
+                DropChoice::Add => self.add_files(paths),
+                DropChoice::Cancel => {}
+            }
+        }
+    }
+
     fn new(settings: Settings) -> Self {
-        Arca {
-            view: View::Browse,
-            settings,
-            archive: None,
-            entries: Vec::new(),
-            checked: Vec::new(),
-            filter: String::new(),
-            order: (SortColumn::Name, true),
-            channel: None,
-            notice: String::new(),
-            error: false,
-            busy: false,
-            done_count: 0,
-            total_count: 0,
-            current_file: String::new(),
-            started: None,
-            format: Format::Zip,
-            codec: Codec::Deflate,
-            level: Level::Normal,
-            into_subfolder: false,
-            pending_inputs: Vec::new(),
-            output_name: String::new(),
-            close_when_done: false,
-            title: String::new(),
-            current_dir: String::new(),
-            show_settings: false,
-            conflict: None,
-            replies: None,
-            waiting_on_password: None,
-            password_input: String::new(),
-            show_password: false,
-            add_password: String::new(),
-            archive_password: None,
-            after_password: None,
-            history: vec![String::new()],
-            here: 0,
-            cursor: None,
-            icons: HashMap::new(),
-            types: HashMap::new(),
-            band: None,
-            band_base: Vec::new(),
-            confirm_delete: None,
-            scroll_to_cursor: false,
-            clip_dir: None,
-            cut_names: HashSet::new(),
-            confirm_drop: None,
-            band_anchor: None,
-            drag_ready: None,
-            drag_settling: false,
-            band_scroll: None,
-            renaming: None,
-            rename_fresh: false,
-            viewing: None,
-            picking_group: None,
-            mask: String::new(),
-            folders: tree::Folder::default(),
-            geometry: None,
-            wheel: None,
-            last_click: None,
-            cut_armed: None,
-            cut_pending: None,
-            was_focused: true,
-            show_shortcuts: false,
-            quiet: false,
+        AppController {
+            state: AppState {
+                view: View::Browse,
+                settings,
+                archive: None,
+                entries: Vec::new(),
+                checked: Vec::new(),
+                filter: String::new(),
+                order: (SortColumn::Name, true),
+                channel: None,
+                notice: String::new(),
+                error: false,
+                busy: false,
+                done_count: 0,
+                total_count: 0,
+                current_file: String::new(),
+                started: None,
+                format: Format::Zip,
+                codec: Codec::Deflate,
+                level: Level::Normal,
+                into_subfolder: false,
+                pending_inputs: Vec::new(),
+                output_name: String::new(),
+                close_when_done: false,
+                title: String::new(),
+                window_title: "Arca".to_string(),
+                current_dir: String::new(),
+                show_settings: false,
+                conflict: None,
+                replies: None,
+                waiting_on_password: None,
+                password_input: String::new(),
+                show_password: false,
+                add_password: String::new(),
+                archive_password: None,
+                after_password: None,
+                history: vec![String::new()],
+                here: 0,
+                cursor: None,
+                types: HashMap::new(),
+                band_base: Vec::new(),
+                confirm_delete: None,
+                scroll_to_cursor: false,
+                clip_dir: None,
+                cut_names: HashSet::new(),
+                confirm_drop: None,
+                band_anchor: None,
+                drag_ready: None,
+                drag_settling: false,
+                band_scroll: None,
+                renaming: None,
+                rename_fresh: false,
+                viewing: None,
+                picking_group: None,
+                mask: String::new(),
+                folders: tree::Folder::default(),
+                geometry: None,
+                last_click: None,
+                cut_armed: None,
+                cut_pending: None,
+                was_focused: true,
+                show_shortcuts: false,
+                quiet: false,
+            },
         }
     }
-
-    fn s(&self) -> &'static Strings {
-        strings(self.settings.effective_lang())
-    }
-
-    fn level_name(&self, l: Level) -> &'static str {
-        let s = self.s();
-        match l {
-            Level::Store => s.level_none,
-            Level::Fast => s.level_fast,
-            Level::Normal => s.level_normal,
-            Level::Best => s.level_best,
-        }
-    }
-
-    fn codec_name(&self, c: Codec) -> &'static str {
-        let s = self.s();
-        match c {
-            Codec::Store => s.codec_store,
-            Codec::Deflate => s.codec_deflate,
-            Codec::Zstd => s.codec_zstd,
-        }
-    }
-
     fn summary(&self) -> String {
         let s = self.s();
-        let n = self.entries.iter().filter(|e| !e.is_dir).count();
-        let raw: u64 = self.entries.iter().map(|e| e.size).sum();
-        let packed: u64 = self.entries.iter().map(|e| e.compressed_size).sum();
+        let n = self.state.entries.iter().filter(|e| !e.is_dir).count();
+        let raw: u64 = self.state.entries.iter().map(|e| e.size).sum();
+        let packed: u64 = self.state.entries.iter().map(|e| e.compressed_size).sum();
         let ratio = if raw == 0 {
             0.0
         } else {
@@ -2167,15 +2420,584 @@ impl Arca {
             s.saved_word
         )
     }
+    fn go_back(&mut self) {
+        if self.can_go_back() {
+            self.state.here -= 1;
+            self.state.current_dir = self.state.history[self.state.here].clone();
+            self.state.filter.clear();
+            self.clear_picked();
+        }
+    }
+    fn selected_roots(&self) -> Vec<String> {
+        let names: Vec<String> = self
+            .state
+            .entries
+            .iter()
+            .map(|e| e.name.replace('\\', "/"))
+            .collect();
+        // Whether everything under a prefix is ticked, worked out once per
+        // prefix: the same ancestors come round again for every file in a
+        // folder, and there can be thousands of them.
+        let mut whole: HashMap<String, bool> = HashMap::new();
+        let mut roots: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
 
+        for (i, full) in names.iter().enumerate() {
+            if !self.state.checked.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let trimmed = full.trim_end_matches('/');
+            let mut root = trimmed.to_string();
+            // Shortest ancestor first: the outermost folder that is ticked all
+            // the way down is the one that was meant.
+            let mut at = 0usize;
+            while let Some(cut) = trimmed[at..].find('/') {
+                at += cut + 1;
+                let prefix = &trimmed[..at];
+                let all = *whole.entry(prefix.to_string()).or_insert_with(|| {
+                    names
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, n)| n.starts_with(prefix))
+                        .all(|(j, _)| self.state.checked.get(j).copied().unwrap_or(false))
+                });
+                if all {
+                    root = prefix.trim_end_matches('/').to_string();
+                    break;
+                }
+            }
+            if seen.insert(root.clone()) {
+                roots.push(root);
+            }
+        }
+        roots
+    }
+
+    // Ctrl+C and Ctrl+X. The clipboard carries paths, not archive entries, so
+    // what is picked is extracted into a folder of its own under the temporary
+    // directory first and those paths are what the shell is handed.
+    //
+    // A cut marks the rows and asks the shell to move rather than copy, which
+    // is what empties the temporary folder afterwards. It does not take the
+    // entries out of the archive: nothing tells this window whether the paste
+    // ever happened, and removing them on the guess that it did would lose them
+    // for good the moment somebody changed their mind.
+    fn clear_picked(&mut self) {
+        self.state.checked.iter_mut().for_each(|c| *c = false);
+        self.state.cursor = None;
+        // A row number means something else in the folder now on screen.
+        self.state.last_click = None;
+    }
+    fn go_forward(&mut self) {
+        if self.can_go_forward() {
+            self.state.here += 1;
+            self.state.current_dir = self.state.history[self.state.here].clone();
+            self.state.filter.clear();
+            self.clear_picked();
+        }
+    }
+    fn s(&self) -> &'static Strings {
+        strings(self.state.settings.effective_lang())
+    }
+    fn selected_names(&self) -> Vec<String> {
+        self.state
+            .entries
+            .iter()
+            .zip(&self.state.checked)
+            .filter(|(_, &on)| on)
+            .map(|(e, _)| e.name.clone())
+            .collect()
+    }
+
+    // The top of what is ticked. A folder with every one of its entries ticked
+    // stands for all of them, so a copy hands the clipboard one folder instead
+    // of the fifteen hundred files inside it, and the Explorer pastes a folder
+    // rather than a heap of loose files.
+    fn cancel_password(&mut self) {
+        let was_job = matches!(self.state.waiting_on_password, Some(Pending::Extract(_)));
+        self.state.waiting_on_password = None;
+        self.state.password_input.clear();
+        // Only a job left the window on the running view with nothing running.
+        if was_job {
+            self.state.view = View::Browse;
+        }
+    }
+    fn extract_here(&mut self) {
+        let Some(archive) = self.state.archive.clone() else {
+            return;
+        };
+        self.run_job(Job::Extract {
+            archives: vec![archive],
+            dest: if self.state.into_subfolder {
+                Destination::Subfolder
+            } else {
+                Destination::Beside
+            },
+            password: self.state.archive_password.clone(),
+        });
+    }
+    fn set_checked(&mut self, row: &Row, value: bool) {
+        // Nothing behind it, and its path is the folder above: ticking it would
+        // pick everything in the archive up to and including where you came
+        // from. Select all has to leave it alone.
+        if row.up {
+            return;
+        }
+        match row.entry {
+            Some(i) => self.state.checked[i] = value,
+            None => {
+                for i in entries_under(&self.state.entries, &row.path) {
+                    self.state.checked[i] = value;
+                }
+            }
+        }
+    }
+
+    // Double clicking a file pulls that one entry out to a temporary folder and
+    // hands it to whatever the system opens it with. It runs on its own thread
+    // because the entry can be large, and reports through the same progress
+    // window as everything else.
+    fn dragged_files(&self) -> Vec<(Entry, String)> {
+        let base = &self.state.current_dir;
+        self.state
+            .entries
+            .iter()
+            .zip(&self.state.checked)
+            .filter(|(e, &on)| on && !e.is_dir)
+            .map(|(e, _)| {
+                let full = e.name.replace('\\', "/");
+                let rel = full.strip_prefix(base.as_str()).unwrap_or(&full);
+                (e.clone(), rel.replace('/', "\\"))
+            })
+            .filter(|(_, rel)| !rel.is_empty())
+            .collect()
+    }
+
+    // Dragging the selection out of the window. Blocks until it has been
+    // dropped or abandoned, because that is what `DoDragDrop` does: the window
+    // stops repainting for as long as the drag lasts, which nobody sees because
+    // the pointer is somewhere else by then.
+    //
+    // Nothing is extracted here. The shell is handed a list of names and sizes
+    // and asks for one file at a time while it is dropping, so a drag that is
+    // thought better of costs nothing, and a drag of six gigabytes starts as
+    // fast as a drag of one file.
+    #[cfg(windows)]
+    fn go_to(&mut self, path: String) {
+        if self.state.history.get(self.state.here) == Some(&path) {
+            return;
+        }
+        self.state.history.truncate(self.state.here + 1);
+        self.state.history.push(path.clone());
+        self.state.here = self.state.history.len() - 1;
+        self.state.current_dir = path;
+        self.state.filter.clear();
+        self.clear_picked();
+    }
+
+    // Every folder starts with nothing picked, the way the Explorer does.
+    // A folder is picked here by ticking every entry underneath it, which is
+    // what lets one be extracted whole, so clicking a folder and walking into
+    // it used to arrive with all of its contents already ticked.
+    fn remember(&mut self, path: &Path) {
+        let text = path.to_string_lossy().to_string();
+        self.state.settings.recent.retain(|p| *p != text);
+        self.state.settings.recent.insert(0, text);
+        self.state.settings.recent.truncate(10);
+        self.state.settings.save();
+    }
+    fn spawn<F>(&mut self, total: usize, work: F)
+    where
+        F: FnOnce(&Sender<Message>) + Send + 'static,
+    {
+        let (tx, rx) = channel();
+        self.state.channel = Some(rx);
+        self.state.busy = true;
+        self.state.quiet = false;
+        self.state.error = false;
+        self.state.done_count = 0;
+        self.state.total_count = total;
+        self.state.current_file.clear();
+        self.state.started = Some(Instant::now());
+        std::thread::spawn(move || {
+            work(&tx);
+        });
+    }
+
+    // The folders of the archive down the side, the way WinRAR and the Explorer
+    // both offer one.
+    //
+    // It earns its place in a deep archive, where walking to a folder six
+    // levels down and back is a dozen double clicks. Off by default: in a flat
+    // archive it would be an empty column taking a fifth of the window.
+    fn can_go_forward(&self) -> bool {
+        self.state.here + 1 < self.state.history.len()
+    }
+    fn codec_name(&self, c: Codec) -> &'static str {
+        let s = self.s();
+        match c {
+            Codec::Store => s.codec_store,
+            Codec::Deflate => s.codec_deflate,
+            Codec::Zstd => s.codec_zstd,
+        }
+    }
+    fn drag_out(&mut self) {}
+
+    // Ctrl+V: whatever files the shell is holding, into the folder on screen.
+    fn ask_extract(&mut self, only_checked: bool) {
+        let s: &'static Strings = self.s();
+        let Some(archive) = self.state.archive.clone() else {
+            return;
+        };
+        let Some(mut dest) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        if self.state.into_subfolder {
+            dest = dest.join(archive_stem(&archive));
+        }
+        let wanted: Vec<bool> = if only_checked {
+            self.state.checked.clone()
+        } else {
+            vec![true; self.state.entries.len()]
+        };
+        let total = wanted.iter().filter(|b| **b).count();
+        let pw = self.state.archive_password.clone();
+        self.state.close_when_done = false;
+        let (reply_tx, reply_rx) = channel::<Answer>();
+        self.state.replies = Some(reply_tx);
+        self.spawn(total, move |tx| {
+            let notify = |i: usize, n: usize, name: &str| {
+                let _ = tx.send(Message::Progress(i, n, name.to_string()));
+            };
+            let ask = conflict_asker(tx, &reply_rx);
+            let _ = tx.send(
+                match extract(&archive, &dest, &wanted, &notify, &ask, pw.as_deref()) {
+                    Ok(bytes) => Message::Done(fill(
+                        s.extracted_to,
+                        &[
+                            ("size", &human(bytes)),
+                            ("dest", &dest.display().to_string()),
+                        ],
+                    )),
+                    Err(e) => Message::Failed(e.to_string()),
+                },
+            );
+        });
+    }
+
+    // Escape and the Cancel button are the same act, so they go through the
+    // same code: two copies of this would drift apart the first time one side
+    // grew a step.
+    // The names ticked right now, which is what every action that works on a
+    // selection needs.
+    fn cut_landed(&mut self) {
+        let Some(cut) = &self.state.cut_pending else {
+            return;
+        };
+        if self.state.busy || self.state.archive.as_ref() != Some(&cut.archive) {
+            return;
+        }
+        if cut.paths.iter().any(|p| p.exists()) {
+            return;
+        }
+        let Some(cut) = self.state.cut_pending.take() else {
+            return;
+        };
+        self.state.cut_names.clear();
+        self.run_job(Job::Delete {
+            archive: cut.archive,
+            names: cut.names,
+            password: self.state.archive_password.clone(),
+        });
+    }
+
+    // What is picked, named the way it should land where it is dropped: the
+    // folder on screen is the base, so dragging a folder out puts that folder
+    // down rather than scattering what was inside it.
+    fn level_name(&self, l: Level) -> &'static str {
+        let s = self.s();
+        match l {
+            Level::Store => s.level_none,
+            Level::Fast => s.level_fast,
+            Level::Normal => s.level_normal,
+            Level::Best => s.level_best,
+        }
+    }
+    fn can_go_back(&self) -> bool {
+        self.state.here > 0
+    }
+    fn add_files(&mut self, inputs: Vec<PathBuf>) {
+        let Some(archive) = self.state.archive.clone() else {
+            return;
+        };
+        self.run_job(Job::Add {
+            archive,
+            inputs,
+            dir: self.state.current_dir.clone(),
+            codec: self.state.codec,
+            level: self.state.level,
+            password: self.state.archive_password.clone(),
+        });
+    }
+
+    // What a drop means depends on what the window is already showing. With
+    // nothing open there is only one thing it can be, and that is what it has
+    // always done: open it. With an archive open, dropping a file on it means
+    // putting the file inside, which is what every other archiver does and what
+    // opening a second archive over the first never was.
+    //
+    // The exception is dropping an archive onto an archive, which is honestly
+    // both, so it asks instead of picking one and being wrong half the time.
+    fn copy_to_clipboard(&mut self, cut: bool) {
+        let s: &'static Strings = self.s();
+        let Some(archive) = self.state.archive.clone() else {
+            return;
+        };
+        let roots = self.selected_roots();
+        if roots.is_empty() {
+            return;
+        }
+        // A folder of its own per copy, so the paths already on the clipboard
+        // never end up pointing at something a later copy overwrote.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir()
+            .join("Arca")
+            .join(format!("clip-{stamp:x}"));
+        let previous = self.state.clip_dir.replace(dir.clone());
+        let names = self.selected_names();
+        // Before the old folder is thrown away further down: an earlier cut
+        // still waiting was watching for those files to disappear, and this is
+        // about to delete them itself.
+        self.state.cut_armed = None;
+        self.state.cut_pending = None;
+        self.state.cut_names = if cut {
+            names.iter().cloned().collect()
+        } else {
+            HashSet::new()
+        };
+        // Where each picked thing will land once extracted. Worked out here
+        // rather than in the thread because it is also what a pending cut has
+        // to watch, and only a .zip can have entries taken out of it in place.
+        let landed: Vec<PathBuf> = roots
+            .iter()
+            .filter_map(|r| arca_core::safe_name(r).ok())
+            .map(|r| dir.join(r))
+            .collect();
+        if cut && detect(&archive) == Some(Format::Zip) {
+            self.state.cut_armed = Some(Cut {
+                archive: archive.clone(),
+                paths: landed.clone(),
+                names,
+            });
+        }
+
+        let wanted = self.state.checked.clone();
+        let total = wanted.iter().filter(|b| **b).count();
+        let pw = self.state.archive_password.clone();
+        self.state.close_when_done = false;
+        self.spawn(total, move |tx| {
+            let notify = |i: usize, n: usize, name: &str| {
+                let _ = tx.send(Message::Progress(i, n, name.to_string()));
+            };
+            // A folder nobody has seen yet has nothing in it to overwrite, so
+            // there is no question to put on screen.
+            let ask = |_: &Path| Answer::Replace;
+            let outcome = extract(&archive, &dir, &wanted, &notify, &ask, pw.as_deref())
+                .map_err(|e| e.to_string())
+                .and_then(|_| clipboard::set_files(&landed, cut).map(|()| landed.len()));
+            // Only once the new list is on the clipboard: until that moment the
+            // old paths are still what a paste would reach for.
+            if let Some(old) = previous {
+                let _ = fs::remove_dir_all(old);
+            }
+            let _ = tx.send(match outcome {
+                // Nothing to say. Copying somewhere else does not announce
+                // itself either, and the rows a cut is holding are already
+                // faded; what is worth a line is the entries leaving the
+                // archive, and that has its own. An empty message hands the
+                // status bar back to the summary of what is open.
+                Ok(_) => {
+                    if cut {
+                        let _ = tx.send(Message::CutReady);
+                    }
+                    Message::Done(String::new())
+                }
+                Err(why) => Message::Failed(fill(s.clipboard_failed, &[("why", &why)])),
+            });
+        });
+        // After `spawn`, which clears it: this is the one job that runs without
+        // saying so.
+        self.state.quiet = true;
+    }
+
+    // Whether the cut waiting on a paste has had it.
+    //
+    // Windows never says. What it does instead, when the clipboard asked for a
+    // move rather than a copy, is take the files out of the folder they were
+    // handed over in, so their absence is the whole of the evidence. It is
+    // checked when the window gets the keyboard back, because pasting somewhere
+    // else means having gone somewhere else first.
+    //
+    // Only all of them counts. A cut that is half gone is more likely to be a
+    // paste still running than one that finished, and leaving the entries where
+    // they are costs nothing: they will still be there next time. Every way
+    // this can be wrong leaves the archive untouched, which is the side to be
+    // wrong on when there is no undo.
+    fn open_file(&mut self, index: usize) {
+        let Some(archive) = self.state.archive.clone() else {
+            return;
+        };
+        let Some(entry) = self.state.entries.get(index).cloned() else {
+            return;
+        };
+        if entry.is_dir {
+            return;
+        }
+        let password = self.state.archive_password.clone();
+        let s = self.s();
+        self.state.close_when_done = false;
+        self.state.title = s.opening.to_string();
+        self.state.view = View::Running;
+        self.spawn(1, move |tx| {
+            let _ = tx.send(Message::Progress(0, 1, entry.name.clone()));
+            let outcome = extract_one(&archive, &entry, password.as_deref())
+                .and_then(|path| launch_with_system(&path).map(|()| path));
+            let _ = tx.send(match outcome {
+                Ok(path) => Message::Done(fill(
+                    s.opened_with_system,
+                    &[("name", &path.display().to_string())],
+                )),
+                Err(e) => Message::Failed(e.to_string()),
+            });
+        });
+    }
+
+    // Everything the keyboard does to the list, in one place. `rows` is what is
+    // on screen right now, which is what the arrows should walk: filtering or
+    // changing folder changes the list under the cursor, so it is clamped here
+    // rather than tracked separately.
+    fn receive(&mut self) -> bool {
+        let mut close = false;
+        let mut finished_ok = false;
+        if let Some(rx) = &self.state.channel {
+            while let Ok(m) = rx.try_recv() {
+                match m {
+                    Message::Listing(path, v) => {
+                        if v.iter().any(|e| e.encrypted) && self.state.archive_password.is_none() {
+                            self.state.password_input.clear();
+                            self.state.archive_password = None;
+                            self.state.waiting_on_password = Some(Pending::OpenArchive);
+                        }
+                        // Nothing picked to begin with. It used to be
+                        // everything, which was invisible while the ticks were
+                        // the only sign of it; now that a picked row is painted
+                        // it would open as a wall of blue, and "everything is
+                        // selected" is not what a list means when you open it.
+                        // The buttons that work on the whole archive never
+                        // looked at the ticks anyway.
+                        self.state.checked = vec![false; v.len()];
+                        self.state.folders = tree::folders_of(&v);
+                        self.state.entries = v;
+                        if let Some(f) = detect(&path) {
+                            self.state.format = f;
+                        }
+                        // The name of what is open goes where every other
+                        // program puts it, which frees a whole row above the
+                        // list for nothing at all.
+                        self.state.window_title = format!(
+                            "{} — Arca",
+                            path.file_name()
+                                .map(|x| x.to_string_lossy().to_string())
+                                .unwrap_or_default()
+                        );
+                        self.state.archive = Some(path);
+                        self.state.history = vec![String::new()];
+                        self.state.here = 0;
+                        self.state.current_dir = String::new();
+                        self.state.busy = false;
+                        close = true;
+                    }
+                    Message::Conflict(path) => {
+                        self.state.conflict = Some(path);
+                    }
+                    Message::Progress(done, total, name) => {
+                        self.state.done_count = done;
+                        self.state.total_count = total;
+                        self.state.current_file = name;
+                    }
+                    Message::Done(text) => {
+                        self.state.notice = text;
+                        self.state.busy = false;
+                        close = true;
+                        finished_ok = true;
+                    }
+                    Message::Failed(text) => {
+                        self.state.notice = text;
+                        self.state.error = true;
+                        self.state.busy = false;
+                        close = true;
+                    }
+                    Message::CutReady => {
+                        self.state.cut_pending = self.state.cut_armed.take();
+                    }
+                }
+            }
+        }
+        if close {
+            self.state.channel = None;
+            self.state.quiet = false;
+            if !self.state.entries.is_empty() && self.state.notice.is_empty() {
+                self.state.notice = self.summary();
+            }
+        }
+        // The archive on disk is not the one that was listed any more. Reopen it
+        // with the password it now carries, so the browse view shows the new
+        // state and does not ask for a password it was just handed.
+        if finished_ok {
+            if let Some((path, pw)) = self.state.after_password.take() {
+                let notice = std::mem::take(&mut self.state.notice);
+                self.open(path);
+                self.state.archive_password = pw;
+                self.state.notice = notice;
+                self.state.view = View::Browse;
+            }
+        }
+        finished_ok && self.state.close_when_done && matches!(self.state.view, View::Running)
+    }
+    fn paste_from_clipboard(&mut self) {
+        let Some(archive) = self.state.archive.clone() else {
+            return;
+        };
+        let here = fs::canonicalize(&archive).unwrap_or_else(|_| archive.clone());
+        // Pasting the archive into itself would have the rewrite reading the
+        // file it is replacing.
+        let inputs: Vec<PathBuf> = clipboard::files()
+            .into_iter()
+            .filter(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()) != here)
+            .collect();
+        if inputs.is_empty() {
+            self.state.notice = self.s().clipboard_empty.to_string();
+            self.state.error = true;
+            return;
+        }
+        self.add_files(inputs);
+    }
+
+    // Files from anywhere outside into the folder the window is showing. Both
+    // the paste and the drop end here so they cannot answer the same question
+    // two different ways.
     fn visible_rows(&self) -> Vec<Row> {
-        let filter = self.filter.trim().to_lowercase();
+        let filter = self.state.filter.trim().to_lowercase();
         // Flat view: every file in the archive at once, wherever it is filed.
         // It is how you find something when you know its name and not its
         // folder, and it is the same list a filter builds, only without one.
-        let flat = self.settings.flat && filter.is_empty();
+        let flat = self.state.settings.flat && filter.is_empty();
         let mut rows = if flat {
-            self.entries
+            self.state
+                .entries
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| !e.is_dir)
@@ -2202,9 +3024,10 @@ impl Arca {
                 })
                 .collect()
         } else if filter.is_empty() {
-            children_of(&self.entries, &self.current_dir)
+            children_of(&self.state.entries, &self.state.current_dir)
         } else {
-            self.entries
+            self.state
+                .entries
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| !e.is_dir && e.name.to_lowercase().contains(&filter))
@@ -2226,7 +3049,7 @@ impl Arca {
                 .collect()
         };
 
-        let (col, asc) = self.order;
+        let (col, asc) = self.state.order;
         rows.sort_by(|x, y| {
             if x.is_dir != y.is_dir {
                 return if x.is_dir {
@@ -2260,46 +3083,288 @@ impl Arca {
         });
         // Put on after the sort, because it belongs at the top whichever column
         // the list is held by and whichever way round.
-        if !flat && filter.is_empty() && !self.current_dir.is_empty() {
-            rows.insert(0, up_row(&self.current_dir));
+        if !flat && filter.is_empty() && !self.state.current_dir.is_empty() {
+            rows.insert(0, up_row(&self.state.current_dir));
         }
         rows
     }
-
-    fn spawn<F>(&mut self, ctx: &egui::Context, total: usize, work: F)
-    where
-        F: FnOnce(&Sender<Message>) + Send + 'static,
-    {
-        let (tx, rx) = channel();
-        self.channel = Some(rx);
-        self.busy = true;
-        self.quiet = false;
-        self.error = false;
-        self.done_count = 0;
-        self.total_count = total;
-        self.current_file.clear();
-        self.started = Some(Instant::now());
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            work(&tx);
-            ctx.request_repaint();
+    fn rename_to(&mut self, rows: &[Row], path: &str, name: &str) {
+        let Some(row) = rows.iter().find(|r| r.path == path) else {
+            return;
+        };
+        if name == row.label {
+            return;
+        }
+        let s = self.s();
+        if name.is_empty() || name.contains('/') || name.contains('\\') {
+            self.state.notice = s.bad_name.to_string();
+            self.state.error = true;
+            return;
+        }
+        // Only against what is in this folder: the same name elsewhere in the
+        // archive is somebody else's business.
+        if rows
+            .iter()
+            .any(|r| r.path != path && r.label.eq_ignore_ascii_case(name))
+        {
+            self.state.notice = fill(s.name_taken, &[("name", name)]);
+            self.state.error = true;
+            return;
+        }
+        let to = match path.rsplit_once('/') {
+            Some((parent, _)) => format!("{parent}/{name}"),
+            None => name.to_string(),
+        };
+        let Some(archive) = self.state.archive.clone() else {
+            return;
+        };
+        self.run_job(Job::Rename {
+            archive,
+            from: path.to_string(),
+            to,
+            folder: row.is_dir,
+            password: self.state.archive_password.clone(),
         });
     }
 
-    // The folders of the archive down the side, the way WinRAR and the Explorer
-    // both offer one.
+    // The rule between two columns, and the handle that moves it.
     //
-    // It earns its place in a deep archive, where walking to a folder six
-    // levels down and back is a dozen double clicks. Off by default: in a flat
-    // archive it would be an empty column taking a fifth of the window.
+    // The handle is a hand's width either side of the rule and only as tall as
+    // the header, which is where every list of files on the machine puts it.
+    // The table's own went from the header to the foot of the list, so six
+    // columns meant six invisible strips down the length of it and a press
+    // near any of them was a column edge rather than the start of a selection.
+    // The rule is still drawn the whole way down: that is what tells you which
+    // number belongs under which heading halfway down a page.
+    #[allow(clippy::too_many_arguments)]
+    fn dropped(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        self.state.notice.clear();
+        self.state.error = false;
+        let open_first = |me: &mut Self, paths: Vec<PathBuf>| {
+            if let Some(p) = paths.into_iter().next() {
+                me.open(p);
+            }
+        };
+        let Some(archive) = self.state.archive.clone() else {
+            open_first(self, paths);
+            return;
+        };
+        let all_archives = paths.iter().all(|p| detect(p).is_some());
+        // Only a .zip can be added to in place. With a .tar open there is
+        // nothing to weigh up: an archive opens, and anything else has to say
+        // why it cannot go in rather than quietly do nothing.
+        if detect(&archive) != Some(Format::Zip) {
+            if all_archives {
+                open_first(self, paths);
+            } else {
+                self.state.notice = self.s().only_zip_can_change.to_string();
+                self.state.error = true;
+            }
+            return;
+        }
+        if all_archives {
+            self.state.confirm_drop = Some(paths);
+            return;
+        }
+        self.add_files(paths);
+    }
+
+    // A drop used to mean one thing and now means another, so while something
+    // is held over the window it says which. Guessing in silence is what made
+    // the old behaviour surprising in the first place.
+    fn view_entry(&mut self, index: usize) {
+        let Some(archive) = self.state.archive.clone() else {
+            return;
+        };
+        let Some(entry) = self.state.entries.get(index).cloned() else {
+            return;
+        };
+        let s = self.s();
+        if entry.is_dir {
+            return;
+        }
+        if entry.size > VIEW_LIMIT {
+            self.state.notice = fill(s.too_big_to_view, &[("size", &human(VIEW_LIMIT))]);
+            self.state.error = true;
+            return;
+        }
+        let mut bytes = Vec::with_capacity(entry.size as usize);
+        if let Err(e) = read_entry(
+            &archive,
+            index,
+            &mut bytes,
+            self.state.archive_password.as_deref(),
+        ) {
+            self.state.notice = e.to_string();
+            self.state.error = true;
+            return;
+        }
+
+        let name = entry.name.rsplit(['/', '\\']).next().unwrap_or(&entry.name);
+        // Asked once, and only of the names that claim to be pictures: handing
+        // every unknown file to a decoder to find out is a decoder run on
+        // whatever happens to be in the archive.
+        let picture = looks_like_picture(name)
+            && image::guess_format(&bytes).is_ok_and(|f| {
+                image::ImageReader::new(std::io::Cursor::new(&bytes))
+                    .with_guessed_format()
+                    .is_ok_and(|r| r.format() == Some(f))
+            });
+        let look = if picture {
+            Look::Picture
+        } else if looks_like_text(&bytes) {
+            Look::Text
+        } else {
+            Look::Hex
+        };
+        // Split now, once. The text is drawn a line at a time and only the
+        // lines on screen are laid out, so a log of a million lines opens as
+        // fast as a note of three.
+        let lines = String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        self.state.viewing = Some(Viewed {
+            name: name.to_string(),
+            bytes: bytes.into(),
+            look,
+            lines,
+            picture,
+        });
+    }
+
+    // The file being looked at, in its own window over the list.
+    fn open(&mut self, path: PathBuf) {
+        self.state.archive_password = None;
+        // Whatever was cut belonged to the listing being replaced, and so did
+        // whatever the status bar was saying: the summary of the archive being
+        // closed sat there over the one that had just opened.
+        self.state.cut_names.clear();
+        self.state.cut_armed = None;
+        self.state.cut_pending = None;
+        self.state.notice.clear();
+        self.state.error = false;
+        self.remember(&path);
+        self.spawn(0, move |tx| {
+            let m = match list_entries(&path) {
+                Ok(v) => Message::Listing(path, v),
+                Err(e) => Message::Failed(e.to_string()),
+            };
+            let _ = tx.send(m);
+        });
+    }
+
+    // Reading the central directory is enough to know whether the archive is
+    // encrypted, and costs nothing next to extracting it. Asking here, before
+    // any work starts, keeps the question on the window's own thread.
+    fn run_job(&mut self, job: Job) {
+        if let Job::Extract {
+            archives,
+            password: None,
+            ..
+        } = &job
+        {
+            if archives.iter().any(|a| is_encrypted(a)) {
+                self.state.password_input.clear();
+                self.state.waiting_on_password = Some(Pending::Extract(Box::new(job)));
+                self.state.view = View::Running;
+                self.state.title = self.s().extracting.to_string();
+                return;
+            }
+        }
+        let s: &'static Strings = self.s();
+        self.state.view = View::Running;
+        self.state.title = match &job {
+            Job::Extract { .. } => s.extracting.to_string(),
+            Job::Test { .. } => s.testing.to_string(),
+            Job::Password { .. } => s.changing_password.to_string(),
+            Job::Delete { .. } => s.deleting.to_string(),
+            Job::Rename { .. } => s.renaming.to_string(),
+            Job::Compress { .. } => s.compressing.to_string(),
+            Job::Add { .. } => s.adding.to_string(),
+        };
+        self.state.close_when_done = !matches!(
+            job,
+            Job::Test { .. }
+                | Job::Password { .. }
+                | Job::Delete { .. }
+                | Job::Rename { .. }
+                | Job::Add { .. }
+        );
+        // The file on disk is about to change, so the listing has to be redone.
+        if let Job::Password { archive, new, .. } = &job {
+            self.state.after_password = Some((archive.clone(), new.clone()));
+        }
+        if let Job::Delete {
+            archive, password, ..
+        } = &job
+        {
+            self.state.after_password = Some((archive.clone(), password.clone()));
+        }
+        if let Job::Add {
+            archive, password, ..
+        } = &job
+        {
+            self.state.after_password = Some((archive.clone(), password.clone()));
+        }
+        if let Job::Rename {
+            archive, password, ..
+        } = &job
+        {
+            self.state.after_password = Some((archive.clone(), password.clone()));
+        }
+
+        let (reply_tx, reply_rx) = channel::<Answer>();
+        self.state.replies = Some(reply_tx);
+        self.spawn(0, move |tx| {
+            let notify = |i: usize, n: usize, name: &str| {
+                let _ = tx.send(Message::Progress(i, n, name.to_string()));
+            };
+            let ask = conflict_asker(tx, &reply_rx);
+            let outcome = run_job_blocking(job, s, &notify, &ask);
+            let _ = tx.send(match outcome {
+                Ok(text) => Message::Done(text),
+                Err(text) => Message::Failed(text),
+            });
+        });
+    }
+    fn is_checked(&self, row: &Row) -> bool {
+        // The way out of the folder is not a thing that can be picked.
+        if row.up {
+            return false;
+        }
+        match row.entry {
+            Some(i) => self.state.checked[i],
+            None => {
+                let under = entries_under(&self.state.entries, &row.path);
+                !under.is_empty() && under.iter().all(|&i| self.state.checked[i])
+            }
+        }
+    }
+}
+
+impl Arca {
+    fn new(controller: AppController) -> Self {
+        Arca {
+            controller,
+            icons: HashMap::new(),
+            band: None,
+            wheel: None,
+        }
+    }
     fn tree_panel(&mut self, ctx: &egui::Context) {
-        if !self.settings.tree || self.entries.is_empty() {
+        if !self.controller.state.settings.tree || self.controller.state.entries.is_empty() {
             return;
         }
         let mut go: Option<String> = None;
-        let folders = self.folders.clone();
-        let here = self.current_dir.clone();
+        let folders = self.controller.state.folders.clone();
+        let here = self.controller.state.current_dir.clone();
         let root = self
+            .controller
+            .state
             .archive
             .as_ref()
             .and_then(|a| a.file_name())
@@ -2321,11 +3386,11 @@ impl Arca {
             // Going to a folder while the list is showing every file at once is
             // asking for that folder, so the flat view gets out of the way
             // rather than swallowing the click.
-            if self.settings.flat {
-                self.settings.flat = false;
-                self.settings.save();
+            if self.controller.state.settings.flat {
+                self.controller.state.settings.flat = false;
+                self.controller.state.settings.save();
             }
-            self.go_to(path);
+            self.controller.go_to(path);
         }
     }
 
@@ -2334,212 +3399,14 @@ impl Arca {
     // Ten of them, which is about as many as anybody scans before giving up and
     // going to the folder instead, and by path rather than by name so that two
     // archives called backup.zip in different places stay two.
-    fn remember(&mut self, path: &Path) {
-        let text = path.to_string_lossy().to_string();
-        self.settings.recent.retain(|p| *p != text);
-        self.settings.recent.insert(0, text);
-        self.settings.recent.truncate(10);
-        self.settings.save();
-    }
-
-    fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
-        self.archive_password = None;
-        // Whatever was cut belonged to the listing being replaced, and so did
-        // whatever the status bar was saying: the summary of the archive being
-        // closed sat there over the one that had just opened.
-        self.cut_names.clear();
-        self.cut_armed = None;
-        self.cut_pending = None;
-        self.notice.clear();
-        self.error = false;
-        self.remember(&path);
-        let ctx2 = ctx.clone();
-        self.spawn(ctx, 0, move |tx| {
-            let m = match list_entries(&path) {
-                Ok(v) => Message::Listing(path, v),
-                Err(e) => Message::Failed(e.to_string()),
-            };
-            let _ = tx.send(m);
-            ctx2.request_repaint();
-        });
-    }
-
-    // Reading the central directory is enough to know whether the archive is
-    // encrypted, and costs nothing next to extracting it. Asking here, before
-    // any work starts, keeps the question on the window's own thread.
-    fn run_job(&mut self, ctx: &egui::Context, job: Job) {
-        if let Job::Extract {
-            archives,
-            password: None,
-            ..
-        } = &job
-        {
-            if archives.iter().any(|a| is_encrypted(a)) {
-                self.password_input.clear();
-                self.waiting_on_password = Some(Pending::Extract(Box::new(job)));
-                self.view = View::Running;
-                self.title = self.s().extracting.to_string();
-                ctx.request_repaint();
-                return;
-            }
-        }
-        let s: &'static Strings = self.s();
-        self.view = View::Running;
-        self.title = match &job {
-            Job::Extract { .. } => s.extracting.to_string(),
-            Job::Test { .. } => s.testing.to_string(),
-            Job::Password { .. } => s.changing_password.to_string(),
-            Job::Delete { .. } => s.deleting.to_string(),
-            Job::Rename { .. } => s.renaming.to_string(),
-            Job::Compress { .. } => s.compressing.to_string(),
-            Job::Add { .. } => s.adding.to_string(),
-        };
-        self.close_when_done = !matches!(
-            job,
-            Job::Test { .. }
-                | Job::Password { .. }
-                | Job::Delete { .. }
-                | Job::Rename { .. }
-                | Job::Add { .. }
-        );
-        // The file on disk is about to change, so the listing has to be redone.
-        if let Job::Password { archive, new, .. } = &job {
-            self.after_password = Some((archive.clone(), new.clone()));
-        }
-        if let Job::Delete {
-            archive, password, ..
-        } = &job
-        {
-            self.after_password = Some((archive.clone(), password.clone()));
-        }
-        if let Job::Add {
-            archive, password, ..
-        } = &job
-        {
-            self.after_password = Some((archive.clone(), password.clone()));
-        }
-        if let Job::Rename {
-            archive, password, ..
-        } = &job
-        {
-            self.after_password = Some((archive.clone(), password.clone()));
-        }
-
-        let (reply_tx, reply_rx) = channel::<Answer>();
-        self.replies = Some(reply_tx);
-        let ctx2 = ctx.clone();
-        self.spawn(ctx, 0, move |tx| {
-            let notify = |i: usize, n: usize, name: &str| {
-                let _ = tx.send(Message::Progress(i, n, name.to_string()));
-                ctx2.request_repaint();
-            };
-            let ask = conflict_asker(tx, &ctx2, &reply_rx);
-            let outcome = run_job_blocking(job, s, &notify, &ask);
-            let _ = tx.send(match outcome {
-                Ok(text) => Message::Done(text),
-                Err(text) => Message::Failed(text),
-            });
-            ctx2.request_repaint();
-        });
-    }
-
-    fn receive(&mut self, ctx: &egui::Context) {
-        let mut close = false;
-        let mut finished_ok = false;
-        if let Some(rx) = &self.channel {
-            while let Ok(m) = rx.try_recv() {
-                match m {
-                    Message::Listing(path, v) => {
-                        if v.iter().any(|e| e.encrypted) && self.archive_password.is_none() {
-                            self.password_input.clear();
-                            self.archive_password = None;
-                            self.waiting_on_password = Some(Pending::OpenArchive);
-                        }
-                        // Nothing picked to begin with. It used to be
-                        // everything, which was invisible while the ticks were
-                        // the only sign of it; now that a picked row is painted
-                        // it would open as a wall of blue, and "everything is
-                        // selected" is not what a list means when you open it.
-                        // The buttons that work on the whole archive never
-                        // looked at the ticks anyway.
-                        self.checked = vec![false; v.len()];
-                        self.folders = tree::folders_of(&v);
-                        self.entries = v;
-                        if let Some(f) = detect(&path) {
-                            self.format = f;
-                        }
-                        // The name of what is open goes where every other
-                        // program puts it, which frees a whole row above the
-                        // list for nothing at all.
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                            "{} — Arca",
-                            path.file_name()
-                                .map(|x| x.to_string_lossy().to_string())
-                                .unwrap_or_default()
-                        )));
-                        self.archive = Some(path);
-                        self.history = vec![String::new()];
-                        self.here = 0;
-                        self.current_dir = String::new();
-                        self.busy = false;
-                        close = true;
-                    }
-                    Message::Conflict(path) => {
-                        self.conflict = Some(path);
-                    }
-                    Message::Progress(done, total, name) => {
-                        self.done_count = done;
-                        self.total_count = total;
-                        self.current_file = name;
-                    }
-                    Message::Done(text) => {
-                        self.notice = text;
-                        self.busy = false;
-                        close = true;
-                        finished_ok = true;
-                    }
-                    Message::Failed(text) => {
-                        self.notice = text;
-                        self.error = true;
-                        self.busy = false;
-                        close = true;
-                    }
-                    Message::CutReady => {
-                        self.cut_pending = self.cut_armed.take();
-                    }
-                }
-            }
-        }
-        if close {
-            self.channel = None;
-            self.quiet = false;
-            if !self.entries.is_empty() && self.notice.is_empty() {
-                self.notice = self.summary();
-            }
-        }
-        // The archive on disk is not the one that was listed any more. Reopen it
-        // with the password it now carries, so the browse view shows the new
-        // state and does not ask for a password it was just handed.
-        if finished_ok {
-            if let Some((path, pw)) = self.after_password.take() {
-                let notice = std::mem::take(&mut self.notice);
-                self.open(ctx, path);
-                self.archive_password = pw;
-                self.notice = notice;
-                self.view = View::Browse;
-            }
-        }
-        if finished_ok && self.close_when_done && matches!(self.view, View::Running) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-    }
-
     fn settings_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let s = self.s();
+        let s = self.controller.s();
         let mut changed = false;
 
         ui.label(s.language);
         let current = self
+            .controller
+            .state
             .settings
             .lang
             .map(|l| l.label())
@@ -2549,18 +3416,21 @@ impl Arca {
             .width(110.0)
             .show_ui(ui, |ui| {
                 if ui
-                    .selectable_label(self.settings.lang.is_none(), s.theme_system)
+                    .selectable_label(
+                        self.controller.state.settings.lang.is_none(),
+                        s.theme_system,
+                    )
                     .clicked()
                 {
-                    self.settings.lang = None;
+                    self.controller.state.settings.lang = None;
                     changed = true;
                 }
                 for l in Lang::ALL {
                     if ui
-                        .selectable_label(self.settings.lang == Some(l), l.label())
+                        .selectable_label(self.controller.state.settings.lang == Some(l), l.label())
                         .clicked()
                     {
-                        self.settings.lang = Some(l);
+                        self.controller.state.settings.lang = Some(l);
                         changed = true;
                     }
                 }
@@ -2568,7 +3438,7 @@ impl Arca {
 
         ui.add_space(10.0);
         ui.label(s.theme);
-        let theme_label = match self.settings.theme {
+        let theme_label = match self.controller.state.settings.theme {
             ThemePreference::System => s.theme_system,
             ThemePreference::Light => s.theme_light,
             ThemePreference::Dark => s.theme_dark,
@@ -2583,10 +3453,10 @@ impl Arca {
                     (ThemePreference::Dark, s.theme_dark),
                 ] {
                     if ui
-                        .selectable_label(self.settings.theme == t, label)
+                        .selectable_label(self.controller.state.settings.theme == t, label)
                         .clicked()
                     {
-                        self.settings.theme = t;
+                        self.controller.state.settings.theme = t;
                         ctx.set_theme(t);
                         changed = true;
                     }
@@ -2594,33 +3464,32 @@ impl Arca {
             });
 
         if changed {
-            self.settings.save();
+            self.controller.state.settings.save();
         }
     }
-
     fn format_row(&mut self, ui: &mut egui::Ui) {
-        let s = self.s();
+        let s = self.controller.s();
         let codecs: Vec<(Codec, &'static str)> = [Codec::Store, Codec::Deflate, Codec::Zstd]
             .into_iter()
-            .map(|c| (c, self.codec_name(c)))
+            .map(|c| (c, self.controller.codec_name(c)))
             .collect();
         let levels: Vec<(Level, &'static str)> =
             [Level::Store, Level::Fast, Level::Normal, Level::Best]
                 .into_iter()
-                .map(|l| (l, self.level_name(l)))
+                .map(|l| (l, self.controller.level_name(l)))
                 .collect();
-        let current_codec = self.codec_name(self.codec);
-        let current_level = self.level_name(self.level);
-        let is_zip = self.format == Format::Zip;
+        let current_codec = self.controller.codec_name(self.controller.state.codec);
+        let current_level = self.controller.level_name(self.controller.state.level);
+        let is_zip = self.controller.state.format == Format::Zip;
 
         ui.horizontal(|ui| {
             ui.label(s.format);
             egui::ComboBox::from_id_salt("fmt")
-                .selected_text(self.format.label())
+                .selected_text(self.controller.state.format.label())
                 .width(90.0)
                 .show_ui(ui, |ui| {
                     for f in [Format::Zip, Format::Tar, Format::TarGz] {
-                        ui.selectable_value(&mut self.format, f, f.label());
+                        ui.selectable_value(&mut self.controller.state.format, f, f.label());
                     }
                 });
             ui.add_space(8.0);
@@ -2631,7 +3500,7 @@ impl Arca {
                     .width(130.0)
                     .show_ui(ui, |ui| {
                         for (c, label) in &codecs {
-                            ui.selectable_value(&mut self.codec, *c, *label);
+                            ui.selectable_value(&mut self.controller.state.codec, *c, *label);
                         }
                     });
             });
@@ -2642,7 +3511,7 @@ impl Arca {
                 .width(100.0)
                 .show_ui(ui, |ui| {
                     for (l, label) in &levels {
-                        ui.selectable_value(&mut self.level, *l, *label);
+                        ui.selectable_value(&mut self.controller.state.level, *l, *label);
                     }
                 });
         });
@@ -2650,424 +3519,15 @@ impl Arca {
 
     // Everything out, beside the archive, without a word. What Alt+W does, and
     // the row menu offers the same thing where the hand already is.
-    fn extract_here(&mut self, ctx: &egui::Context) {
-        let Some(archive) = self.archive.clone() else {
-            return;
-        };
-        self.run_job(
-            ctx,
-            Job::Extract {
-                archives: vec![archive],
-                dest: if self.into_subfolder {
-                    Destination::Subfolder
-                } else {
-                    Destination::Beside
-                },
-                password: self.archive_password.clone(),
-            },
-        );
-    }
-
-    fn ask_extract(&mut self, ctx: &egui::Context, only_checked: bool) {
-        let s: &'static Strings = self.s();
-        let Some(archive) = self.archive.clone() else {
-            return;
-        };
-        let Some(mut dest) = rfd::FileDialog::new().pick_folder() else {
-            return;
-        };
-        if self.into_subfolder {
-            dest = dest.join(archive_stem(&archive));
-        }
-        let wanted: Vec<bool> = if only_checked {
-            self.checked.clone()
-        } else {
-            vec![true; self.entries.len()]
-        };
-        let total = wanted.iter().filter(|b| **b).count();
-        let pw = self.archive_password.clone();
-        self.close_when_done = false;
-        let (reply_tx, reply_rx) = channel::<Answer>();
-        self.replies = Some(reply_tx);
-        let ctx2 = ctx.clone();
-        self.spawn(ctx, total, move |tx| {
-            let notify = |i: usize, n: usize, name: &str| {
-                let _ = tx.send(Message::Progress(i, n, name.to_string()));
-                ctx2.request_repaint();
-            };
-            let ask = conflict_asker(tx, &ctx2, &reply_rx);
-            let _ = tx.send(
-                match extract(&archive, &dest, &wanted, &notify, &ask, pw.as_deref()) {
-                    Ok(bytes) => Message::Done(fill(
-                        s.extracted_to,
-                        &[
-                            ("size", &human(bytes)),
-                            ("dest", &dest.display().to_string()),
-                        ],
-                    )),
-                    Err(e) => Message::Failed(e.to_string()),
-                },
-            );
-        });
-    }
-
-    // Escape and the Cancel button are the same act, so they go through the
-    // same code: two copies of this would drift apart the first time one side
-    // grew a step.
-    // The names ticked right now, which is what every action that works on a
-    // selection needs.
-    fn selected_names(&self) -> Vec<String> {
-        self.entries
-            .iter()
-            .zip(&self.checked)
-            .filter(|(_, &on)| on)
-            .map(|(e, _)| e.name.clone())
-            .collect()
-    }
-
-    // The top of what is ticked. A folder with every one of its entries ticked
-    // stands for all of them, so a copy hands the clipboard one folder instead
-    // of the fifteen hundred files inside it, and the Explorer pastes a folder
-    // rather than a heap of loose files.
-    fn selected_roots(&self) -> Vec<String> {
-        let names: Vec<String> = self
-            .entries
-            .iter()
-            .map(|e| e.name.replace('\\', "/"))
-            .collect();
-        // Whether everything under a prefix is ticked, worked out once per
-        // prefix: the same ancestors come round again for every file in a
-        // folder, and there can be thousands of them.
-        let mut whole: HashMap<String, bool> = HashMap::new();
-        let mut roots: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-
-        for (i, full) in names.iter().enumerate() {
-            if !self.checked.get(i).copied().unwrap_or(false) {
-                continue;
-            }
-            let trimmed = full.trim_end_matches('/');
-            let mut root = trimmed.to_string();
-            // Shortest ancestor first: the outermost folder that is ticked all
-            // the way down is the one that was meant.
-            let mut at = 0usize;
-            while let Some(cut) = trimmed[at..].find('/') {
-                at += cut + 1;
-                let prefix = &trimmed[..at];
-                let all = *whole.entry(prefix.to_string()).or_insert_with(|| {
-                    names
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, n)| n.starts_with(prefix))
-                        .all(|(j, _)| self.checked.get(j).copied().unwrap_or(false))
-                });
-                if all {
-                    root = prefix.trim_end_matches('/').to_string();
-                    break;
-                }
-            }
-            if seen.insert(root.clone()) {
-                roots.push(root);
-            }
-        }
-        roots
-    }
-
-    // Ctrl+C and Ctrl+X. The clipboard carries paths, not archive entries, so
-    // what is picked is extracted into a folder of its own under the temporary
-    // directory first and those paths are what the shell is handed.
-    //
-    // A cut marks the rows and asks the shell to move rather than copy, which
-    // is what empties the temporary folder afterwards. It does not take the
-    // entries out of the archive: nothing tells this window whether the paste
-    // ever happened, and removing them on the guess that it did would lose them
-    // for good the moment somebody changed their mind.
-    fn copy_to_clipboard(&mut self, ctx: &egui::Context, cut: bool) {
-        let s: &'static Strings = self.s();
-        let Some(archive) = self.archive.clone() else {
-            return;
-        };
-        let roots = self.selected_roots();
-        if roots.is_empty() {
-            return;
-        }
-        // A folder of its own per copy, so the paths already on the clipboard
-        // never end up pointing at something a later copy overwrote.
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir()
-            .join("Arca")
-            .join(format!("clip-{stamp:x}"));
-        let previous = self.clip_dir.replace(dir.clone());
-        let names = self.selected_names();
-        // Before the old folder is thrown away further down: an earlier cut
-        // still waiting was watching for those files to disappear, and this is
-        // about to delete them itself.
-        self.cut_armed = None;
-        self.cut_pending = None;
-        self.cut_names = if cut {
-            names.iter().cloned().collect()
-        } else {
-            HashSet::new()
-        };
-        // Where each picked thing will land once extracted. Worked out here
-        // rather than in the thread because it is also what a pending cut has
-        // to watch, and only a .zip can have entries taken out of it in place.
-        let landed: Vec<PathBuf> = roots
-            .iter()
-            .filter_map(|r| arca_core::safe_name(r).ok())
-            .map(|r| dir.join(r))
-            .collect();
-        if cut && detect(&archive) == Some(Format::Zip) {
-            self.cut_armed = Some(Cut {
-                archive: archive.clone(),
-                paths: landed.clone(),
-                names,
-            });
-        }
-
-        let wanted = self.checked.clone();
-        let total = wanted.iter().filter(|b| **b).count();
-        let pw = self.archive_password.clone();
-        self.close_when_done = false;
-        let ctx2 = ctx.clone();
-        self.spawn(ctx, total, move |tx| {
-            let notify = |i: usize, n: usize, name: &str| {
-                let _ = tx.send(Message::Progress(i, n, name.to_string()));
-                ctx2.request_repaint();
-            };
-            // A folder nobody has seen yet has nothing in it to overwrite, so
-            // there is no question to put on screen.
-            let ask = |_: &Path| Answer::Replace;
-            let outcome = extract(&archive, &dir, &wanted, &notify, &ask, pw.as_deref())
-                .map_err(|e| e.to_string())
-                .and_then(|_| clipboard::set_files(&landed, cut).map(|()| landed.len()));
-            // Only once the new list is on the clipboard: until that moment the
-            // old paths are still what a paste would reach for.
-            if let Some(old) = previous {
-                let _ = fs::remove_dir_all(old);
-            }
-            let _ = tx.send(match outcome {
-                // Nothing to say. Copying somewhere else does not announce
-                // itself either, and the rows a cut is holding are already
-                // faded; what is worth a line is the entries leaving the
-                // archive, and that has its own. An empty message hands the
-                // status bar back to the summary of what is open.
-                Ok(_) => {
-                    if cut {
-                        let _ = tx.send(Message::CutReady);
-                    }
-                    Message::Done(String::new())
-                }
-                Err(why) => Message::Failed(fill(s.clipboard_failed, &[("why", &why)])),
-            });
-            ctx2.request_repaint();
-        });
-        // After `spawn`, which clears it: this is the one job that runs without
-        // saying so.
-        self.quiet = true;
-    }
-
-    // Whether the cut waiting on a paste has had it.
-    //
-    // Windows never says. What it does instead, when the clipboard asked for a
-    // move rather than a copy, is take the files out of the folder they were
-    // handed over in, so their absence is the whole of the evidence. It is
-    // checked when the window gets the keyboard back, because pasting somewhere
-    // else means having gone somewhere else first.
-    //
-    // Only all of them counts. A cut that is half gone is more likely to be a
-    // paste still running than one that finished, and leaving the entries where
-    // they are costs nothing: they will still be there next time. Every way
-    // this can be wrong leaves the archive untouched, which is the side to be
-    // wrong on when there is no undo.
-    fn cut_landed(&mut self, ctx: &egui::Context) {
-        let Some(cut) = &self.cut_pending else {
-            return;
-        };
-        if self.busy || self.archive.as_ref() != Some(&cut.archive) {
-            return;
-        }
-        if cut.paths.iter().any(|p| p.exists()) {
-            return;
-        }
-        let Some(cut) = self.cut_pending.take() else {
-            return;
-        };
-        self.cut_names.clear();
-        self.run_job(
-            ctx,
-            Job::Delete {
-                archive: cut.archive,
-                names: cut.names,
-                password: self.archive_password.clone(),
-            },
-        );
-    }
-
-    // What is picked, named the way it should land where it is dropped: the
-    // folder on screen is the base, so dragging a folder out puts that folder
-    // down rather than scattering what was inside it.
-    fn dragged_files(&self) -> Vec<(Entry, String)> {
-        let base = &self.current_dir;
-        self.entries
-            .iter()
-            .zip(&self.checked)
-            .filter(|(e, &on)| on && !e.is_dir)
-            .map(|(e, _)| {
-                let full = e.name.replace('\\', "/");
-                let rel = full.strip_prefix(base.as_str()).unwrap_or(&full);
-                (e.clone(), rel.replace('/', "\\"))
-            })
-            .filter(|(_, rel)| !rel.is_empty())
-            .collect()
-    }
-
-    // Dragging the selection out of the window. Blocks until it has been
-    // dropped or abandoned, because that is what `DoDragDrop` does: the window
-    // stops repainting for as long as the drag lasts, which nobody sees because
-    // the pointer is somewhere else by then.
-    //
-    // Nothing is extracted here. The shell is handed a list of names and sizes
-    // and asks for one file at a time while it is dropping, so a drag that is
-    // thought better of costs nothing, and a drag of six gigabytes starts as
-    // fast as a drag of one file.
-    #[cfg(windows)]
-    fn drag_out(&mut self, ctx: &egui::Context) {
-        let Some(archive) = self.archive.clone() else {
-            return;
-        };
-        let picked = self.dragged_files();
-        if picked.is_empty() {
-            return;
-        }
-        let items: Vec<arca_drag::Item> = picked
-            .iter()
-            .map(|(e, name)| arca_drag::Item {
-                name: name.clone(),
-                size: e.size,
-                mtime: e.mtime,
-            })
-            .collect();
-        let password = self.archive_password.clone();
-        let entries: Vec<Entry> = picked.into_iter().map(|(e, _)| e).collect();
-        let deliver = Box::new(move |i: usize| {
-            entries
-                .get(i)
-                .and_then(|e| extract_one(&archive, e, password.as_deref()).ok())
-        });
-        // Copy only. Moving would mean taking the entries out of the archive,
-        // and the one gesture that does that already asks first.
-        let _ = arca_drag::drag(items, deliver, false);
-        // However it ended -- dropped, or called off with Escape -- the button
-        // that started it went up somewhere this window never saw.
-        self.drag_settling = true;
-        self.band = None;
-        self.band_anchor = None;
-        self.band_scroll = None;
-        ctx.request_repaint();
-    }
-
-    #[cfg(not(windows))]
-    fn drag_out(&mut self, _ctx: &egui::Context) {}
-
-    // Ctrl+V: whatever files the shell is holding, into the folder on screen.
-    fn paste_from_clipboard(&mut self, ctx: &egui::Context) {
-        let Some(archive) = self.archive.clone() else {
-            return;
-        };
-        let here = fs::canonicalize(&archive).unwrap_or_else(|_| archive.clone());
-        // Pasting the archive into itself would have the rewrite reading the
-        // file it is replacing.
-        let inputs: Vec<PathBuf> = clipboard::files()
-            .into_iter()
-            .filter(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()) != here)
-            .collect();
-        if inputs.is_empty() {
-            self.notice = self.s().clipboard_empty.to_string();
-            self.error = true;
-            return;
-        }
-        self.add_files(ctx, inputs);
-    }
-
-    // Files from anywhere outside into the folder the window is showing. Both
-    // the paste and the drop end here so they cannot answer the same question
-    // two different ways.
-    fn add_files(&mut self, ctx: &egui::Context, inputs: Vec<PathBuf>) {
-        let Some(archive) = self.archive.clone() else {
-            return;
-        };
-        self.run_job(
-            ctx,
-            Job::Add {
-                archive,
-                inputs,
-                dir: self.current_dir.clone(),
-                codec: self.codec,
-                level: self.level,
-                password: self.archive_password.clone(),
-            },
-        );
-    }
-
-    // What a drop means depends on what the window is already showing. With
-    // nothing open there is only one thing it can be, and that is what it has
-    // always done: open it. With an archive open, dropping a file on it means
-    // putting the file inside, which is what every other archiver does and what
-    // opening a second archive over the first never was.
-    //
-    // The exception is dropping an archive onto an archive, which is honestly
-    // both, so it asks instead of picking one and being wrong half the time.
-    fn dropped(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
-        if paths.is_empty() {
-            return;
-        }
-        self.notice.clear();
-        self.error = false;
-        let open_first = |me: &mut Self, paths: Vec<PathBuf>| {
-            if let Some(p) = paths.into_iter().next() {
-                me.open(ctx, p);
-            }
-        };
-        let Some(archive) = self.archive.clone() else {
-            open_first(self, paths);
-            return;
-        };
-        let all_archives = paths.iter().all(|p| detect(p).is_some());
-        // Only a .zip can be added to in place. With a .tar open there is
-        // nothing to weigh up: an archive opens, and anything else has to say
-        // why it cannot go in rather than quietly do nothing.
-        if detect(&archive) != Some(Format::Zip) {
-            if all_archives {
-                open_first(self, paths);
-            } else {
-                self.notice = self.s().only_zip_can_change.to_string();
-                self.error = true;
-            }
-            return;
-        }
-        if all_archives {
-            self.confirm_drop = Some(paths);
-            return;
-        }
-        self.add_files(ctx, paths);
-    }
-
-    // A drop used to mean one thing and now means another, so while something
-    // is held over the window it says which. Guessing in silence is what made
-    // the old behaviour surprising in the first place.
     fn drop_hint(&self, ctx: &egui::Context) {
-        if !matches!(self.view, View::Browse)
-            || self.busy
+        if !matches!(self.controller.state.view, View::Browse)
+            || self.controller.state.busy
             || ctx.input(|i| i.raw.hovered_files.is_empty())
         {
             return;
         }
-        let s = self.s();
-        let text = match &self.archive {
+        let s = self.controller.s();
+        let text = match &self.controller.state.archive {
             Some(a) if detect(a) == Some(Format::Zip) => fill(
                 s.drop_to_add,
                 &[(
@@ -3093,13 +3553,14 @@ impl Arca {
             egui::Color32::WHITE,
         );
     }
-
     fn confirm_drop_window(&mut self, ctx: &egui::Context) {
-        let Some(paths) = self.confirm_drop.clone() else {
+        let Some(paths) = self.controller.state.confirm_drop.clone() else {
             return;
         };
-        let s = self.s();
+        let s = self.controller.s();
         let into = self
+            .controller
+            .state
             .archive
             .as_ref()
             .and_then(|a| a.file_name())
@@ -3145,16 +3606,16 @@ impl Arca {
                 ui.add_space(4.0);
             });
         if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.confirm_drop = None;
+            self.controller.state.confirm_drop = None;
         }
         if open_it {
-            self.confirm_drop = None;
+            self.controller.state.confirm_drop = None;
             if let Some(p) = paths.into_iter().next() {
-                self.open(ctx, p);
+                self.controller.open(p);
             }
         } else if add_it {
-            self.confirm_drop = None;
-            self.add_files(ctx, paths);
+            self.controller.state.confirm_drop = None;
+            self.controller.add_files(paths);
         }
     }
 
@@ -3162,10 +3623,10 @@ impl Arca {
     // archive to grow a feature it has not got are left out rather than made to
     // look present and do nothing.
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if !matches!(self.view, View::Browse)
-            || self.busy
-            || self.confirm_delete.is_some()
-            || self.confirm_drop.is_some()
+        if !matches!(self.controller.state.view, View::Browse)
+            || self.controller.state.busy
+            || self.controller.state.confirm_delete.is_some()
+            || self.controller.state.confirm_drop.is_some()
         {
             return;
         }
@@ -3221,59 +3682,56 @@ impl Arca {
                 // where the names as text went; it is also all a platform
                 // without a file clipboard can offer.
                 if shift || !clipboard::AVAILABLE {
-                    let names = self.selected_names();
+                    let names = self.controller.selected_names();
                     if !names.is_empty() {
                         ctx.copy_text(names.join("\r\n"));
                     }
                 } else {
-                    self.copy_to_clipboard(ctx, false);
+                    self.controller.copy_to_clipboard(false);
                 }
             }
             if cut && clipboard::AVAILABLE {
-                self.copy_to_clipboard(ctx, true);
+                self.controller.copy_to_clipboard(true);
             }
-            if paste && clipboard::AVAILABLE && self.archive.is_some() {
-                self.paste_from_clipboard(ctx);
+            if paste && clipboard::AVAILABLE && self.controller.state.archive.is_some() {
+                self.controller.paste_from_clipboard();
             }
         }
 
         if f5 && !typing {
-            if let Some(p) = self.archive.clone() {
-                let keep = self.archive_password.clone();
-                self.open(ctx, p);
-                self.archive_password = keep;
+            if let Some(p) = self.controller.state.archive.clone() {
+                let keep = self.controller.state.archive_password.clone();
+                self.controller.open(p);
+                self.controller.state.archive_password = keep;
             }
         }
         // The keypad's plus and minus, which is where WinRAR has kept picking a
         // group by name since before there were menus to put it in. Its third
         // one, the keypad star for inverting, cannot be told from any other
         // asterisk by the toolkit, so that one stays on Ctrl+I alone.
-        if (plus || minus) && !typing && self.archive.is_some() {
-            self.picking_group = Some(plus);
+        if (plus || minus) && !typing && self.controller.state.archive.is_some() {
+            self.controller.state.picking_group = Some(plus);
         }
         // Everything out, beside the archive, without asking where. The whole
         // point of it is that it is one keystroke: the folder the archive is in
         // is where an extraction goes nine times out of ten.
         if alt_w && !typing {
-            if let Some(archive) = self.archive.clone() {
-                self.run_job(
-                    ctx,
-                    Job::Extract {
-                        archives: vec![archive],
-                        dest: if self.into_subfolder {
-                            Destination::Subfolder
-                        } else {
-                            Destination::Beside
-                        },
-                        password: self.archive_password.clone(),
+            if let Some(archive) = self.controller.state.archive.clone() {
+                self.controller.run_job(Job::Extract {
+                    archives: vec![archive],
+                    dest: if self.controller.state.into_subfolder {
+                        Destination::Subfolder
+                    } else {
+                        Destination::Beside
                     },
-                );
+                    password: self.controller.state.archive_password.clone(),
+                });
             }
         }
-        if del && !typing && self.archive.is_some() {
-            let names = self.selected_names();
+        if del && !typing && self.controller.state.archive.is_some() {
+            let names = self.controller.selected_names();
             if !names.is_empty() {
-                self.confirm_delete = Some(names);
+                self.controller.state.confirm_delete = Some(names);
             }
         }
         if !ctrl {
@@ -3284,35 +3742,33 @@ impl Arca {
                 .add_filter("Archives", &["zip", "tar", "gz", "tgz"])
                 .pick_file()
             {
-                self.open(ctx, p);
+                self.controller.open(p);
             }
         }
-        if e && self.archive.is_some() {
-            self.ask_extract(ctx, false);
+        if e && self.controller.state.archive.is_some() {
+            self.controller.ask_extract(false);
         }
         // Verifying an archive is a job this program has had all along, reached
         // from the shell menu and from the command line, and from inside the
         // window there was no way to ask for it at all.
         if t {
-            if let Some(archive) = self.archive.clone() {
-                self.run_job(
-                    ctx,
-                    Job::Test {
-                        archive,
-                        only: None,
-                    },
-                );
+            if let Some(archive) = self.controller.state.archive.clone() {
+                self.controller.run_job(Job::Test {
+                    archive,
+                    only: None,
+                });
             }
         }
         if n {
             if let Some(files) = rfd::FileDialog::new().pick_files() {
                 if !files.is_empty() {
-                    self.output_name = quick_output(&files, self.format)
-                        .file_name()
-                        .map(|x| x.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    self.pending_inputs = files;
-                    self.view = View::Add;
+                    self.controller.state.output_name =
+                        quick_output(&files, self.controller.state.format)
+                            .file_name()
+                            .map(|x| x.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                    self.controller.state.pending_inputs = files;
+                    self.controller.state.view = View::Add;
                 }
             }
         }
@@ -3329,73 +3785,17 @@ impl Arca {
     // window does on a thread it does because it might take minutes; this is
     // capped at a size that comes back in the time between two frames, and a
     // progress window that flashes past is worse than a pause nobody notices.
-    fn view_entry(&mut self, index: usize) {
-        let Some(archive) = self.archive.clone() else {
-            return;
-        };
-        let Some(entry) = self.entries.get(index).cloned() else {
-            return;
-        };
-        let s = self.s();
-        if entry.is_dir {
-            return;
-        }
-        if entry.size > VIEW_LIMIT {
-            self.notice = fill(s.too_big_to_view, &[("size", &human(VIEW_LIMIT))]);
-            self.error = true;
-            return;
-        }
-        let mut bytes = Vec::with_capacity(entry.size as usize);
-        if let Err(e) = read_entry(
-            &archive,
-            index,
-            &mut bytes,
-            self.archive_password.as_deref(),
-        ) {
-            self.notice = e.to_string();
-            self.error = true;
-            return;
-        }
-
-        let name = entry.name.rsplit(['/', '\\']).next().unwrap_or(&entry.name);
-        // Asked once, and only of the names that claim to be pictures: handing
-        // every unknown file to a decoder to find out is a decoder run on
-        // whatever happens to be in the archive.
-        let picture = looks_like_picture(name)
-            && image::guess_format(&bytes).is_ok_and(|f| {
-                image::ImageReader::new(std::io::Cursor::new(&bytes))
-                    .with_guessed_format()
-                    .is_ok_and(|r| r.format() == Some(f))
-            });
-        let look = if picture {
-            Look::Picture
-        } else if looks_like_text(&bytes) {
-            Look::Text
-        } else {
-            Look::Hex
-        };
-        // Split now, once. The text is drawn a line at a time and only the
-        // lines on screen are laid out, so a log of a million lines opens as
-        // fast as a note of three.
-        let lines = String::from_utf8_lossy(&bytes)
-            .lines()
-            .map(|l| l.to_string())
-            .collect();
-        self.viewing = Some(Viewed {
-            name: name.to_string(),
-            bytes: bytes.into(),
-            look,
-            lines,
-            picture,
-        });
-    }
-
-    // The file being looked at, in its own window over the list.
     fn viewer_window(&mut self, ctx: &egui::Context) {
-        let Some(view) = &mut self.viewing else {
+        let Some(view) = &mut self.controller.state.viewing else {
             return;
         };
-        let s = i18n::strings(self.settings.lang.unwrap_or_else(Lang::from_system));
+        let s = i18n::strings(
+            self.controller
+                .state
+                .settings
+                .lang
+                .unwrap_or_else(Lang::from_system),
+        );
         let mut open = true;
         egui::Window::new(&view.name)
             .open(&mut open)
@@ -3467,7 +3867,7 @@ impl Arca {
                 }
             });
         if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.viewing = None;
+            self.controller.state.viewing = None;
         }
     }
 
@@ -3479,10 +3879,10 @@ impl Arca {
     // that folder and in the flat view it is the whole archive, which is what
     // "what is on screen" means either way.
     fn group_window(&mut self, ctx: &egui::Context) {
-        let Some(adding) = self.picking_group else {
+        let Some(adding) = self.controller.state.picking_group else {
             return;
         };
-        let s = self.s();
+        let s = self.controller.s();
         let mut go = false;
         let mut cancel = false;
         egui::Window::new(if adding {
@@ -3498,7 +3898,7 @@ impl Arca {
             ui.label(s.mask_hint);
             ui.add_space(6.0);
             let field = ui.add(
-                egui::TextEdit::singleline(&mut self.mask)
+                egui::TextEdit::singleline(&mut self.controller.state.mask)
                     .id(egui::Id::new("arca-mask"))
                     .desired_width(260.0),
             );
@@ -3529,27 +3929,26 @@ impl Arca {
             ui.add_space(4.0);
         });
         if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.picking_group = None;
+            self.controller.state.picking_group = None;
         }
         if go {
-            self.picking_group = None;
-            let mask = self.mask.trim().to_string();
+            self.controller.state.picking_group = None;
+            let mask = self.controller.state.mask.trim().to_string();
             if mask.is_empty() {
                 return;
             }
-            for row in self.visible_rows() {
+            for row in self.controller.visible_rows() {
                 if matches_mask(&mask, &row.label) {
-                    self.set_checked(&row, adding);
+                    self.controller.set_checked(&row, adding);
                 }
             }
         }
     }
-
     fn confirm_delete_window(&mut self, ctx: &egui::Context) {
-        let Some(names) = self.confirm_delete.clone() else {
+        let Some(names) = self.controller.state.confirm_delete.clone() else {
             return;
         };
-        let s = self.s();
+        let s = self.controller.s();
         let mut go = false;
         let mut cancel = false;
         egui::Window::new(s.delete_word)
@@ -3580,39 +3979,28 @@ impl Arca {
                 ui.add_space(4.0);
             });
         if cancel || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.confirm_delete = None;
+            self.controller.state.confirm_delete = None;
         }
         if go {
-            self.confirm_delete = None;
-            if let Some(archive) = self.archive.clone() {
-                self.run_job(
-                    ctx,
-                    Job::Delete {
-                        archive,
-                        names,
-                        password: self.archive_password.clone(),
-                    },
-                );
+            self.controller.state.confirm_delete = None;
+            if let Some(archive) = self.controller.state.archive.clone() {
+                self.controller.run_job(Job::Delete {
+                    archive,
+                    names,
+                    password: self.controller.state.archive_password.clone(),
+                });
             }
         }
     }
-
-    fn cancel_password(&mut self) {
-        let was_job = matches!(self.waiting_on_password, Some(Pending::Extract(_)));
-        self.waiting_on_password = None;
-        self.password_input.clear();
-        // Only a job left the window on the running view with nothing running.
-        if was_job {
-            self.view = View::Browse;
-        }
-    }
-
     fn password_window(&mut self, ctx: &egui::Context) {
-        if self.waiting_on_password.is_none() {
+        if self.controller.state.waiting_on_password.is_none() {
             return;
         }
-        let s = self.s();
-        let setting = matches!(self.waiting_on_password, Some(Pending::NewPassword(_)));
+        let s = self.controller.s();
+        let setting = matches!(
+            self.controller.state.waiting_on_password,
+            Some(Pending::NewPassword(_))
+        );
         let mut go = false;
         let mut cancel = false;
         egui::Window::new(if setting {
@@ -3637,15 +4025,15 @@ impl Arca {
                 // the window could only be dismissed with the mouse.
                 let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let field = ui.add(
-                    egui::TextEdit::singleline(&mut self.password_input)
-                        .password(!self.show_password)
+                    egui::TextEdit::singleline(&mut self.controller.state.password_input)
+                        .password(!self.controller.state.show_password)
                         .desired_width(240.0),
                 );
                 field.request_focus();
                 if enter {
                     go = true;
                 }
-                ui.checkbox(&mut self.show_password, s.show_password);
+                ui.checkbox(&mut self.controller.state.show_password, s.show_password);
             });
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -3660,63 +4048,53 @@ impl Arca {
         });
 
         if cancel {
-            self.cancel_password();
+            self.controller.cancel_password();
             return;
         }
-        if go && !self.password_input.is_empty() {
-            let given = std::mem::take(&mut self.password_input);
-            match self.waiting_on_password.take() {
+        if go && !self.controller.state.password_input.is_empty() {
+            let given = std::mem::take(&mut self.controller.state.password_input);
+            match self.controller.state.waiting_on_password.take() {
                 Some(Pending::Extract(job)) => {
                     if let Job::Extract { archives, dest, .. } = *job {
-                        self.run_job(
-                            ctx,
-                            Job::Extract {
-                                archives,
-                                dest,
-                                password: Some(given),
-                            },
-                        );
+                        self.controller.run_job(Job::Extract {
+                            archives,
+                            dest,
+                            password: Some(given),
+                        });
                     }
                 }
                 Some(Pending::CurrentPassword(job)) => {
                     if let Job::Password { archive, new, .. } = *job {
-                        self.archive_password = Some(given.clone());
-                        self.run_job(
-                            ctx,
-                            Job::Password {
-                                archive,
-                                current: Some(given),
-                                new,
-                            },
-                        );
+                        self.controller.state.archive_password = Some(given.clone());
+                        self.controller.run_job(Job::Password {
+                            archive,
+                            current: Some(given),
+                            new,
+                        });
                     }
                 }
-                Some(Pending::OpenArchive) => self.archive_password = Some(given),
+                Some(Pending::OpenArchive) => self.controller.state.archive_password = Some(given),
                 Some(Pending::NewPassword(job)) => {
                     if let Job::Password {
                         archive, current, ..
                     } = *job
                     {
-                        self.run_job(
-                            ctx,
-                            Job::Password {
-                                archive,
-                                current,
-                                new: Some(given),
-                            },
-                        );
+                        self.controller.run_job(Job::Password {
+                            archive,
+                            current,
+                            new: Some(given),
+                        });
                     }
                 }
                 None => {}
             }
         }
     }
-
     fn conflict_window(&mut self, ctx: &egui::Context) {
-        let Some(path) = self.conflict.clone() else {
+        let Some(path) = self.controller.state.conflict.clone() else {
             return;
         };
-        let s = self.s();
+        let s = self.controller.s();
         let mut chosen: Option<Answer> = None;
         egui::Window::new(s.conflict_title)
             .collapsible(false)
@@ -3760,10 +4138,10 @@ impl Arca {
                 ui.add_space(4.0);
             });
         if let Some(a) = chosen {
-            if let Some(tx) = &self.replies {
+            if let Some(tx) = &self.controller.state.replies {
                 let _ = tx.send(a);
             }
-            self.conflict = None;
+            self.controller.state.conflict = None;
         }
     }
 
@@ -3772,42 +4150,44 @@ impl Arca {
     // another, which is a lot of furniture above a list. The name of the file
     // moved to the title bar, where the name of the open document goes in every
     // other program, and the ticking buttons in beside the counts they act on.
-    fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let s = self.s();
+    fn toolbar(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        let s = self.controller.s();
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             // The password window is not modal on its own, so the toolbar behind
             // it has to be shut off: a click there would run with a password
             // that has not been given yet.
-            let idle = !self.busy && self.waiting_on_password.is_none();
-            let has = self.archive.is_some() && idle;
+            let idle =
+                !self.controller.state.busy && self.controller.state.waiting_on_password.is_none();
+            let has = self.controller.state.archive.is_some() && idle;
             ui.add_enabled_ui(idle, |ui| {
                 if tool_button(ui, glyphs::Glyph::Open, s.open, true, "Ctrl+O").clicked() {
                     if let Some(p) = rfd::FileDialog::new()
                         .add_filter("Archives", &["zip", "tar", "gz", "tgz"])
                         .pick_file()
                     {
-                        self.open(ctx, p);
+                        self.controller.open(p);
                     }
                 }
                 if tool_button(ui, glyphs::Glyph::Compress, s.compress, true, "Ctrl+N").clicked() {
                     if let Some(files) = rfd::FileDialog::new().pick_files() {
                         if !files.is_empty() {
-                            self.output_name = quick_output(&files, self.format)
-                                .file_name()
-                                .map(|x| x.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            self.pending_inputs = files;
-                            self.view = View::Add;
+                            self.controller.state.output_name =
+                                quick_output(&files, self.controller.state.format)
+                                    .file_name()
+                                    .map(|x| x.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                            self.controller.state.pending_inputs = files;
+                            self.controller.state.view = View::Add;
                         }
                     }
                 }
             });
             ui.separator();
             if tool_button(ui, glyphs::Glyph::ExtractAll, s.extract_all, has, "Ctrl+E").clicked() {
-                self.ask_extract(ctx, false);
+                self.controller.ask_extract(false);
             }
-            let n = self.checked.iter().filter(|b| **b).count();
+            let n = self.controller.state.checked.iter().filter(|b| **b).count();
             if tool_button(
                 ui,
                 glyphs::Glyph::ExtractPicked,
@@ -3817,12 +4197,12 @@ impl Arca {
             )
             .clicked()
             {
-                self.ask_extract(ctx, true);
+                self.controller.ask_extract(true);
             }
             ui.separator();
             // Only a .zip has anywhere to keep a password.
-            let zip = has && self.format == Format::Zip;
-            let encrypted = self.entries.iter().any(|e| e.encrypted);
+            let zip = has && self.controller.state.format == Format::Zip;
+            let encrypted = self.controller.state.entries.iter().any(|e| e.encrypted);
             let glyph = if encrypted {
                 glyphs::Glyph::Unlocked
             } else {
@@ -3834,27 +4214,27 @@ impl Arca {
                 s.set_password
             };
             if tool_button(ui, glyph, s.password_word, zip, tip).clicked() {
-                let archive = self.archive.clone().unwrap_or_default();
+                let archive = self.controller.state.archive.clone().unwrap_or_default();
                 if encrypted {
                     let job = Job::Password {
                         archive,
-                        current: self.archive_password.clone(),
+                        current: self.controller.state.archive_password.clone(),
                         new: None,
                     };
                     // Cancelling the question when the archive opened leaves us
                     // without it, so ask again instead of failing halfway
                     // through the rewrite.
-                    match self.archive_password {
-                        Some(_) => self.run_job(ctx, job),
+                    match self.controller.state.archive_password {
+                        Some(_) => self.controller.run_job(job),
                         None => {
-                            self.password_input.clear();
-                            self.waiting_on_password =
+                            self.controller.state.password_input.clear();
+                            self.controller.state.waiting_on_password =
                                 Some(Pending::CurrentPassword(Box::new(job)));
                         }
                     }
                 } else {
-                    self.password_input.clear();
-                    self.waiting_on_password =
+                    self.controller.state.password_input.clear();
+                    self.controller.state.waiting_on_password =
                         Some(Pending::NewPassword(Box::new(Job::Password {
                             archive,
                             current: None,
@@ -3888,7 +4268,8 @@ impl Arca {
                     if ui
                         .add_enabled(
                             has,
-                            egui::Button::new(s.flat_view).selected(self.settings.flat),
+                            egui::Button::new(s.flat_view)
+                                .selected(self.controller.state.settings.flat),
                         )
                         .clicked()
                     {
@@ -3897,7 +4278,8 @@ impl Arca {
                     if ui
                         .add_enabled(
                             has,
-                            egui::Button::new(s.folder_tree).selected(self.settings.tree),
+                            egui::Button::new(s.folder_tree)
+                                .selected(self.controller.state.settings.tree),
                         )
                         .clicked()
                     {
@@ -3905,9 +4287,9 @@ impl Arca {
                     }
                     // The archives opened lately. By name, with the whole path
                     // on hover: a menu of paths is a menu nobody reads.
-                    ui.add_enabled_ui(!self.settings.recent.is_empty(), |ui| {
+                    ui.add_enabled_ui(!self.controller.state.settings.recent.is_empty(), |ui| {
                         ui.menu_button(s.recent_word, |ui| {
-                            for path in self.settings.recent.clone() {
+                            for path in self.controller.state.settings.recent.clone() {
                                 let p = PathBuf::from(&path);
                                 let leaf = p
                                     .file_name()
@@ -3949,55 +4331,61 @@ impl Arca {
             );
             match wants {
                 Some(More::Test) => {
-                    if let Some(archive) = self.archive.clone() {
-                        self.run_job(
-                            ctx,
-                            Job::Test {
-                                archive,
-                                only: None,
-                            },
-                        );
+                    if let Some(archive) = self.controller.state.archive.clone() {
+                        self.controller.run_job(Job::Test {
+                            archive,
+                            only: None,
+                        });
                     }
                 }
                 Some(More::All) => {
-                    let rows = self.visible_rows();
+                    let rows = self.controller.visible_rows();
                     for r in &rows {
-                        self.set_checked(r, true);
+                        self.controller.set_checked(r, true);
                     }
                 }
                 Some(More::Invert) => {
-                    let rows = self.visible_rows();
-                    let flipped: Vec<bool> = rows.iter().map(|r| !self.is_checked(r)).collect();
+                    let rows = self.controller.visible_rows();
+                    let flipped: Vec<bool> = rows
+                        .iter()
+                        .map(|r| !self.controller.is_checked(r))
+                        .collect();
                     for (r, on) in rows.iter().zip(flipped) {
-                        self.set_checked(r, on);
+                        self.controller.set_checked(r, on);
                     }
                 }
                 Some(More::Flat) => {
-                    self.settings.flat = !self.settings.flat;
+                    self.controller.state.settings.flat = !self.controller.state.settings.flat;
                     // A flat list is a list of names with no folder over them,
                     // so the folder each one came from has to go somewhere. It
                     // is left on afterwards: turning the view off and on again
                     // should not keep undoing a column the user has since
                     // arranged.
-                    if self.settings.flat && !self.settings.columns.on(SortColumn::Path) {
-                        self.settings.columns.set(SortColumn::Path, true);
+                    if self.controller.state.settings.flat
+                        && !self.controller.state.settings.columns.on(SortColumn::Path)
+                    {
+                        self.controller
+                            .state
+                            .settings
+                            .columns
+                            .set(SortColumn::Path, true);
                     }
-                    self.clear_picked();
-                    self.cursor = None;
-                    self.settings.save();
+                    self.controller.clear_picked();
+                    self.controller.state.cursor = None;
+                    self.controller.state.settings.save();
                 }
                 Some(More::Tree) => {
-                    self.settings.tree = !self.settings.tree;
-                    self.settings.save();
+                    self.controller.state.settings.tree = !self.controller.state.settings.tree;
+                    self.controller.state.settings.save();
                 }
-                Some(More::Open(path)) => self.open(ctx, path),
+                Some(More::Open(path)) => self.controller.open(path),
                 Some(More::Forget) => {
-                    self.settings.recent.clear();
-                    self.settings.save();
+                    self.controller.state.settings.recent.clear();
+                    self.controller.state.settings.save();
                 }
-                Some(More::None_) => self.clear_picked(),
-                Some(More::Settings) => self.show_settings = true,
-                Some(More::Shortcuts) => self.show_shortcuts = true,
+                Some(More::None_) => self.controller.clear_picked(),
+                Some(More::Settings) => self.controller.state.show_settings = true,
+                Some(More::Shortcuts) => self.controller.state.show_shortcuts = true,
                 None => {}
             }
 
@@ -4011,7 +4399,7 @@ impl Arca {
                 let wide = ui.available_width();
                 ui.add_sized(
                     egui::vec2(wide, tall),
-                    egui::TextEdit::singleline(&mut self.filter)
+                    egui::TextEdit::singleline(&mut self.controller.state.filter)
                         .id(egui::Id::new("filter"))
                         .vertical_align(egui::Align::Center)
                         .hint_text(s.filter_hint),
@@ -4021,37 +4409,50 @@ impl Arca {
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            let at_root = self.current_dir.is_empty();
-            if tool_button(ui, glyphs::Glyph::Back, "", self.can_go_back(), s.back).clicked() {
-                self.go_back();
+            let at_root = self.controller.state.current_dir.is_empty();
+            if tool_button(
+                ui,
+                glyphs::Glyph::Back,
+                "",
+                self.controller.can_go_back(),
+                s.back,
+            )
+            .clicked()
+            {
+                self.controller.go_back();
             }
             if tool_button(
                 ui,
                 glyphs::Glyph::Forward,
                 "",
-                self.can_go_forward(),
+                self.controller.can_go_forward(),
                 s.forward,
             )
             .clicked()
             {
-                self.go_forward();
+                self.controller.go_forward();
             }
             if tool_button(ui, glyphs::Glyph::Up, "", !at_root, s.up).clicked() {
-                let parent = parent_of(&self.current_dir);
-                self.go_to(parent);
+                let parent = parent_of(&self.controller.state.current_dir);
+                self.controller.go_to(parent);
             }
             ui.add_space(4.0);
             // The count is measured and set aside before the path is drawn.
             // Laid out the other way round, a deep path took the whole row and
             // ran out over the top of it.
-            let tally = self.archive.is_some().then(|| {
-                let n = self.checked.iter().filter(|b| **b).count();
+            let tally = self.controller.state.archive.is_some().then(|| {
+                let n = self.controller.state.checked.iter().filter(|b| **b).count();
                 // The way out of the folder is not one of the things in it.
-                let shown = self.visible_rows().iter().filter(|r| !r.up).count();
+                let shown = self
+                    .controller
+                    .visible_rows()
+                    .iter()
+                    .filter(|r| !r.up)
+                    .count();
                 let all = format!(
                     "{shown} {} {} · {n} {}",
                     s.visible_of,
-                    self.entries.len(),
+                    self.controller.state.entries.len(),
                     s.checked
                 );
                 if n == 0 {
@@ -4061,9 +4462,11 @@ impl Arca {
                 // its status bar and it is the answer to the question anybody
                 // is asking before they extract something: how much is this.
                 let bytes: u64 = self
+                    .controller
+                    .state
                     .entries
                     .iter()
-                    .zip(&self.checked)
+                    .zip(&self.controller.state.checked)
                     .filter(|(_, &on)| on)
                     .map(|(e, _)| e.size)
                     .sum();
@@ -4095,10 +4498,12 @@ impl Arca {
     // of text with slashes in it. Each one takes you back to that level, which
     // is three clicks the Up arrow used to be needed for.
     fn breadcrumb(&mut self, ui: &mut egui::Ui, budget: f32) {
-        if self.archive.is_none() {
+        if self.controller.state.archive.is_none() {
             return;
         }
         let root = self
+            .controller
+            .state
             .archive
             .as_ref()
             .and_then(|a| a.file_name())
@@ -4106,7 +4511,13 @@ impl Arca {
             .unwrap_or_default();
         let mut crumbs: Vec<(String, String)> = vec![(root, String::new())];
         let mut walked = String::new();
-        for part in self.current_dir.split('/').filter(|p| !p.is_empty()) {
+        for part in self
+            .controller
+            .state
+            .current_dir
+            .split('/')
+            .filter(|p| !p.is_empty())
+        {
             walked.push_str(part);
             walked.push('/');
             crumbs.push((part.to_string(), walked.clone()));
@@ -4191,7 +4602,7 @@ impl Arca {
                 }
             });
         if let Some(path) = go {
-            self.go_to(path);
+            self.controller.go_to(path);
         }
     }
 
@@ -4199,10 +4610,10 @@ impl Arca {
     // this out short of reading the source, and a program whose shortcuts are a
     // secret may as well not have them.
     fn shortcuts_window(&mut self, ctx: &egui::Context) {
-        if !self.show_shortcuts {
+        if !self.controller.state.show_shortcuts {
             return;
         }
-        let s = self.s();
+        let s = self.controller.s();
         // `open` gives the window its own cross, which is one button fewer at
         // the bottom and one row less of height.
         let mut open = true;
@@ -4280,15 +4691,14 @@ impl Arca {
                 ui.add_space(2.0);
             });
         if !open {
-            self.show_shortcuts = false;
+            self.controller.state.show_shortcuts = false;
         }
     }
-
     fn settings_window(&mut self, ctx: &egui::Context) {
-        if !self.show_settings {
+        if !self.controller.state.show_settings {
             return;
         }
-        let s = self.s();
+        let s = self.controller.s();
         let mut open = true;
         egui::Window::new(s.settings)
             .open(&mut open)
@@ -4307,39 +4717,41 @@ impl Arca {
                 ui.add_space(6.0);
                 self.format_row(ui);
                 ui.add_space(6.0);
-                ui.checkbox(&mut self.into_subfolder, s.into_subfolder);
+                ui.checkbox(&mut self.controller.state.into_subfolder, s.into_subfolder);
                 ui.add_space(8.0);
             });
-        self.show_settings = open;
+        self.controller.state.show_settings = open;
     }
-
-    fn add_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let s = self.s();
+    fn add_view(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        let s = self.controller.s();
         ui.add_space(10.0);
         ui.heading(s.add_to_archive);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.label(s.output_name);
-            ui.add(egui::TextEdit::singleline(&mut self.output_name).desired_width(320.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.controller.state.output_name)
+                    .desired_width(320.0),
+            );
         });
         ui.add_space(6.0);
         self.format_row(ui);
         ui.add_space(6.0);
         // Only .zip has anywhere to put encryption, so the field is not offered
         // for the other two rather than accepted and quietly ignored.
-        if self.format == Format::Zip {
+        if self.controller.state.format == Format::Zip {
             ui.horizontal(|ui| {
                 ui.label(s.password_optional);
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.add_password)
-                        .password(!self.show_password)
+                    egui::TextEdit::singleline(&mut self.controller.state.add_password)
+                        .password(!self.controller.state.show_password)
                         .desired_width(220.0),
                 );
-                ui.checkbox(&mut self.show_password, s.show_password);
+                ui.checkbox(&mut self.controller.state.show_password, s.show_password);
             });
             ui.add_space(6.0);
         }
-        let count = self.pending_inputs.len();
+        let count = self.controller.state.pending_inputs.len();
         ui.label(format!(
             "{count} {}",
             if count == 1 {
@@ -4352,55 +4764,61 @@ impl Arca {
         ui.horizontal(|ui| {
             if ui.button(s.start).clicked() {
                 let dir = self
+                    .controller
+                    .state
                     .pending_inputs
                     .first()
                     .and_then(|p| p.parent())
                     .map(PathBuf::from)
                     .unwrap_or_default();
-                let mut name = self.output_name.trim().to_string();
+                let mut name = self.controller.state.output_name.trim().to_string();
                 if name.is_empty() {
-                    name = format!("archive.{}", self.format.extension());
+                    name = format!("archive.{}", self.controller.state.format.extension());
                 }
                 let job = Job::Compress {
                     out: dir.join(name),
-                    inputs: self.pending_inputs.clone(),
-                    format: self.format,
-                    codec: self.codec,
-                    level: self.level,
-                    password: if self.format == Format::Zip && !self.add_password.is_empty() {
-                        Some(self.add_password.clone())
+                    inputs: self.controller.state.pending_inputs.clone(),
+                    format: self.controller.state.format,
+                    codec: self.controller.state.codec,
+                    level: self.controller.state.level,
+                    password: if self.controller.state.format == Format::Zip
+                        && !self.controller.state.add_password.is_empty()
+                    {
+                        Some(self.controller.state.add_password.clone())
                     } else {
                         None
                     },
                 };
-                self.run_job(ctx, job);
+                self.controller.run_job(job);
             }
             if ui.button(s.cancel).clicked() {
-                self.view = View::Browse;
+                self.controller.state.view = View::Browse;
             }
         });
     }
-
     fn running_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let s = self.s();
+        let s = self.controller.s();
         ui.add_space(12.0);
-        ui.heading(&self.title);
+        ui.heading(&self.controller.state.title);
         ui.add_space(10.0);
 
-        let fraction = if self.total_count == 0 {
+        let fraction = if self.controller.state.total_count == 0 {
             0.0
         } else {
-            self.done_count as f32 / self.total_count as f32
+            self.controller.state.done_count as f32 / self.controller.state.total_count as f32
         };
         ui.add(
             egui::ProgressBar::new(fraction)
-                .text(format!("{} / {}", self.done_count, self.total_count))
+                .text(format!(
+                    "{} / {}",
+                    self.controller.state.done_count, self.controller.state.total_count
+                ))
                 .desired_width(ui.available_width()),
         );
         ui.add_space(6.0);
-        ui.label(egui::RichText::new(&self.current_file).weak());
+        ui.label(egui::RichText::new(&self.controller.state.current_file).weak());
 
-        if let Some(t) = self.started {
+        if let Some(t) = self.controller.state.started {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(format!("{:.1} s", t.elapsed().as_secs_f64()))
@@ -4409,16 +4827,23 @@ impl Arca {
             );
         }
 
-        if !self.busy {
+        if !self.controller.state.busy {
             ui.add_space(12.0);
-            let color = if self.error {
+            let color = if self.controller.state.error {
                 egui::Color32::from_rgb(220, 90, 90)
             } else {
                 ui.visuals().text_color()
             };
-            ui.colored_label(color, if self.error { s.failed } else { s.done });
+            ui.colored_label(
+                color,
+                if self.controller.state.error {
+                    s.failed
+                } else {
+                    s.done
+                },
+            );
             ui.add_space(4.0);
-            ui.label(&self.notice);
+            ui.label(&self.controller.state.notice);
             ui.add_space(12.0);
             if ui.button(s.close).clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -4432,58 +4857,6 @@ impl Arca {
     // name and not a path, nothing else in this folder is already called that,
     // and a rename to the same name is not a rewrite of the whole archive for
     // nothing. Anything else the zip will refuse on its own and say so.
-    fn rename_to(&mut self, ctx: &egui::Context, rows: &[Row], path: &str, name: &str) {
-        let Some(row) = rows.iter().find(|r| r.path == path) else {
-            return;
-        };
-        if name == row.label {
-            return;
-        }
-        let s = self.s();
-        if name.is_empty() || name.contains('/') || name.contains('\\') {
-            self.notice = s.bad_name.to_string();
-            self.error = true;
-            return;
-        }
-        // Only against what is in this folder: the same name elsewhere in the
-        // archive is somebody else's business.
-        if rows
-            .iter()
-            .any(|r| r.path != path && r.label.eq_ignore_ascii_case(name))
-        {
-            self.notice = fill(s.name_taken, &[("name", name)]);
-            self.error = true;
-            return;
-        }
-        let to = match path.rsplit_once('/') {
-            Some((parent, _)) => format!("{parent}/{name}"),
-            None => name.to_string(),
-        };
-        let Some(archive) = self.archive.clone() else {
-            return;
-        };
-        self.run_job(
-            ctx,
-            Job::Rename {
-                archive,
-                from: path.to_string(),
-                to,
-                folder: row.is_dir,
-                password: self.archive_password.clone(),
-            },
-        );
-    }
-
-    // The rule between two columns, and the handle that moves it.
-    //
-    // The handle is a hand's width either side of the rule and only as tall as
-    // the header, which is where every list of files on the machine puts it.
-    // The table's own went from the header to the foot of the list, so six
-    // columns meant six invisible strips down the length of it and a press
-    // near any of them was a column edge rather than the start of a selection.
-    // The rule is still drawn the whole way down: that is what tells you which
-    // number belongs under which heading halfway down a page.
-    #[allow(clippy::too_many_arguments)]
     fn column_edges(
         &mut self,
         ui: &mut egui::Ui,
@@ -4526,7 +4899,7 @@ impl Arca {
             }
             if resp.dragged() {
                 if let Some(slot) = slots.get(i - 1).copied() {
-                    if let Some(width) = self.settings.widths.get_mut(slot) {
+                    if let Some(width) = self.controller.state.settings.widths.get_mut(slot) {
                         *width = (*width + resp.drag_delta().x).max(Settings::least(slot));
                     }
                 }
@@ -4539,18 +4912,18 @@ impl Arca {
                 if let (Some(slot), Some(which)) =
                     (slots.get(i - 1).copied(), cols.get(i - 1).copied())
                 {
-                    if let Some(width) = self.settings.widths.get_mut(slot) {
+                    if let Some(width) = self.controller.state.settings.widths.get_mut(slot) {
                         *width =
                             natural_width(ui, rows, which, s).clamp(Settings::least(slot), 640.0);
                     }
                 }
-                self.settings.save();
+                self.controller.state.settings.save();
             }
             // Written when the hand lets go rather than on the way, so that
             // pulling an edge across the window is one visit to the disk and
             // not one per frame.
             if resp.drag_stopped() {
-                self.settings.save();
+                self.controller.state.settings.save();
             }
             let stroke = if resp.dragged() {
                 ui.visuals().widgets.active.bg_stroke
@@ -4718,16 +5091,16 @@ impl Arca {
         // as far as the toolkit knows. Nothing happens until it comes up for
         // real; the press that is still on the books belongs to a gesture that
         // is over.
-        if self.drag_settling {
+        if self.controller.state.drag_settling {
             self.band = None;
-            self.band_anchor = None;
-            self.band_scroll = None;
+            self.controller.state.band_anchor = None;
+            self.controller.state.band_scroll = None;
             // Cleared by the button coming up, and also by a fresh press, in
             // case the release happened over somebody else's window and this
             // one never hears about it. Either way the gesture that
             // `DoDragDrop` swallowed is over.
             if !down || ui.input(|i| i.pointer.any_pressed()) {
-                self.drag_settling = false;
+                self.controller.state.drag_settling = false;
             }
             return;
         }
@@ -4739,8 +5112,8 @@ impl Arca {
         // the thing being dragged, so this cannot turn off what it is for.
         if !down || ui.ctx().dragged_id().is_some() {
             self.band = None;
-            self.band_anchor = None;
-            self.band_scroll = None;
+            self.controller.state.band_anchor = None;
+            self.controller.state.band_scroll = None;
             return;
         }
         // `viewport` is the scrolling part alone, so the header is already out
@@ -4772,18 +5145,20 @@ impl Arca {
             // is the only one that lets both gestures share a button. Ctrl and
             // Shift are for adding to a selection, never for carrying it.
             let shift = ui.input(|i| i.modifiers.shift);
-            let picked = anchor < visible.len() && self.is_checked(&visible[anchor]);
-            self.drag_ready = (picked && !ctrl && !shift).then_some(anchor);
+            let picked = anchor < visible.len() && self.controller.is_checked(&visible[anchor]);
+            self.controller.state.drag_ready = (picked && !ctrl && !shift).then_some(anchor);
             self.band = origin;
-            self.band_anchor = Some(anchor);
-            self.band_base = if ctrl {
-                self.checked.clone()
+            self.controller.state.band_anchor = Some(anchor);
+            self.controller.state.band_base = if ctrl {
+                self.controller.state.checked.clone()
             } else {
-                vec![false; self.checked.len()]
+                vec![false; self.controller.state.checked.len()]
             };
         }
 
-        let (Some(start), Some(here), Some(anchor)) = (self.band, now, self.band_anchor) else {
+        let (Some(start), Some(here), Some(anchor)) =
+            (self.band, now, self.controller.state.band_anchor)
+        else {
             return;
         };
         // A click is a drag of no distance. Under this it is left alone, so
@@ -4798,12 +5173,12 @@ impl Arca {
 
         // Far enough to be a gesture, and it began on something picked: the
         // selection is being carried out of the window, not redrawn.
-        if self.drag_ready.take().is_some() {
+        if self.controller.state.drag_ready.take().is_some() {
             self.band = None;
-            self.band_anchor = None;
-            self.band_scroll = None;
-            let ctx = ui.ctx().clone();
-            self.drag_out(&ctx);
+            self.controller.state.band_anchor = None;
+            self.controller.state.band_scroll = None;
+            let _ctx = ui.ctx().clone();
+            self.controller.drag_out();
             return;
         }
 
@@ -4818,9 +5193,10 @@ impl Arca {
             0.0
         };
         if over == 0.0 {
-            self.band_scroll = None;
+            self.controller.state.band_scroll = None;
         } else {
-            self.band_scroll = Some((offset + over.clamp(-24.0, 24.0)).clamp(0.0, reach));
+            self.controller.state.band_scroll =
+                Some((offset + over.clamp(-24.0, 24.0)).clamp(0.0, reach));
             // Nothing else is moving, so without this the list would take one
             // step per stray mouse event instead of running.
             ui.ctx().request_repaint();
@@ -4837,12 +5213,15 @@ impl Arca {
         } else {
             (head, anchor)
         };
-        self.checked.clone_from(&self.band_base);
+        self.controller
+            .state
+            .checked
+            .clone_from(&self.controller.state.band_base);
         // Both ends past the last row means the band is entirely in the empty
         // space under the list, and has reached nothing.
         if lo < visible.len() {
             for row in &visible[lo..=hi.min(visible.len() - 1)] {
-                self.set_checked(row, true);
+                self.controller.set_checked(row, true);
             }
         }
 
@@ -4892,73 +5271,15 @@ impl Arca {
             theme::cursor(ui.visuals()),
         );
     }
-
-    fn set_checked(&mut self, row: &Row, value: bool) {
-        // Nothing behind it, and its path is the folder above: ticking it would
-        // pick everything in the archive up to and including where you came
-        // from. Select all has to leave it alone.
-        if row.up {
-            return;
-        }
-        match row.entry {
-            Some(i) => self.checked[i] = value,
-            None => {
-                for i in entries_under(&self.entries, &row.path) {
-                    self.checked[i] = value;
-                }
-            }
-        }
-    }
-
-    // Double clicking a file pulls that one entry out to a temporary folder and
-    // hands it to whatever the system opens it with. It runs on its own thread
-    // because the entry can be large, and reports through the same progress
-    // window as everything else.
-    fn open_file(&mut self, ctx: &egui::Context, index: usize) {
-        let Some(archive) = self.archive.clone() else {
-            return;
-        };
-        let Some(entry) = self.entries.get(index).cloned() else {
-            return;
-        };
-        if entry.is_dir {
-            return;
-        }
-        let password = self.archive_password.clone();
-        let s = self.s();
-        let ctx2 = ctx.clone();
-        self.close_when_done = false;
-        self.title = s.opening.to_string();
-        self.view = View::Running;
-        self.spawn(ctx, 1, move |tx| {
-            let _ = tx.send(Message::Progress(0, 1, entry.name.clone()));
-            ctx2.request_repaint();
-            let outcome = extract_one(&archive, &entry, password.as_deref())
-                .and_then(|path| launch_with_system(&path).map(|()| path));
-            let _ = tx.send(match outcome {
-                Ok(path) => Message::Done(fill(
-                    s.opened_with_system,
-                    &[("name", &path.display().to_string())],
-                )),
-                Err(e) => Message::Failed(e.to_string()),
-            });
-            ctx2.request_repaint();
-        });
-    }
-
-    // Everything the keyboard does to the list, in one place. `rows` is what is
-    // on screen right now, which is what the arrows should walk: filtering or
-    // changing folder changes the list under the cursor, so it is clamped here
-    // rather than tracked separately.
     fn keyboard(&mut self, ctx: &egui::Context, rows: &[Row]) {
         // The box that picks a group by name has just opened and does not have
         // the keyboard yet. The key that opened it is still in this frame, and
         // a minus is a character the list would otherwise jump to.
-        if self.picking_group.is_some() {
+        if self.controller.state.picking_group.is_some() {
             return;
         }
         if rows.is_empty() {
-            self.cursor = None;
+            self.controller.state.cursor = None;
             return;
         }
         // A text box has the keyboard: the filter field, or a dialog. Arrows
@@ -4981,7 +5302,7 @@ impl Arca {
         let mut look = false;
 
         ctx.input(|i| {
-            let at = self.cursor.unwrap_or(0);
+            let at = self.controller.state.cursor.unwrap_or(0);
             shift = i.modifiers.shift;
             check_all = i.modifiers.command && i.key_pressed(egui::Key::A);
             invert = i.modifiers.command && i.key_pressed(egui::Key::I);
@@ -4999,7 +5320,11 @@ impl Arca {
                     if i.key_pressed(key) {
                         // The first press only lands the cursor somewhere
                         // visible instead of jumping a row from nowhere.
-                        moved = Some(if self.cursor.is_none() { 0 } else { to });
+                        moved = Some(if self.controller.state.cursor.is_none() {
+                            0
+                        } else {
+                            to
+                        });
                     }
                 }
             }
@@ -5026,17 +5351,20 @@ impl Arca {
         // picked and let go of what was, which is how you pick everything but
         // the handful you can see.
         if invert {
-            let flipped: Vec<bool> = rows.iter().map(|r| !self.is_checked(r)).collect();
+            let flipped: Vec<bool> = rows
+                .iter()
+                .map(|r| !self.controller.is_checked(r))
+                .collect();
             for (r, on) in rows.iter().zip(flipped) {
-                self.set_checked(r, on);
+                self.controller.set_checked(r, on);
             }
             return;
         }
 
         if check_all {
-            let value = rows.iter().any(|r| !self.is_checked(r));
+            let value = rows.iter().any(|r| !self.controller.is_checked(r));
             for r in rows {
-                self.set_checked(r, value);
+                self.controller.set_checked(r, value);
             }
             return;
         }
@@ -5045,13 +5373,13 @@ impl Arca {
         // round, so pressing the same letter walks through the matches.
         if !typed.is_empty() && typed != " " {
             let needle = typed.to_lowercase();
-            let from = self.cursor.map_or(0, |c| c + 1);
+            let from = self.controller.state.cursor.map_or(0, |c| c + 1);
             let hit = (0..rows.len())
                 .map(|n| (from + n) % rows.len())
                 .find(|&n| rows[n].label.to_lowercase().starts_with(&needle));
             if let Some(n) = hit {
-                self.cursor = Some(n);
-                self.scroll_to_cursor = true;
+                self.controller.state.cursor = Some(n);
+                self.controller.state.scroll_to_cursor = true;
                 return;
             }
         }
@@ -5060,23 +5388,25 @@ impl Arca {
             // Shift drags the ticks along with the cursor, so a run of files
             // can be picked without reaching for the mouse.
             if shift {
-                let from = self.cursor.unwrap_or(to);
+                let from = self.controller.state.cursor.unwrap_or(to);
                 let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
                 for r in &rows[lo..=hi] {
-                    self.set_checked(r, true);
+                    self.controller.set_checked(r, true);
                 }
             }
-            self.cursor = Some(to);
-            self.scroll_to_cursor = true;
+            self.controller.state.cursor = Some(to);
+            self.controller.state.scroll_to_cursor = true;
         }
 
-        if up_level && !self.current_dir.is_empty() {
-            let parent = parent_of(&self.current_dir);
-            self.go_to(parent);
+        if up_level && !self.controller.state.current_dir.is_empty() {
+            let parent = parent_of(&self.controller.state.current_dir);
+            self.controller.go_to(parent);
             return;
         }
 
-        let Some(at) = self.cursor else { return };
+        let Some(at) = self.controller.state.cursor else {
+            return;
+        };
         let Some(row) = rows.get(at) else { return };
 
         // F2 opens the name for editing where it stands, which is what it does
@@ -5087,102 +5417,44 @@ impl Arca {
         // what Alt+V has always done in WinRAR.
         if look {
             if let Some(i) = row.entry {
-                self.view_entry(i);
+                self.controller.view_entry(i);
             }
             return;
         }
-        if rename && self.format == Format::Zip && !row.up {
-            self.renaming = Some((row.path.clone(), row.label.clone()));
-            self.rename_fresh = true;
+        if rename && self.controller.state.format == Format::Zip && !row.up {
+            self.controller.state.renaming = Some((row.path.clone(), row.label.clone()));
+            self.controller.state.rename_fresh = true;
             return;
         }
         if space {
-            let value = !self.is_checked(row);
-            self.set_checked(row, value);
+            let value = !self.controller.is_checked(row);
+            self.controller.set_checked(row, value);
         }
         if enter {
             if row.is_dir {
                 let path = row.path.clone();
-                self.go_to(path);
+                self.controller.go_to(path);
             } else if let Some(i) = row.entry {
-                self.open_file(ctx, i);
+                self.controller.open_file(i);
             }
         }
     }
 
     // Going somewhere new drops whatever was ahead in the history, the way a
     // browser does. Re-entering the folder already showing is not a move.
-    fn go_to(&mut self, path: String) {
-        if self.history.get(self.here) == Some(&path) {
-            return;
-        }
-        self.history.truncate(self.here + 1);
-        self.history.push(path.clone());
-        self.here = self.history.len() - 1;
-        self.current_dir = path;
-        self.filter.clear();
-        self.clear_picked();
-    }
-
-    // Every folder starts with nothing picked, the way the Explorer does.
-    // A folder is picked here by ticking every entry underneath it, which is
-    // what lets one be extracted whole, so clicking a folder and walking into
-    // it used to arrive with all of its contents already ticked.
-    fn clear_picked(&mut self) {
-        self.checked.iter_mut().for_each(|c| *c = false);
-        self.cursor = None;
-        // A row number means something else in the folder now on screen.
-        self.last_click = None;
-    }
-
-    fn can_go_back(&self) -> bool {
-        self.here > 0
-    }
-
-    fn can_go_forward(&self) -> bool {
-        self.here + 1 < self.history.len()
-    }
-
-    fn go_back(&mut self) {
-        if self.can_go_back() {
-            self.here -= 1;
-            self.current_dir = self.history[self.here].clone();
-            self.filter.clear();
-            self.clear_picked();
-        }
-    }
-
-    fn go_forward(&mut self) {
-        if self.can_go_forward() {
-            self.here += 1;
-            self.current_dir = self.history[self.here].clone();
-            self.filter.clear();
-            self.clear_picked();
-        }
-    }
-
-    fn is_checked(&self, row: &Row) -> bool {
-        // The way out of the folder is not a thing that can be picked.
-        if row.up {
-            return false;
-        }
-        match row.entry {
-            Some(i) => self.checked[i],
-            None => {
-                let under = entries_under(&self.entries, &row.path);
-                !under.is_empty() && under.iter().all(|&i| self.checked[i])
-            }
-        }
-    }
-
     fn table(&mut self, ui: &mut egui::Ui) {
-        let s = self.s();
-        let visible = self.visible_rows();
+        let s = self.controller.s();
+        let visible = self.controller.visible_rows();
         // Before the table is drawn, so a move this frame is painted this
         // frame rather than one behind.
         self.keyboard(ui.ctx(), &visible);
-        if self.cursor.is_some_and(|c| c >= visible.len()) {
-            self.cursor = if visible.is_empty() {
+        if self
+            .controller
+            .state
+            .cursor
+            .is_some_and(|c| c >= visible.len())
+        {
+            self.controller.state.cursor = if visible.is_empty() {
                 None
             } else {
                 Some(visible.len() - 1)
@@ -5196,7 +5468,7 @@ impl Arca {
         // `clicked` so that right clicking something picks it, and a right
         // click is not half of a double click.
         let mut left_click: Option<usize> = None;
-        let columns = self.settings.columns;
+        let columns = self.controller.state.settings.columns;
         // The ones on, in the order they are drawn. The header, the cells and
         // the column widths all walk this same list, so they cannot drift.
         let shown: Vec<SortColumn> = Columns::ALL
@@ -5232,13 +5504,20 @@ impl Arca {
         // The rename in progress, unpacked into pieces the row closure can hold
         // while the table still has `self`. `finish` is how the box says it is
         // done: yes to keep what was typed, no to throw it away.
-        let editing: Option<String> = self.renaming.as_ref().map(|(p, _)| p.clone());
+        let editing: Option<String> = self
+            .controller
+            .state
+            .renaming
+            .as_ref()
+            .map(|(p, _)| p.clone());
         let typing = std::cell::RefCell::new(
-            self.renaming
+            self.controller
+                .state
+                .renaming
                 .as_ref()
                 .map_or(String::new(), |(_, t)| t.clone()),
         );
-        let fresh = std::cell::Cell::new(self.rename_fresh);
+        let fresh = std::cell::Cell::new(self.controller.state.rename_fresh);
         let finish: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
         let wants_rename = std::cell::Cell::new(false);
         let wants_copy_names = std::cell::Cell::new(false);
@@ -5256,8 +5535,8 @@ impl Arca {
         let mut icons = std::mem::take(&mut self.icons);
         // A RefCell rather than a plain take: the cell closures are handed out one
         // per column and two of them would otherwise want the same &mut.
-        let types = std::cell::RefCell::new(std::mem::take(&mut self.types));
-        let order = self.order;
+        let types = std::cell::RefCell::new(std::mem::take(&mut self.controller.state.types));
+        let order = self.controller.state.order;
         let hint = s.sort_hint;
         // The whole header cell answers, not the four letters of the name:
         // aiming at the text to sort by a column is a nuisance, and the cell is
@@ -5362,12 +5641,17 @@ impl Arca {
             builder = if n + 1 == slots.len() {
                 builder.column(Column::remainder().at_least(CELL_LEAST))
             } else {
-                builder.column(Column::exact(self.settings.widths[*slot]))
+                builder.column(Column::exact(self.controller.state.settings.widths[*slot]))
             };
         }
         // Set only while a selection drag has run off the end of the list, so
         // the rest of the time the table keeps its own scroll position.
-        if let Some(y) = self.band_scroll.or(self.wheel.map(|w| w.at)) {
+        if let Some(y) = self
+            .controller
+            .state
+            .band_scroll
+            .or(self.wheel.map(|w| w.at))
+        {
             builder = builder.vertical_scroll_offset(y);
         }
 
@@ -5418,7 +5702,7 @@ impl Arca {
                     // way WinRAR and the Explorer do it. Highlighting only the
                     // row the keyboard was on said nothing about what the
                     // buttons were going to act on.
-                    row.set_selected(self.is_checked(r));
+                    row.set_selected(self.controller.is_checked(r));
                     // The table works out which row the pointer is over, keeps
                     // it, and tints it on the next frame. One frame late is
                     // fine while the pointer is only passing over rows, and is
@@ -5429,9 +5713,13 @@ impl Arca {
                     if pressing {
                         row.set_hovered(false);
                     }
-                    let cut = self.cut_names.contains(&r.path)
-                        || r.entry
-                            .is_some_and(|i| self.cut_names.contains(&self.entries[i].name));
+                    let cut = self.controller.state.cut_names.contains(&r.path)
+                        || r.entry.is_some_and(|i| {
+                            self.controller
+                                .state
+                                .cut_names
+                                .contains(&self.controller.state.entries[i].name)
+                        });
                     row.col(|ui| {
                         // The system icon when the desktop has one, and the
                         // drawn one when it does not, which is every platform
@@ -5584,10 +5872,10 @@ impl Arca {
                             ui.menu_button(s.sort_by, |ui| {
                                 for which in std::iter::once(SortColumn::Name).chain(shown.clone())
                                 {
-                                    let on = self.order.0 == which;
+                                    let on = self.controller.state.order.0 == which;
                                     let arrow = if !on {
                                         ""
-                                    } else if self.order.1 {
+                                    } else if self.controller.state.order.1 {
                                         " \u{25B2}"
                                     } else {
                                         " \u{25BC}"
@@ -5602,7 +5890,7 @@ impl Arca {
                             ui.separator();
                             // Only a zip can be written to, so anywhere else this
                             // is left out rather than offered and refused.
-                            if self.format == Format::Zip
+                            if self.controller.state.format == Format::Zip
                                 && ui.button(format!("{}	F2", s.rename_word)).clicked()
                             {
                                 clicked = Some(idx);
@@ -5655,31 +5943,33 @@ impl Arca {
                         left_click = Some(idx);
                     }
                     row_rects.push((idx, resp.rect));
-                    if self.cursor == Some(idx) {
+                    if self.controller.state.cursor == Some(idx) {
                         cursor_rect.set(Some(resp.rect));
                     }
                     // Only when the keyboard moved it: doing this every frame
                     // would fight the scroll wheel.
-                    if self.scroll_to_cursor && self.cursor == Some(idx) {
+                    if self.controller.state.scroll_to_cursor
+                        && self.controller.state.cursor == Some(idx)
+                    {
                         resp.scroll_to_me(Some(egui::Align::Center));
                     }
                 });
             });
 
         self.icons = icons;
-        self.types = types.into_inner();
-        self.scroll_to_cursor = false;
+        self.controller.state.types = types.into_inner();
+        self.controller.state.scroll_to_cursor = false;
 
         // Everything the two menus asked for, now that the table has let go of
         // self. Turning a column off is not allowed to leave the list with
         // nothing but names to look at, so the last one stays.
         if let Some(which) = toggle_column.get() {
-            let mut c = self.settings.columns;
+            let mut c = self.controller.state.settings.columns;
             let turning_off = c.on(which);
             if !turning_off || shown.len() > 1 {
                 c.set(which, !turning_off);
-                self.settings.columns = c;
-                self.settings.save();
+                self.controller.state.settings.columns = c;
+                self.controller.state.settings.save();
             }
         }
 
@@ -5691,23 +5981,27 @@ impl Arca {
             let mods = ui.input(|i| i.modifiers);
             let target = visible[index].clone();
             if mods.command {
-                let value = !self.is_checked(&target);
-                self.set_checked(&target, value);
+                let value = !self.controller.is_checked(&target);
+                self.controller.set_checked(&target, value);
             } else if mods.shift {
-                let from = self.cursor.unwrap_or(index);
+                let from = self.controller.state.cursor.unwrap_or(index);
                 let (lo, hi) = if from <= index {
                     (from, index)
                 } else {
                     (index, from)
                 };
                 for r in &visible[lo..=hi] {
-                    self.set_checked(r, true);
+                    self.controller.set_checked(r, true);
                 }
             } else {
-                self.checked.iter_mut().for_each(|c| *c = false);
-                self.set_checked(&target, true);
+                self.controller
+                    .state
+                    .checked
+                    .iter_mut()
+                    .for_each(|c| *c = false);
+                self.controller.set_checked(&target, true);
             }
-            self.cursor = Some(index);
+            self.controller.state.cursor = Some(index);
         }
 
         // Opening keeps its own count of clicks rather than asking egui whether
@@ -5721,9 +6015,11 @@ impl Arca {
             let (now, plain) = ui.input(|i| (i.time, !i.modifiers.command && !i.modifiers.shift));
             let again = plain
                 && self
+                    .controller
+                    .state
                     .last_click
                     .is_some_and(|(i, t)| i == index && now - t < DOUBLE_CLICK);
-            self.last_click = if again { None } else { Some((index, now)) };
+            self.controller.state.last_click = if again { None } else { Some((index, now)) };
             if again {
                 opened = Some(index);
             }
@@ -5731,11 +6027,11 @@ impl Arca {
 
         if wants_select_all.get() {
             for r in &visible {
-                self.set_checked(r, true);
+                self.controller.set_checked(r, true);
             }
         }
         if wants_copy_names.get() {
-            let names = self.selected_names();
+            let names = self.controller.selected_names();
             if !names.is_empty() {
                 ui.ctx().copy_text(names.join(
                     "
@@ -5744,66 +6040,63 @@ impl Arca {
             }
         }
         if wants_delete.get() {
-            let names = self.selected_names();
+            let names = self.controller.selected_names();
             if !names.is_empty() {
-                self.confirm_delete = Some(names);
+                self.controller.state.confirm_delete = Some(names);
             }
         }
         // The menu asked for a rename of the row it was opened on.
         if wants_rename.get() {
             if let Some(row) = clicked.and_then(|i| visible.get(i)) {
-                self.renaming = Some((row.path.clone(), row.label.clone()));
-                self.rename_fresh = true;
+                self.controller.state.renaming = Some((row.path.clone(), row.label.clone()));
+                self.controller.state.rename_fresh = true;
             }
         }
         // What the box in the row typed, and whether it was finished or walked
         // away from. Done here rather than inside the table because starting a
         // job needs `self` and the table still had it.
-        self.rename_fresh = fresh.get();
-        if let Some((path, _)) = self.renaming.clone() {
+        self.controller.state.rename_fresh = fresh.get();
+        if let Some((path, _)) = self.controller.state.renaming.clone() {
             let text = typing.borrow().clone();
-            self.renaming = Some((path.clone(), text.clone()));
+            self.controller.state.renaming = Some((path.clone(), text.clone()));
             match finish.get() {
                 None => {}
-                Some(false) => self.renaming = None,
+                Some(false) => self.controller.state.renaming = None,
                 Some(true) => {
-                    self.renaming = None;
-                    let ctx = ui.ctx().clone();
-                    self.rename_to(&ctx, &visible, &path, text.trim());
+                    self.controller.state.renaming = None;
+                    let _ctx = ui.ctx().clone();
+                    self.controller.rename_to(&visible, &path, text.trim());
                 }
             }
         }
         if wants_extract.get() {
-            let ctx = ui.ctx().clone();
-            self.ask_extract(&ctx, true);
+            let _ctx = ui.ctx().clone();
+            self.controller.ask_extract(true);
         }
         if let Some(at) = wants_view.get() {
-            self.view_entry(at);
+            self.controller.view_entry(at);
         }
         if wants_here.get() {
-            let ctx = ui.ctx().clone();
-            self.extract_here(&ctx);
+            let _ctx = ui.ctx().clone();
+            self.controller.extract_here();
         }
         if wants_test.get() {
-            let names = self.selected_names();
-            if let Some(archive) = self.archive.clone() {
-                let ctx = ui.ctx().clone();
-                self.run_job(
-                    &ctx,
-                    Job::Test {
-                        archive,
-                        only: (!names.is_empty()).then(|| names.into_iter().collect()),
-                    },
-                );
+            let names = self.controller.selected_names();
+            if let Some(archive) = self.controller.state.archive.clone() {
+                let _ctx = ui.ctx().clone();
+                self.controller.run_job(Job::Test {
+                    archive,
+                    only: (!names.is_empty()).then(|| names.into_iter().collect()),
+                });
             }
         }
         if let Some(cut) = wants_clip.get() {
-            let ctx = ui.ctx().clone();
-            self.copy_to_clipboard(&ctx, cut);
+            let _ctx = ui.ctx().clone();
+            self.controller.copy_to_clipboard(cut);
         }
         if wants_paste.get() {
-            let ctx = ui.ctx().clone();
-            self.paste_from_clipboard(&ctx);
+            let _ctx = ui.ctx().clone();
+            self.controller.paste_from_clipboard();
         }
 
         // A thin outline where the keyboard is, over the fill that says what is
@@ -5874,16 +6167,16 @@ impl Arca {
             let target = &visible[index];
             if target.is_dir {
                 let path = target.path.clone();
-                self.go_to(path);
+                self.controller.go_to(path);
             } else if let Some(i) = target.entry {
-                self.open_file(ui.ctx(), i);
+                self.controller.open_file(i);
             }
         }
         if let Some(c) = requested {
-            if self.order.0 == c {
-                self.order.1 = !self.order.1;
+            if self.controller.state.order.0 == c {
+                self.controller.state.order.1 = !self.controller.state.order.1;
             } else {
-                self.order = (c, true);
+                self.controller.state.order = (c, true);
             }
         }
     }
@@ -5894,9 +6187,9 @@ impl eframe::App for Arca {
     // size and place change with every pixel of a resize and the settings file
     // is not a thing to write sixty times a second.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if self.geometry.is_some() {
-            self.settings.window = self.geometry;
-            self.settings.save();
+        if self.controller.state.geometry.is_some() {
+            self.controller.state.settings.window = self.controller.state.geometry;
+            self.controller.state.settings.save();
         }
     }
 
@@ -5904,19 +6197,28 @@ impl eframe::App for Arca {
         // Kept fresh every frame because `on_exit` is handed no context to ask.
         // Only a window somebody is browsing in: the small one a job runs in
         // would otherwise be what came back next time.
-        if matches!(self.view, View::Browse) {
+        if matches!(self.controller.state.view, View::Browse) {
             if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
-                self.geometry = Some([rect.min.x, rect.min.y, rect.width(), rect.height()]);
+                self.controller.state.geometry =
+                    Some([rect.min.x, rect.min.y, rect.width(), rect.height()]);
             }
         }
-        self.receive(ctx);
+        if self.controller.receive() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+            self.controller.state.window_title.clone(),
+        ));
         // Getting the keyboard back is when whatever was done elsewhere has
         // been done. Only on the change, not every frame it is focused.
         let focused = ctx.input(|i| i.focused);
-        if focused && !self.was_focused && matches!(self.view, View::Browse) {
-            self.cut_landed(ctx);
+        if focused
+            && !self.controller.state.was_focused
+            && matches!(self.controller.state.view, View::Browse)
+        {
+            self.controller.cut_landed();
         }
-        self.was_focused = focused;
+        self.controller.state.was_focused = focused;
         self.shortcuts(ctx);
 
         // Escape backs out of whatever is on top, innermost first, the way it
@@ -5926,31 +6228,35 @@ impl eframe::App for Arca {
         // window is drawn as well, the same press would open it and close it
         // again inside the one frame.
         if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
-            self.show_shortcuts = !self.show_shortcuts;
+            self.controller.state.show_shortcuts = !self.controller.state.show_shortcuts;
         }
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.waiting_on_password.is_some() {
-                self.cancel_password();
-            } else if self.show_shortcuts {
-                self.show_shortcuts = false;
-            } else if self.show_settings {
-                self.show_settings = false;
+            if self.controller.state.waiting_on_password.is_some() {
+                self.controller.cancel_password();
+            } else if self.controller.state.show_shortcuts {
+                self.controller.state.show_shortcuts = false;
+            } else if self.controller.state.show_settings {
+                self.controller.state.show_settings = false;
             // The viewer and the group box close themselves on Escape, and
             // closing one of them is all that press was for: it must not also
             // let go of everything that was picked underneath.
-            } else if self.viewing.is_some() || self.picking_group.is_some() {
-            } else if matches!(self.view, View::Browse) && !self.busy {
+            } else if self.controller.state.viewing.is_some()
+                || self.controller.state.picking_group.is_some()
+            {
+            } else if matches!(self.controller.state.view, View::Browse)
+                && !self.controller.state.busy
+            {
                 // Nothing on top of the list any more, so it backs out of the
                 // last thing there is to back out of: what is picked.
-                self.clear_picked();
+                self.controller.clear_picked();
             }
         }
 
         // The side buttons on a mouse, which winit reports as Back and Forward
         // and egui hands over as Extra1 and Extra2. Alt+Left and Alt+Right do
         // the same, for anyone without them.
-        if matches!(self.view, View::Browse) && !self.busy {
+        if matches!(self.controller.state.view, View::Browse) && !self.controller.state.busy {
             let (back, forward) = ctx.input(|i| {
                 (
                     i.pointer.button_pressed(egui::PointerButton::Extra1)
@@ -5960,21 +6266,21 @@ impl eframe::App for Arca {
                 )
             });
             if back {
-                self.go_back();
+                self.controller.go_back();
             }
             if forward {
-                self.go_forward();
+                self.controller.go_forward();
             }
         }
 
         // Not while something is running or a window is waiting on an answer:
         // a drop that lands then would be acting on a state that is about to
         // change under it.
-        if matches!(self.view, View::Browse)
-            && !self.busy
-            && self.confirm_delete.is_none()
-            && self.confirm_drop.is_none()
-            && self.waiting_on_password.is_none()
+        if matches!(self.controller.state.view, View::Browse)
+            && !self.controller.state.busy
+            && self.controller.state.confirm_delete.is_none()
+            && self.controller.state.confirm_drop.is_none()
+            && self.controller.state.waiting_on_password.is_none()
         {
             let dropped: Vec<PathBuf> = ctx.input(|i| {
                 i.raw
@@ -5983,15 +6289,15 @@ impl eframe::App for Arca {
                     .filter_map(|f| f.path.clone())
                     .collect()
             });
-            self.dropped(ctx, dropped);
+            self.controller.dropped(dropped);
         }
 
-        if self.busy {
+        if self.controller.state.busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         let ctx2 = ctx.clone();
-        match self.view {
+        match self.controller.state.view {
             View::Running => {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     self.running_view(ui, &ctx2);
@@ -6023,24 +6329,29 @@ impl eframe::App for Arca {
                     .exact_height(30.0)
                     .show(ctx, |ui| {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            if self.busy && !self.quiet {
-                                let f = if self.total_count == 0 {
+                            if self.controller.state.busy && !self.controller.state.quiet {
+                                let f = if self.controller.state.total_count == 0 {
                                     0.0
                                 } else {
-                                    self.done_count as f32 / self.total_count as f32
+                                    self.controller.state.done_count as f32
+                                        / self.controller.state.total_count as f32
                                 };
                                 ui.add(
                                     egui::ProgressBar::new(f)
-                                        .text(format!("{} / {}", self.done_count, self.total_count))
+                                        .text(format!(
+                                            "{} / {}",
+                                            self.controller.state.done_count,
+                                            self.controller.state.total_count
+                                        ))
                                         .desired_width(ui.available_width()),
                                 );
                             } else {
-                                let color = if self.error {
+                                let color = if self.controller.state.error {
                                     egui::Color32::from_rgb(220, 90, 90)
                                 } else {
                                     ui.visuals().weak_text_color()
                                 };
-                                ui.colored_label(color, &self.notice);
+                                ui.colored_label(color, &self.controller.state.notice);
                             }
                         });
                     });
@@ -6052,8 +6363,8 @@ impl eframe::App for Arca {
                 let mut frame = egui::Frame::central_panel(&ctx.style());
                 frame.inner_margin.bottom = 0.0;
                 egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-                    if self.entries.is_empty() {
-                        let text = self.s().drop_here;
+                    if self.controller.state.entries.is_empty() {
+                        let text = self.controller.s().drop_here;
                         ui.centered_and_justified(|ui| {
                             ui.label(egui::RichText::new(text).size(16.0).weak());
                         });
@@ -6072,6 +6383,7 @@ impl eframe::App for Arca {
     }
 }
 
+#[cfg(not(feature = "gpui"))]
 fn main() -> eframe::Result<()> {
     let startup = parse_args();
     let settings = Settings::load();
@@ -6124,23 +6436,29 @@ fn main() -> eframe::Result<()> {
             cc.egui_ctx.all_styles_mut(theme::style);
             cc.egui_ctx.set_theme(settings.theme);
 
-            let mut app = Arca::new(settings);
+            let mut app = Arca::new(AppController::new(settings));
             match startup {
-                Startup::Browse(Some(p)) => app.open(&cc.egui_ctx, p),
+                Startup::Browse(Some(p)) => app.controller.open(p),
                 Startup::Browse(None) => {}
-                Startup::Run(job) => app.run_job(&cc.egui_ctx, job),
+                Startup::Run(job) => app.controller.run_job(job),
                 Startup::Add(files) => {
-                    app.output_name = quick_output(&files, app.format)
-                        .file_name()
-                        .map(|x| x.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    app.pending_inputs = files;
-                    app.view = View::Add;
+                    app.controller.state.output_name =
+                        quick_output(&files, app.controller.state.format)
+                            .file_name()
+                            .map(|x| x.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                    app.controller.state.pending_inputs = files;
+                    app.controller.state.view = View::Add;
                 }
             }
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(feature = "gpui")]
+fn main() {
+    gpui_shell::run();
 }
 
 #[cfg(test)]

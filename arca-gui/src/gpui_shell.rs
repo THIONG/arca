@@ -10,7 +10,10 @@ use super::{
     human, parent_of, saved_of, when, Answer, AppAction, AppController, Columns, DropChoice, Job,
     Pending, Settings, SortColumn, Startup, View,
 };
-use crate::{clipboard, gpui_theme, tree::Kind};
+use crate::{
+    clipboard, gpui_theme,
+    tree::{Folder, Kind},
+};
 use gpui::{actions, point};
 use gpui::{
     canvas, div, prelude::*, px, size, uniform_list, App, Bounds, ClickEvent, Context, Element,
@@ -533,74 +536,6 @@ struct GpuiShell {
     add_start_focus: FocusHandle,
     add_cancel_focus: FocusHandle,
     drop_paths: Vec<PathBuf>,
-    /// The folder tree the sidebar draws, and the archive it was built from.
-    ///
-    /// Walking every entry name is cheap once and wasteful sixty times a
-    /// second, which is what rebuilding it inside `render` would cost during a
-    /// long extraction.
-    ///
-    /// ponytail: keyed on (path, entry count). Two edits that cancel out
-    /// exactly — delete four entries, add four — would leave a stale tree; each
-    /// of those is a separate operation that moves the count in between, so it
-    /// cannot happen in one step today. Key on a real revision counter if the
-    /// controller ever grows batched edits.
-    folders: (Option<PathBuf>, usize, Vec<Folder>),
-}
-
-/// One directory in the archive, and the directories inside it.
-struct Folder {
-    label: String,
-    /// Trailing slash included, which is the form `AppAction::Navigate` and
-    /// `children_of` both expect.
-    path: String,
-    children: Vec<Folder>,
-}
-
-impl Folder {
-    /// Build the directory tree from the flat entry list.
-    ///
-    /// An archive is a list of paths, not a tree: a folder exists because some
-    /// entry is inside it, whether or not the archive bothered to record the
-    /// folder itself. So every segment of every name is walked, and a directory
-    /// entry contributes all of its segments while a file contributes all but
-    /// the last.
-    fn tree(entries: &[super::Entry]) -> Vec<Folder> {
-        let mut roots: Vec<Folder> = Vec::new();
-        for entry in entries {
-            let name = entry.name.replace('\\', "/");
-            let mut segments: Vec<&str> = name.split('/').filter(|s| !s.is_empty()).collect();
-            if !entry.is_dir {
-                segments.pop();
-            }
-            let mut level = &mut roots;
-            let mut path = String::new();
-            for segment in segments {
-                path.push_str(segment);
-                path.push('/');
-                let index = match level.iter().position(|f| f.label == segment) {
-                    Some(index) => index,
-                    None => {
-                        level.push(Folder {
-                            label: segment.to_string(),
-                            path: path.clone(),
-                            children: Vec::new(),
-                        });
-                        level.len() - 1
-                    }
-                };
-                level = &mut level[index].children;
-            }
-        }
-        Folder::sort(&mut roots);
-        roots
-    }
-
-    fn sort(level: &mut Vec<Folder>) {
-        level.sort_by(|a, b| a.label.cmp(&b.label));
-        for folder in level {
-            Folder::sort(&mut folder.children);
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -744,20 +679,7 @@ impl GpuiShell {
             add_start_focus: cx.focus_handle().tab_stop(true),
             add_cancel_focus: cx.focus_handle().tab_stop(true),
             drop_paths: Vec::new(),
-            folders: (None, usize::MAX, Vec::new()),
         }
-    }
-
-    /// The archive's folder tree, rebuilt only when the archive itself changed.
-    fn folder_tree(&mut self) -> &[Folder] {
-        let key = (
-            self.controller.state.archive.clone(),
-            self.controller.state.entries.len(),
-        );
-        if (self.folders.0.clone(), self.folders.1) != key {
-            self.folders = (key.0, key.1, Folder::tree(&self.controller.state.entries));
-        }
-        &self.folders.2
     }
 
     /// One folder and everything under it, as a nestable sidebar item.
@@ -766,16 +688,21 @@ impl GpuiShell {
     /// archive three levels down does not present a closed tree you have to
     /// re-walk by hand. Everything else stays shut, because an archive of a
     /// source tree fully expanded is not a sidebar, it is a second file list.
-    fn folder_item(folder: &Folder, current: &str, cx: &mut Context<Self>) -> SidebarMenuItem {
-        let on_path = current.starts_with(folder.path.as_str());
-        let path = folder.path.clone();
-        SidebarMenuItem::new(folder.label.clone())
+    fn folder_item(
+        folder: &Folder,
+        label: &str,
+        path: String,
+        current: &str,
+        cx: &mut Context<Self>,
+    ) -> SidebarMenuItem {
+        let on_path = current.starts_with(path.as_str());
+        SidebarMenuItem::new(label.to_string())
             .icon(if on_path {
                 IconName::FolderOpen
             } else {
                 IconName::Folder
             })
-            .active(current == folder.path)
+            .active(current == path)
             .default_open(on_path)
             // Clicking the label navigates; the disclosure chevron is what
             // opens a branch. Merging the two would make it impossible to look
@@ -783,9 +710,17 @@ impl GpuiShell {
             .click_to_open(false)
             .children(
                 folder
-                    .children
+                    .kids
                     .iter()
-                    .map(|child| Self::folder_item(child, current, cx))
+                    .map(|(child_label, child)| {
+                        Self::folder_item(
+                            child,
+                            child_label,
+                            format!("{path}{child_label}/"),
+                            current,
+                            cx,
+                        )
+                    })
                     .collect::<Vec<_>>(),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -814,12 +749,13 @@ impl GpuiShell {
                 }
             }));
         let mut items = vec![root_item];
-        // `self.folder_tree()` holds a borrow of `self`; `folder_item` only
-        // touches `cx`, which is a separate binding, so the two coexist.
-        let tree = self.folder_tree();
+        let tree = &self.controller.state.folders;
         items.extend(
-            tree.iter()
-                .map(|folder| Self::folder_item(folder, &current, cx))
+            tree.kids
+                .iter()
+                .map(|(label, folder)| {
+                    Self::folder_item(folder, label, format!("{label}/"), &current, cx)
+                })
                 .collect::<Vec<_>>(),
         );
         let menu = SidebarMenu::new().children(items);
@@ -2069,6 +2005,8 @@ impl GpuiShell {
             SortColumn::Saved => 82.0,
             SortColumn::Modified => 150.0,
             SortColumn::Crc => 105.0,
+            SortColumn::Type => 120.0,
+            SortColumn::Path => 180.0,
         }
     }
 
@@ -2184,6 +2122,8 @@ impl GpuiShell {
                     format!("{:08X}", row.crc32)
                 }
             }
+            SortColumn::Type => arca_icons::cache_key(&row.label, row.is_dir),
+            SortColumn::Path => super::folder_of(&row.path).to_string(),
         }
     }
 
@@ -2211,6 +2151,8 @@ impl GpuiShell {
                 SortColumn::Saved => "Saved",
                 SortColumn::Modified => "Modified",
                 SortColumn::Crc => "CRC32",
+                SortColumn::Type => "Type",
+                SortColumn::Path => "Path",
                 SortColumn::Name => continue,
             };
             description.push_str(&format!("; {label} {}", self.column_text(row, column)));
@@ -3292,7 +3234,10 @@ impl Render for GpuiShell {
             menu = menu.child(test.on_click(cx.listener(|this, _, _, cx| {
                 if this.menu_enabled() {
                     if let Some(archive) = this.controller.state.archive.clone() {
-                        this.controller.dispatch(AppAction::Run(Job::Test(archive)));
+                        this.controller.dispatch(AppAction::Run(Job::Test {
+                            archive,
+                            only: None,
+                        }));
                     }
                 }
                 this.overflow_open = false;
