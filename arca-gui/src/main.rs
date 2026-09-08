@@ -4024,6 +4024,20 @@ impl Arca {
         let accent = theme::cursor(ui.visuals()).color;
         let head = |ui: &mut egui::Ui, text: &str, col: SortColumn| -> egui::Response {
             let cell = ui.max_rect();
+            // Asked for before the word is drawn, so the ground can be laid
+            // under it: a heading lights up when the pointer is on it, which is
+            // how WinRAR says that a column name is a thing you press and not
+            // just a label. Spread half the gap either side, the same as the
+            // fill on a row, so that the lit heading reaches its neighbours.
+            let resp = ui.interact(cell, egui::Id::new(("arca-head", text)), egui::Sense::click());
+            if resp.hovered() {
+                let half = ui.spacing().item_spacing.x * 0.5;
+                ui.painter().rect_filled(
+                    cell.expand2(egui::vec2(half, 0.0)),
+                    0.0,
+                    ui.visuals().widgets.hovered.bg_fill,
+                );
+            }
             // The table puts its cells in truncating mode, and a truncating
             // label takes the whole width it is offered. That is right for a
             // file name and wrong for a column heading: it left no room beside
@@ -4043,8 +4057,7 @@ impl Arca {
                     egui::Stroke::NONE,
                 ));
             }
-            ui.interact(cell, egui::Id::new(("arca-head", text)), egui::Sense::click())
-                .on_hover_text(hint)
+            resp.on_hover_text(hint)
         };
 
         let mut builder = TableBuilder::new(ui)
@@ -4553,19 +4566,12 @@ impl eframe::App for Arca {
                         });
                         return;
                     }
-                    // The list as a card on the window rather than as the
-                    // window itself. It is what gives the rows an edge to end
-                    // against now that the stripes and the column rules are
-                    // gone, and it is how the Explorer separates its list from
-                    // its chrome.
-                    egui::Frame::none()
-                        .fill(ui.visuals().window_fill)
-                        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                        .rounding(egui::Rounding::same(8.0))
-                        .inner_margin(egui::Margin::symmetric(4.0, 2.0))
-                        .show(ui, |ui| {
-                            self.table(ui);
-                        });
+                    // The list sits on the window, not in a card on it. It was
+                    // given a fill, a border and rounded corners back when the
+                    // column rules were gone and the rows had no edge to end
+                    // against; the rules are back and they do that job, so all
+                    // the card left was a box drawn inside a box.
+                    self.table(ui);
                 });
                 self.drop_hint(&ctx2);
             }
