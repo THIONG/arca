@@ -4369,9 +4369,23 @@ impl Arca {
 
         // A thin outline where the keyboard is, over the fill that says what is
         // ticked. Two different things, so they cannot share the one colour.
+        //
+        // Only the top and bottom of the row are taken from the row itself. Its
+        // rectangle is the union of its cells', and a cell reports itself as
+        // wide as whatever was drawn inside it, so the sides came out wherever
+        // the longest name happened to end: the outline bit into the icon on
+        // the left and hung past the blue on the right. The blue is painted
+        // cell by cell, each spread half the gap between columns wider than its
+        // column so that the row comes out unbroken, and that is the shape the
+        // outline has to follow.
         if let Some(rect) = cursor_rect.get() {
+            let half = ui.spacing().item_spacing * 0.5;
+            let here = egui::Rect::from_x_y_ranges(
+                out.inner_rect.expand(half.x).x_range(),
+                rect.expand(half.y).y_range(),
+            );
             ui.painter()
-                .rect_stroke(rect.shrink(0.5), 0.0, theme::cursor(ui.visuals()));
+                .rect_stroke(here.shrink(0.5), 0.0, theme::cursor(ui.visuals()));
         }
 
         // The scrollable part on its own, without the header the outer rect
