@@ -3724,6 +3724,10 @@ impl Arca {
     // What is picked, named the way it should land where it is dropped: the
     // folder on screen is the base, so dragging a folder out puts that folder
     // down rather than scattering what was inside it.
+    //
+    // Windows only, like the drag it answers: dragging out of the window is
+    // COM, and where there is no COM there is nobody to ask this.
+    #[cfg(windows)]
     fn dragged_files(&self) -> Vec<(Entry, String)> {
         let base = &self.current_dir;
         self.entries
