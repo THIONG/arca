@@ -1059,6 +1059,26 @@ fn compress(
     notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
     password: Option<&str>,
 ) -> arca_core::Result<(u64, u64)> {
+    let outcome = compress_inner(out, inputs, format, codec, level, notify, password);
+    if outcome.is_err() {
+        // Half an archive is not a small archive: it is a file that opens to an
+        // error, and leaving one where a good one was asked for looks like it
+        // worked. `create_zip` clears up after itself; this is for the tar.
+        let _ = fs::remove_file(out);
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compress_inner(
+    out: &Path,
+    inputs: &[PathBuf],
+    format: Format,
+    codec: Codec,
+    level: Level,
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
+    password: Option<&str>,
+) -> arca_core::Result<(u64, u64)> {
     if password.is_some() && format != Format::Zip {
         return Err(arca_core::Error::Unsupported(
             "encryption only exists in .zip".into(),
@@ -1082,9 +1102,11 @@ fn compress(
                     name: name.clone(),
                     size: meta.len(),
                     mtime: mtime_of(&meta),
+                    codec,
+                    level,
                 });
             }
-            arca_zip::create_zip(out, &sources, codec, level, 0, password, notify)?;
+            arca_zip::create_zip(out, &sources, 0, password, notify)?;
         }
         _ => {
             let raw = BufWriter::with_capacity(BUF, File::create(out)?);

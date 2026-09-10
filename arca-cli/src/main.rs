@@ -307,6 +307,8 @@ fn create(
             name,
             size: m.len(),
             mtime: mtime_of(&m),
+            codec,
+            level,
         });
     }
 
@@ -314,11 +316,7 @@ fn create(
     match format_kind {
         // Nothing to report while it runs -- the summary is printed at the end
         // -- so the answer to "carry on?" is always yes.
-        Format::Zip => {
-            arca_zip::create_zip(out, &files, codec, level, threads, password, &|_, _, _| {
-                true
-            })?
-        }
+        Format::Zip => arca_zip::create_zip(out, &files, threads, password, &|_, _, _| true)?,
         Format::Tar | Format::TarGz => {
             let f = BufWriter::with_capacity(BUF, File::create(out)?);
             let dest: Box<dyn Write> = if format_kind == Format::TarGz {

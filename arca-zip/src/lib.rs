@@ -1249,7 +1249,7 @@ pub fn rewrite_password(
     // Told how far along this is, and answers whether to carry on: false is
     // somebody pressing stop, and the rewrite gives up where it stands rather
     // than finishing a copy nobody is waiting for.
-    notify: &dyn Fn(usize, usize, &str) -> bool,
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
 ) -> Result<u64> {
     rewrite(
         archive,
@@ -1294,7 +1294,7 @@ pub fn add_entries(
     // Told how far along this is, and answers whether to carry on: false is
     // somebody pressing stop, and the rewrite gives up where it stands rather
     // than finishing a copy nobody is waiting for.
-    notify: &dyn Fn(usize, usize, &str) -> bool,
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
 ) -> Result<u64> {
     // Compared with the separator the format actually specifies. Windows tools
     // write backslashes into zips, and an existing `a\b.txt` measured against a
@@ -1334,7 +1334,7 @@ pub fn remove_entries(
     // Told how far along this is, and answers whether to carry on: false is
     // somebody pressing stop, and the rewrite gives up where it stands rather
     // than finishing a copy nobody is waiting for.
-    notify: &dyn Fn(usize, usize, &str) -> bool,
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
 ) -> Result<u64> {
     rewrite(
         archive,
@@ -1373,7 +1373,7 @@ pub fn rename_entries(
     // Told how far along this is, and answers whether to carry on: false is
     // somebody pressing stop, and the rewrite gives up where it stands rather
     // than finishing a copy nobody is waiting for.
-    notify: &dyn Fn(usize, usize, &str) -> bool,
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
 ) -> Result<u64> {
     rewrite(
         archive,
@@ -1399,7 +1399,7 @@ fn rewrite(
     // Told how far along this is, and answers whether to carry on: false is
     // somebody pressing stop, and the rewrite gives up where it stands rather
     // than finishing a copy nobody is waiting for.
-    notify: &dyn Fn(usize, usize, &str) -> bool,
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
 ) -> Result<u64> {
     use std::fs::File;
     use std::io::{BufReader, BufWriter};
@@ -1435,10 +1435,10 @@ fn rewrite(
 
     // The new ones last, so copying what was already there stays one straight
     // pass over the source file instead of one interleaved with compression.
-    for (i, a) in extra.iter().enumerate() {
-        if !notify(entries.len() + i, total, &a.name) {
-            return Err(Error::Cancelled);
-        }
+    // The folders go first among them: they hold nothing, so there is nothing
+    // to compress and nothing to wait for.
+    let mut fresh: Vec<Source> = Vec::with_capacity(extra.len());
+    for a in extra {
         let Some(from) = &a.source else {
             // A folder: nothing to read, nothing to compress, and the slash on
             // the end of the name is what makes it one.
@@ -1450,15 +1450,26 @@ fn rewrite(
             continue;
         };
         let meta = std::fs::metadata(from)?;
-        let mtime = meta.modified().ok().and_then(|t| {
-            t.duration_since(std::time::UNIX_EPOCH)
+        fresh.push(Source {
+            path: from.clone(),
+            name: a.name.clone(),
+            size: meta.len(),
+            mtime: meta
+                .modified()
                 .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            codec: a.codec,
+            level: a.level,
         });
-        let f = BufReader::with_capacity(STREAM_BUF, File::open(from)?);
-        w.add_with_password(&a.name, f, a.codec, a.level, mtime, new)?;
-        bytes += meta.len();
     }
+    // Dropping into an open archive compresses on every core, the same as
+    // making one from nothing: it is the same work. What is already in the
+    // archive is only copied through, so it costs no compression at all -- and
+    // the count carries on from where that copying left it.
+    let done = std::sync::atomic::AtomicUsize::new(total - fresh.len());
+    bytes += write_in_parallel(&mut w, &fresh, 0, new, &done, total, notify)?;
     w.finish()?.flush()?;
 
     let mut check = ZipArchive::open(File::open(out)?)?;
@@ -1561,6 +1572,11 @@ pub struct Source {
     pub name: String,
     pub size: u64,
     pub mtime: i64,
+    // The codec travels with the file rather than sitting in the call, so a
+    // paste into an open archive can use whatever the window is set to without
+    // the rewrite having to know about it. See [`Addition`].
+    pub codec: Codec,
+    pub level: Level,
 }
 
 /// How much of the uncompressed data one thread is allowed to be holding.
@@ -1621,20 +1637,77 @@ type Block = (usize, Vec<u8>, Method, u32);
 /// them on one thread.
 ///
 /// `notify` is told how many files are finished and answers whether to carry
-/// on; a no gives up with [`Error::Cancelled`] and leaves the half-written file
-/// where it is, for the caller to clear away. `threads` at zero means every
+/// on; a no gives up with [`Error::Cancelled`]. `threads` at zero means every
 /// core.
+///
+/// Nothing is left behind when it does not finish. Half an archive is not a
+/// small archive, it is a file that opens to an error, and leaving one sitting
+/// where a good one was asked for is worse than leaving nothing: it looks like
+/// it worked.
 pub fn create_zip(
     out: &std::path::Path,
     files: &[Source],
-    codec: Codec,
-    level: Level,
     threads: usize,
     password: Option<&str>,
     notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
 ) -> Result<()> {
+    let outcome = write_zip(out, files, threads, password, notify);
+    if outcome.is_err() {
+        // After `write_zip` has returned, so the handle it was writing through
+        // is closed: Windows will not remove a file anybody still has open.
+        let _ = std::fs::remove_file(out);
+    }
+    outcome
+}
+
+fn write_zip(
+    out: &std::path::Path,
+    files: &[Source],
+    threads: usize,
+    password: Option<&str>,
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
+) -> Result<()> {
+    let f = std::fs::File::create(out)?;
+    let mut w = ZipWriter::new(io::BufWriter::with_capacity(STREAM_BUF, f));
+    let total = files.len();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    write_in_parallel(&mut w, files, threads, password, &done, total, notify)?;
+    w.finish()?;
+    let _ = notify(total, total, "");
+    Ok(())
+}
+
+/// Compresses `files` on every core and writes them into `w` in order.
+///
+/// This is what makes a zip worth having over the formats that pack everything
+/// into one stream: each entry is compressed on its own, so a hundred files can
+/// go through a hundred compressions at once and only the writing is left to a
+/// single thread. Nothing about the file that comes out says it was made this
+/// way -- it is an ordinary zip.
+///
+/// Files are read in batches so that the memory held at once stays bounded, and
+/// one too big for the whole budget is streamed straight through instead. That
+/// one goes at the speed of a single core, which is the price of not needing
+/// room for it.
+///
+/// Sealing happens inside the worker on purpose: deriving the key is a thousand
+/// rounds of PBKDF2 per entry, and doing it back in the writer would put all of
+/// them on one thread.
+///
+/// `done` and `total` are how far along the whole job is, not just this call:
+/// adding to an archive copies what was already in it first, and the count has
+/// to carry on from there. Answers with the uncompressed bytes written.
+fn write_in_parallel<W: Write + Seek>(
+    w: &mut ZipWriter<W>,
+    files: &[Source],
+    threads: usize,
+    password: Option<&str>,
+    done: &std::sync::atomic::AtomicUsize,
+    total: usize,
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
+) -> Result<u64> {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
 
     let threads = if threads > 0 {
         threads
@@ -1647,12 +1720,8 @@ pub fn create_zip(
         .num_threads(threads)
         .build()
         .map_err(|e| Error::Format(format!("could not create the thread pool: {e}")))?;
-
-    let f = std::fs::File::create(out)?;
-    let mut w = ZipWriter::new(io::BufWriter::with_capacity(STREAM_BUF, f));
     let cap = IN_FLIGHT_PER_THREAD * threads as u64;
-    let total = files.len();
-    let done = AtomicUsize::new(0);
+    let mut bytes = 0u64;
 
     for batch in batches(files, cap) {
         if batch.len() == 1 && files[batch[0]].size > cap {
@@ -1661,8 +1730,9 @@ pub fn create_zip(
                 return Err(Error::Cancelled);
             }
             let source = io::BufReader::with_capacity(STREAM_BUF, std::fs::File::open(&s.path)?);
-            w.add_with_password(&s.name, source, codec, level, Some(s.mtime), password)?;
+            w.add_with_password(&s.name, source, s.codec, s.level, Some(s.mtime), password)?;
             done.fetch_add(1, Ordering::Relaxed);
+            bytes += s.size;
             continue;
         }
         let produced: Vec<Result<Block>> = pool.install(|| {
@@ -1671,7 +1741,7 @@ pub fn create_zip(
                 .map(|&i| {
                     let s = &files[i];
                     let data = std::fs::read(&s.path)?;
-                    let (c, m, crc) = compress_block(&data, codec, level)?;
+                    let (c, m, crc) = compress_block(&data, s.codec, s.level)?;
                     let c = match password {
                         Some(pw) => seal_block(&c, pw)?,
                         None => c,
@@ -1690,11 +1760,10 @@ pub fn create_zip(
                 Some(_) => w.add_sealed(&s.name, &c, s.size, m, Some(s.mtime))?,
                 None => w.add_compressed(&s.name, &c, crc, s.size, m, Some(s.mtime))?,
             }
+            bytes += s.size;
         }
     }
-    w.finish()?;
-    let _ = notify(total, total, "");
-    Ok(())
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -2260,6 +2329,8 @@ mod tests {
                 name: format!("{i}"),
                 size,
                 mtime: 0,
+                codec: Codec::Deflate,
+                level: Level::Normal,
             })
             .collect();
         let cut = batches(&files, 10);
@@ -2307,20 +2378,13 @@ mod tests {
                 name: format!("sub/f{i}.txt"),
                 size: body.len() as u64,
                 mtime: 1_700_000_000 + i as i64 * 120,
+                codec: Codec::Deflate,
+                level: Level::Normal,
             });
         }
 
         let out = room.join("out.zip");
-        create_zip(
-            &out,
-            &files,
-            Codec::Deflate,
-            Level::Normal,
-            4,
-            None,
-            &|_, _, _| true,
-        )
-        .unwrap();
+        create_zip(&out, &files, 4, None, &|_, _, _| true).unwrap();
 
         let mut source = std::fs::File::open(&out).unwrap();
         let a = ZipArchive::open(&mut source).unwrap();
@@ -2363,19 +2427,16 @@ mod tests {
                 name: format!("f{i}.txt"),
                 size: 8,
                 mtime: 0,
+                codec: Codec::Deflate,
+                level: Level::Normal,
             });
         }
-        let e = create_zip(
-            &room.join("out.zip"),
-            &files,
-            Codec::Deflate,
-            Level::Normal,
-            2,
-            None,
-            &|_, _, _| false,
-        )
-        .unwrap_err();
+        let e = create_zip(&room.join("out.zip"), &files, 2, None, &|_, _, _| false).unwrap_err();
         assert!(matches!(e, Error::Cancelled), "{e:?}");
+        assert!(
+            !room.join("out.zip").exists(),
+            "half an archive has to be cleared away, not left looking like one"
+        );
         let _ = std::fs::remove_dir_all(&room);
     }
 
@@ -2688,6 +2749,77 @@ mod tests {
             a.extract_to(i, &mut got).unwrap();
             assert_eq!(got, b"brand new bytes".repeat(50), "entry {i}");
         }
+
+        std::fs::remove_dir_all(&room).unwrap();
+    }
+
+    // Dropping a folder full of files into an archive that has a password now
+    // compresses and seals on every core, which moves the key derivation off
+    // the writing thread. Enough files to make sure more than one of them is in
+    // the air at a time, and a folder among them, which has no file behind it.
+    #[test]
+    fn adding_a_pile_of_files_to_an_encrypted_archive_comes_back_whole() {
+        let room = std::env::temp_dir().join(format!("arca-addmany-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&room);
+        std::fs::create_dir_all(&room).unwrap();
+
+        let archive = room.join("a.zip");
+        std::fs::write(
+            &archive,
+            encrypted_archive("secret", Codec::Deflate, b"first"),
+        )
+        .unwrap();
+
+        let mut extra = vec![Addition {
+            source: None,
+            name: "sub/".into(),
+            codec: Codec::Store,
+            level: Level::Store,
+        }];
+        let bodies: Vec<Vec<u8>> = (0..25)
+            .map(|i| format!("number {i} ").repeat(300).into_bytes())
+            .collect();
+        for (i, body) in bodies.iter().enumerate() {
+            let path = room.join(format!("f{i}.txt"));
+            std::fs::write(&path, body).unwrap();
+            extra.push(Addition {
+                source: Some(path),
+                name: format!("sub/f{i}.txt"),
+                codec: Codec::Deflate,
+                level: Level::Normal,
+            });
+        }
+        let out = room.join("b.zip");
+        add_entries(&archive, &out, Some("secret"), &extra, &|_, _, _| true).unwrap();
+
+        let mut a = ZipArchive::open(std::fs::File::open(&out).unwrap()).unwrap();
+        assert_eq!(a.len(), 1 + extra.len());
+        for i in 0..a.len() {
+            let e = a.entries()[i].clone();
+            if e.is_dir {
+                continue;
+            }
+            let mut got = Vec::new();
+            a.extract_to_with(i, &mut got, Some("secret")).unwrap();
+            match e
+                .name
+                .strip_prefix("sub/f")
+                .and_then(|r| r.strip_suffix(".txt").and_then(|n| n.parse::<usize>().ok()))
+            {
+                Some(n) => assert_eq!(got, bodies[n], "{}", e.name),
+                None => assert_eq!(got, b"first", "{}", e.name),
+            }
+        }
+        // The password has to be the one that was asked for, not none. Checked
+        // on a file that was added, not on the one already in there: the point
+        // is that sealing on a worker thread still seals.
+        let mut a = ZipArchive::open(std::fs::File::open(&out).unwrap()).unwrap();
+        let added = a
+            .entries()
+            .iter()
+            .position(|e| e.name == "sub/f0.txt")
+            .expect("the added file");
+        assert!(a.extract_to(added, io::sink()).is_err());
 
         std::fs::remove_dir_all(&room).unwrap();
     }
