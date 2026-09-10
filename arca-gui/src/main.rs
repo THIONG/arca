@@ -5281,132 +5281,151 @@ impl Arca {
                 egui::PopupCloseBehavior::CloseOnClick,
                 |ui| {
                     ui.set_min_width(215.0);
-                    // Only when there is one, and at the top, where something
-                    // that was not there yesterday belongs.
-                    if let Some(release) = self.update.clone() {
-                        if ui
-                            .button(fill(s.update_ready, &[("version", &release.tag)]))
-                            .clicked()
-                        {
-                            wants = Some(More::Release);
-                        }
-                        ui.separator();
-                    }
-                    if ui
-                        .add_enabled(has, egui::Button::new(format!("{}\tCtrl+T", s.test_word)))
-                        .clicked()
-                    {
-                        wants = Some(More::Test);
-                    }
-                    if ui
-                        .add_enabled(
-                            has && self.format == Format::Zip,
-                            egui::Button::new(s.new_folder),
-                        )
-                        .clicked()
-                    {
-                        wants = Some(More::NewFolder);
-                    }
-                    if ui
-                        .add_enabled(has, egui::Button::new(s.save_copy))
-                        .clicked()
-                    {
-                        wants = Some(More::SaveCopy);
-                    }
-                    if ui
-                        .button(format!("{}	Ctrl+P", s.default_password))
-                        .clicked()
-                    {
-                        wants = Some(More::DefaultPassword);
-                    }
-                    ui.separator();
-                    // Named after what it would take back, because "undo" on its
-                    // own asks the reader to remember what they did last.
-                    let back = self
-                        .undo
-                        .as_ref()
-                        .map(|(_, what)| format!("{}: {}	Ctrl+Z", s.undo_word, what))
-                        .unwrap_or_else(|| format!("{}	Ctrl+Z", s.undo_word));
-                    if ui
-                        .add_enabled(self.undo.is_some(), egui::Button::new(back))
-                        .clicked()
-                    {
-                        wants = Some(More::Undo);
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            has,
-                            egui::Button::new(s.flat_view).selected(self.settings.flat),
-                        )
-                        .clicked()
-                    {
-                        wants = Some(More::Flat);
-                    }
-                    if ui
-                        .add_enabled(
-                            has,
-                            egui::Button::new(s.folder_tree).selected(self.settings.tree),
-                        )
-                        .clicked()
-                    {
-                        wants = Some(More::Tree);
-                    }
-                    // Only where there is an archive whose names could be read
-                    // another way. A tar has none of this argument.
-                    ui.add_enabled_ui(has && self.format == Format::Zip, |ui| {
-                        ui.menu_button(s.name_encoding, |ui| {
-                            for (page, _, label) in arca_zip::pages::Page::ALL {
-                                let on = self.settings.page == page;
-                                if ui.selectable_label(on, label).clicked() {
-                                    wants = Some(More::Page(page));
-                                    ui.close_menu();
+                    // Con la ventana baja, catorce entradas no caben debajo del
+                    // boton y las ultimas quedaban cortadas por el borde. Se le
+                    // da todo el alto que queda hasta abajo y, si aun asi no
+                    // cabe, se desplaza en vez de perderse.
+                    //
+                    // Un menu de verdad se saldria de la ventana, como el del
+                    // Explorador. Aqui no: egui dibuja dentro de una superficie
+                    // y sacar el menu a una ventana propia dejaria a cada
+                    // submenu -- Recientes, Codificacion -- con este mismo
+                    // problema un nivel mas abajo.
+                    let room =
+                        (ui.ctx().screen_rect().bottom() - ui.min_rect().top() - 14.0).max(120.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(room)
+                        .show(ui, |ui| {
+                            // Only when there is one, and at the top, where something
+                            // that was not there yesterday belongs.
+                            if let Some(release) = self.update.clone() {
+                                if ui
+                                    .button(fill(s.update_ready, &[("version", &release.tag)]))
+                                    .clicked()
+                                {
+                                    wants = Some(More::Release);
                                 }
+                                ui.separator();
                             }
-                        });
-                    });
-                    // The archives opened lately. By name, with the whole path
-                    // on hover: a menu of paths is a menu nobody reads.
-                    ui.add_enabled_ui(!self.settings.recent.is_empty(), |ui| {
-                        ui.menu_button(s.recent_word, |ui| {
-                            for path in self.settings.recent.clone() {
-                                let p = PathBuf::from(&path);
-                                let leaf = p
-                                    .file_name()
-                                    .map(|x| x.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| path.clone());
-                                if ui.button(leaf).on_hover_text(&path).clicked() {
-                                    wants = Some(More::Open(p));
-                                    ui.close_menu();
-                                }
+                            if ui
+                                .add_enabled(
+                                    has,
+                                    egui::Button::new(format!("{}\tCtrl+T", s.test_word)),
+                                )
+                                .clicked()
+                            {
+                                wants = Some(More::Test);
+                            }
+                            if ui
+                                .add_enabled(
+                                    has && self.format == Format::Zip,
+                                    egui::Button::new(s.new_folder),
+                                )
+                                .clicked()
+                            {
+                                wants = Some(More::NewFolder);
+                            }
+                            if ui
+                                .add_enabled(has, egui::Button::new(s.save_copy))
+                                .clicked()
+                            {
+                                wants = Some(More::SaveCopy);
+                            }
+                            if ui
+                                .button(format!("{}	Ctrl+P", s.default_password))
+                                .clicked()
+                            {
+                                wants = Some(More::DefaultPassword);
                             }
                             ui.separator();
-                            if ui.button(s.clear_history).clicked() {
-                                wants = Some(More::Forget);
-                                ui.close_menu();
+                            // Named after what it would take back, because "undo" on its
+                            // own asks the reader to remember what they did last.
+                            let back = self
+                                .undo
+                                .as_ref()
+                                .map(|(_, what)| format!("{}: {}	Ctrl+Z", s.undo_word, what))
+                                .unwrap_or_else(|| format!("{}	Ctrl+Z", s.undo_word));
+                            if ui
+                                .add_enabled(self.undo.is_some(), egui::Button::new(back))
+                                .clicked()
+                            {
+                                wants = Some(More::Undo);
+                            }
+                            ui.separator();
+                            if ui
+                                .add_enabled(
+                                    has,
+                                    egui::Button::new(s.flat_view).selected(self.settings.flat),
+                                )
+                                .clicked()
+                            {
+                                wants = Some(More::Flat);
+                            }
+                            if ui
+                                .add_enabled(
+                                    has,
+                                    egui::Button::new(s.folder_tree).selected(self.settings.tree),
+                                )
+                                .clicked()
+                            {
+                                wants = Some(More::Tree);
+                            }
+                            // Only where there is an archive whose names could be read
+                            // another way. A tar has none of this argument.
+                            ui.add_enabled_ui(has && self.format == Format::Zip, |ui| {
+                                ui.menu_button(s.name_encoding, |ui| {
+                                    for (page, _, label) in arca_zip::pages::Page::ALL {
+                                        let on = self.settings.page == page;
+                                        if ui.selectable_label(on, label).clicked() {
+                                            wants = Some(More::Page(page));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                            });
+                            // The archives opened lately. By name, with the whole path
+                            // on hover: a menu of paths is a menu nobody reads.
+                            ui.add_enabled_ui(!self.settings.recent.is_empty(), |ui| {
+                                ui.menu_button(s.recent_word, |ui| {
+                                    for path in self.settings.recent.clone() {
+                                        let p = PathBuf::from(&path);
+                                        let leaf = p
+                                            .file_name()
+                                            .map(|x| x.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| path.clone());
+                                        if ui.button(leaf).on_hover_text(&path).clicked() {
+                                            wants = Some(More::Open(p));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    ui.separator();
+                                    if ui.button(s.clear_history).clicked() {
+                                        wants = Some(More::Forget);
+                                        ui.close_menu();
+                                    }
+                                });
+                            });
+                            ui.separator();
+                            if ui.button(format!("{}\tCtrl+A", s.select_all)).clicked() {
+                                wants = Some(More::All);
+                            }
+                            if ui
+                                .button(format!("{}\tCtrl+I", s.invert_selection))
+                                .clicked()
+                            {
+                                wants = Some(More::Invert);
+                            }
+                            if ui.button(format!("{}\tEsc", s.clear_selection)).clicked() {
+                                wants = Some(More::None_);
+                            }
+                            ui.separator();
+                            if ui.button(s.settings).clicked() {
+                                wants = Some(More::Settings);
+                            }
+                            if ui.button(format!("{}\tF1", s.shortcuts_title)).clicked() {
+                                wants = Some(More::Shortcuts);
                             }
                         });
-                    });
-                    ui.separator();
-                    if ui.button(format!("{}\tCtrl+A", s.select_all)).clicked() {
-                        wants = Some(More::All);
-                    }
-                    if ui
-                        .button(format!("{}\tCtrl+I", s.invert_selection))
-                        .clicked()
-                    {
-                        wants = Some(More::Invert);
-                    }
-                    if ui.button(format!("{}\tEsc", s.clear_selection)).clicked() {
-                        wants = Some(More::None_);
-                    }
-                    ui.separator();
-                    if ui.button(s.settings).clicked() {
-                        wants = Some(More::Settings);
-                    }
-                    if ui.button(format!("{}\tF1", s.shortcuts_title)).clicked() {
-                        wants = Some(More::Shortcuts);
-                    }
                 },
             );
             match wants {
