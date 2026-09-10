@@ -7692,13 +7692,16 @@ impl Arca {
         let reach = (out.content_size.y - out.inner_rect.height()).max(0.0);
         if let Some(first) = heads.first() {
             let half = ui.spacing().item_spacing * 0.5;
+            // Por la izquierda donde estaba, con su margen. Por la derecha
+            // hasta el borde: el ancho de dentro del scroll deja fuera la
+            // franja donde vive la barra de desplazamiento, y la banda se
+            // quedaba a un dedo del borde derecho, con una raya negra al final
+            // de la fila de cabeceras que en ningun otro archivador esta.
+            let ends = out.inner_rect.left() - half.x..=ui.max_rect().right();
             ui.painter().set(
                 band,
                 egui::Shape::rect_filled(
-                    egui::Rect::from_x_y_ranges(
-                        out.inner_rect.expand(half.x).x_range(),
-                        table_top..=first.bottom() + half.y,
-                    ),
+                    egui::Rect::from_x_y_ranges(ends, table_top..=first.bottom() + half.y),
                     0.0,
                     theme::header(ui.visuals()),
                 ),
