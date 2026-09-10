@@ -221,14 +221,6 @@ fn archive_stem(p: &Path) -> String {
     name
 }
 
-/// The smallest a browsing window is allowed to be.
-///
-/// One number for two places that have to agree: the floor the window is opened
-/// with, and the check that decides whether a remembered size is worth keeping.
-/// While they disagreed, a window made smaller than the check was thrown away
-/// on the way out and came back the size it used to be.
-const WINDOW_MIN: [f32; 2] = [520.0, 340.0];
-
 fn config_file() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)
@@ -350,7 +342,7 @@ impl Settings {
                         // A window smaller than the minimum, or one left on a
                         // screen that is no longer plugged in, is not a window
                         // anybody can use.
-                        if w >= WINDOW_MIN[0] && h >= WINDOW_MIN[1] {
+                        if w >= 720.0 && h >= 320.0 {
                             s.window = Some([x, y, w, h]);
                         }
                     }
@@ -679,58 +671,6 @@ fn launch_with_system(path: &Path) -> arca_core::Result<()> {
 // is one of the ones worth naming. Written out rather than built from
 // `egui::Button` because that one only takes an image for its icon, and these
 // come either from the system icon font or from a painter.
-/// The narrowest the search box is allowed to get before it stops being one.
-///
-/// Under this there is no room to see what has been typed, and a box too small
-/// to read is worse than no box: it takes up the width and gives nothing back.
-const FILTER_MIN: f32 = 110.0;
-
-/// How wide the command bar has to be for every button to carry its word.
-///
-/// Measured with the same numbers the buttons measure themselves with, not
-/// guessed at: the words are translated, the Spanish ones are longer than the
-/// English, and a figure that fitted one language would crop the other.
-fn toolbar_width(ui: &egui::Ui, s: &i18n::Strings) -> f32 {
-    let named = [
-        s.open,
-        s.compress,
-        s.extract_all,
-        s.extract_selected,
-        s.password_word,
-        s.more_word,
-    ];
-    let pad = ui.spacing().button_padding.x * 2.0;
-    let mut total = 0.0;
-    for label in named {
-        let g = ui.painter().layout_no_wrap(
-            label.to_owned(),
-            egui::TextStyle::Button.resolve(ui.style()),
-            egui::Color32::PLACEHOLDER,
-        );
-        total += glyphs::SIZE + g.size().x + 6.0 + pad;
-    }
-    // The two separators, the gaps between all of it, and enough search box to
-    // be able to read what is in it.
-    total + ui.spacing().item_spacing.x * 8.0 + 16.0 + FILTER_MIN
-}
-
-/// The word a button carries and what its tooltip says, once it is known
-/// whether there is room for the word at all.
-///
-/// A row of unexplained pictures is not a command bar. So when the window is
-/// too narrow to name them the name is not lost, it moves into the tooltip and
-/// the shortcut goes after it: hovering still says what the button does.
-fn naming(narrow: bool, label: &'static str, tip: &str) -> (&'static str, String) {
-    if !narrow {
-        return (label, tip.to_string());
-    }
-    if tip.is_empty() {
-        ("", label.to_string())
-    } else {
-        ("", format!("{label}  ({tip})"))
-    }
-}
-
 fn tool_button(
     ui: &mut egui::Ui,
     glyph: glyphs::Glyph,
@@ -4981,13 +4921,6 @@ impl Arca {
     // other program, and the ticking buttons in beside the counts they act on.
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let s = self.s();
-        // Whether there is room to name the buttons, worked out before any of
-        // them is drawn: they all carry their word or none does, because half a
-        // bar of words and half of pictures is worse than either. Narrow, the
-        // words move into the tooltips and the bar stops running off its own
-        // edge, which is what it used to do with the search box hanging over
-        // the side.
-        let narrow = ui.available_width() < toolbar_width(ui, s);
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             // The password window is not modal on its own, so the toolbar behind
@@ -4996,8 +4929,7 @@ impl Arca {
             let idle = !self.busy && self.waiting_on_password.is_none();
             let has = self.archive.is_some() && idle;
             ui.add_enabled_ui(idle, |ui| {
-                let (word, tip) = naming(narrow, s.open, "Ctrl+O");
-                if tool_button(ui, glyphs::Glyph::Open, word, true, &tip).clicked() {
+                if tool_button(ui, glyphs::Glyph::Open, s.open, true, "Ctrl+O").clicked() {
                     if let Some(p) = rfd::FileDialog::new()
                         .add_filter("Archives", &["zip", "tar", "gz", "tgz"])
                         .pick_file()
@@ -5005,8 +4937,7 @@ impl Arca {
                         self.open(ctx, p);
                     }
                 }
-                let (word, tip) = naming(narrow, s.compress, "Ctrl+N");
-                if tool_button(ui, glyphs::Glyph::Compress, word, true, &tip).clicked() {
+                if tool_button(ui, glyphs::Glyph::Compress, s.compress, true, "Ctrl+N").clicked() {
                     if let Some(files) = rfd::FileDialog::new().pick_files() {
                         if !files.is_empty() {
                             self.output_name = quick_output(&files, self.format)
@@ -5020,13 +4951,19 @@ impl Arca {
                 }
             });
             ui.separator();
-            let (word, tip) = naming(narrow, s.extract_all, "Ctrl+E");
-            if tool_button(ui, glyphs::Glyph::ExtractAll, word, has, &tip).clicked() {
+            if tool_button(ui, glyphs::Glyph::ExtractAll, s.extract_all, has, "Ctrl+E").clicked() {
                 self.ask_extract(ctx, false);
             }
             let n = self.checked.iter().filter(|b| **b).count();
-            let (word, tip) = naming(narrow, s.extract_selected, "");
-            if tool_button(ui, glyphs::Glyph::ExtractPicked, word, has && n > 0, &tip).clicked() {
+            if tool_button(
+                ui,
+                glyphs::Glyph::ExtractPicked,
+                s.extract_selected,
+                has && n > 0,
+                "",
+            )
+            .clicked()
+            {
                 self.ask_extract(ctx, true);
             }
             ui.separator();
@@ -5043,8 +4980,7 @@ impl Arca {
             } else {
                 s.set_password
             };
-            let (word, tip) = naming(narrow, s.password_word, tip);
-            if tool_button(ui, glyph, word, zip, &tip).clicked() {
+            if tool_button(ui, glyph, s.password_word, zip, tip).clicked() {
                 let archive = self.archive.clone().unwrap_or_default();
                 if encrypted {
                     let job = Job::Password {
@@ -5078,8 +5014,7 @@ impl Arca {
             // and the ones there is no room to name go here rather than
             // becoming a row of unexplained pictures.
             let mut wants = None;
-            let (word, tip) = naming(narrow, s.more_word, "");
-            let more = tool_button(ui, glyphs::Glyph::More, word, idle, &tip);
+            let more = tool_button(ui, glyphs::Glyph::More, s.more_word, idle, "");
             // A dot on the button when there is a newer Arca. The word for it
             // is inside the menu, and a notice inside a menu is a notice nobody
             // reads: something has to say from the outside that there is
@@ -5304,19 +5239,14 @@ impl Arca {
                 // something that had not finished loading.
                 let tall = (glyphs::SIZE + ui.spacing().button_padding.y * 2.0)
                     .max(ui.spacing().interact_size.y);
-                // Only if what is left is enough to be a box. Asking for more
-                // width than there is does not make the window wider, it makes
-                // the box hang over the edge, which is what it was doing.
                 let wide = ui.available_width();
-                if wide >= FILTER_MIN {
-                    ui.add_sized(
-                        egui::vec2(wide, tall),
-                        egui::TextEdit::singleline(&mut self.filter)
-                            .id(egui::Id::new("filter"))
-                            .vertical_align(egui::Align::Center)
-                            .hint_text(s.filter_hint),
-                    );
-                }
+                ui.add_sized(
+                    egui::vec2(wide, tall),
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .id(egui::Id::new("filter"))
+                        .vertical_align(egui::Align::Center)
+                        .hint_text(s.filter_hint),
+                );
             });
         });
 
@@ -7717,12 +7647,11 @@ fn main() -> eframe::Result<()> {
     // window needs room for a progress bar and two buttons. One floor for both
     // was the browsing one, so the job window was being held open at more than
     // twice the size of what it had to show.
-    //
-    // The browsing floor used to be 720 because that is what the commands need
-    // with their words on. They drop their words when there is no room for them
-    // now, so the floor is what the pictures and the search box need instead,
-    // and the window goes down to about half of what it did.
-    let floor = if compact { [380.0, 180.0] } else { WINDOW_MIN };
+    let floor = if compact {
+        [380.0, 180.0]
+    } else {
+        [720.0, 320.0]
+    };
     // The icon compiled into the executable covers the Explorer and the
     // shortcut, but winit does not read it for the window itself, so the title
     // bar and the taskbar keep the generic one unless it is set here too.
