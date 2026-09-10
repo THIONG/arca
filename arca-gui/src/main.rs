@@ -7671,10 +7671,12 @@ fn main() -> eframe::Result<()> {
     let size = match remembered {
         Some([_, _, w, h]) => [w, h],
         None if compact => [440.0, 192.0],
-        // Lo justo para la fila de comandos y una lista que se lea, y no mas:
-        // una ventana que se abre ocupando media pantalla la primera vez es una
-        // ventana que hay que colocar antes de poder usarla.
-        None => [840.0, 540.0],
+        // Bastante para que la lista quepa con sus columnas y se lean los
+        // nombres sin tocar nada, que es lo que se hace nada mas abrir un
+        // archivo. Mas estrecha cabe -- el minimo esta en 840 -- pero entonces
+        // la ruta y la fecha se quedan a media palabra y hay que ensancharla a
+        // mano cada vez.
+        None => [970.0, 620.0],
     };
     // The browsing window needs room for the row of commands; the little job
     // window needs room for a progress bar and two buttons. One floor for both
