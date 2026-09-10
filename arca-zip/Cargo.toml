@@ -19,6 +19,10 @@ getrandom = "0.2"
 arca-core.workspace = true
 flate2.workspace = true
 crc32fast.workspace = true
+# Comprimir cada entrada en un nucleo distinto. Es lo que hace que un zip valga
+# la pena frente a los formatos de un solo flujo, y hasta ahora solo lo tenia la
+# linea de ordenes.
+rayon.workspace = true
 # Zstandard: bindings a libzstd. Entra solo con la bandera codecs-native
 # (seccion 03 del diseno).
 zstd = { workspace = true, optional = true }

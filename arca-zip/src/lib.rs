@@ -1550,6 +1550,153 @@ pub fn compress_block(data: &[u8], codec: Codec, level: Level) -> Result<(Vec<u8
     }
 }
 
+/// A file on its way into a new archive: where to read it from, the name it
+/// takes inside, and what its own metadata said.
+///
+/// The size is here because the batching has to know it before anything is
+/// read, and the time because an archive that forgets when a file was written
+/// has lost something the file had.
+pub struct Source {
+    pub path: std::path::PathBuf,
+    pub name: String,
+    pub size: u64,
+    pub mtime: i64,
+}
+
+/// How much of the uncompressed data one thread is allowed to be holding.
+///
+/// Compressing in parallel means several files are in memory at once, and
+/// without a ceiling a folder of big files would ask for all of them at the
+/// same time. This is the ceiling per thread; the batches are cut so that what
+/// is in flight never goes over it.
+const IN_FLIGHT_PER_THREAD: u64 = 32 * 1024 * 1024;
+
+/// Cuts the list into runs of files that fit in `cap` bytes together.
+///
+/// A file bigger than the whole budget comes out in a batch of its own, which
+/// is the caller's cue to stream it instead of reading it in.
+fn batches(files: &[Source], cap: u64) -> Vec<Vec<usize>> {
+    let mut v = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut sum = 0u64;
+    for (i, f) in files.iter().enumerate() {
+        if f.size > cap {
+            if !current.is_empty() {
+                v.push(std::mem::take(&mut current));
+                sum = 0;
+            }
+            v.push(vec![i]);
+            continue;
+        }
+        if sum + f.size > cap && !current.is_empty() {
+            v.push(std::mem::take(&mut current));
+            sum = 0;
+        }
+        current.push(i);
+        sum += f.size;
+    }
+    if !current.is_empty() {
+        v.push(current);
+    }
+    v
+}
+
+type Block = (usize, Vec<u8>, Method, u32);
+
+/// Writes a new archive at `out` holding `files`, compressing on every core.
+///
+/// This is what makes a zip worth having over the formats that pack everything
+/// into one stream: each entry is compressed on its own, so a hundred files can
+/// go through a hundred compressions at once and only the writing is left to a
+/// single thread. Nothing about the file that comes out says it was made this
+/// way -- it is an ordinary zip.
+///
+/// Files are read in batches so that the memory held at once stays bounded, and
+/// one too big for the whole budget is streamed straight through instead. That
+/// one goes at the speed of a single core, which is the price of not needing
+/// room for it.
+///
+/// Sealing happens inside the worker on purpose: deriving the key is a thousand
+/// rounds of PBKDF2 per entry, and doing it back in the writer would put all of
+/// them on one thread.
+///
+/// `notify` is told how many files are finished and answers whether to carry
+/// on; a no gives up with [`Error::Cancelled`] and leaves the half-written file
+/// where it is, for the caller to clear away. `threads` at zero means every
+/// core.
+pub fn create_zip(
+    out: &std::path::Path,
+    files: &[Source],
+    codec: Codec,
+    level: Level,
+    threads: usize,
+    password: Option<&str>,
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
+) -> Result<()> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let threads = if threads > 0 {
+        threads
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|e| Error::Format(format!("could not create the thread pool: {e}")))?;
+
+    let f = std::fs::File::create(out)?;
+    let mut w = ZipWriter::new(io::BufWriter::with_capacity(STREAM_BUF, f));
+    let cap = IN_FLIGHT_PER_THREAD * threads as u64;
+    let total = files.len();
+    let done = AtomicUsize::new(0);
+
+    for batch in batches(files, cap) {
+        if batch.len() == 1 && files[batch[0]].size > cap {
+            let s = &files[batch[0]];
+            if !notify(done.load(Ordering::Relaxed), total, &s.name) {
+                return Err(Error::Cancelled);
+            }
+            let source = io::BufReader::with_capacity(STREAM_BUF, std::fs::File::open(&s.path)?);
+            w.add_with_password(&s.name, source, codec, level, Some(s.mtime), password)?;
+            done.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let produced: Vec<Result<Block>> = pool.install(|| {
+            batch
+                .par_iter()
+                .map(|&i| {
+                    let s = &files[i];
+                    let data = std::fs::read(&s.path)?;
+                    let (c, m, crc) = compress_block(&data, codec, level)?;
+                    let c = match password {
+                        Some(pw) => seal_block(&c, pw)?,
+                        None => c,
+                    };
+                    if !notify(done.fetch_add(1, Ordering::Relaxed) + 1, total, &s.name) {
+                        return Err(Error::Cancelled);
+                    }
+                    Ok((i, c, m, crc))
+                })
+                .collect()
+        });
+        for h in produced {
+            let (i, c, m, crc) = h?;
+            let s = &files[i];
+            match password {
+                Some(_) => w.add_sealed(&s.name, &c, s.size, m, Some(s.mtime))?,
+                None => w.add_compressed(&s.name, &c, crc, s.size, m, Some(s.mtime))?,
+            }
+        }
+    }
+    w.finish()?;
+    let _ = notify(total, total, "");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2095,6 +2242,141 @@ mod tests {
         let b = central_header(0x800, crudo);
         let e = read_central_header(&mut Cursor::new(&b)).unwrap();
         assert_eq!(e.name, "caf\u{FFFD}.txt");
+    }
+
+    // What is held in memory at once is the whole point of the cut, so this
+    // checks the two things that can go wrong: a run that adds up to more than
+    // the budget, and a single file that is bigger than the budget on its own
+    // -- that one has to come out alone, because the caller reads a batch in
+    // full and a file it cannot hold has to be streamed instead.
+    #[test]
+    fn batches_never_hold_more_than_the_budget_at_once() {
+        let sizes = [3u64, 4, 3, 20, 1, 9, 1];
+        let files: Vec<Source> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &size)| Source {
+                path: std::path::PathBuf::from(format!("{i}")),
+                name: format!("{i}"),
+                size,
+                mtime: 0,
+            })
+            .collect();
+        let cut = batches(&files, 10);
+
+        let seen: Vec<usize> = cut.iter().flatten().copied().collect();
+        assert_eq!(
+            seen,
+            (0..sizes.len()).collect::<Vec<_>>(),
+            "every file, in order"
+        );
+        for b in &cut {
+            let sum: u64 = b.iter().map(|&i| files[i].size).sum();
+            if b.len() > 1 {
+                assert!(sum <= 10, "batch of {} adds up to {sum}", b.len());
+            } else {
+                assert_eq!(b.len(), 1);
+            }
+        }
+        assert_eq!(
+            cut.iter().find(|b| b.contains(&3)).unwrap(),
+            &vec![3],
+            "the big one goes alone"
+        );
+    }
+
+    // One call builds the archive both the window and the command line ask for,
+    // so this stands for both of them. What matters is that going wide changes
+    // nothing about what comes out: the same names in the same order, the same
+    // bytes, and the times the files had.
+    #[test]
+    fn create_zip_writes_every_file_with_its_name_time_and_bytes() {
+        let room = std::env::temp_dir().join(format!("arca-create-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&room);
+        std::fs::create_dir_all(room.join("sub")).unwrap();
+
+        let bodies: Vec<Vec<u8>> = (0..30)
+            .map(|i| format!("body of number {i} ").repeat(200).into_bytes())
+            .collect();
+        let mut files = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            let path = room.join("sub").join(format!("f{i}.txt"));
+            std::fs::write(&path, body).unwrap();
+            files.push(Source {
+                path,
+                name: format!("sub/f{i}.txt"),
+                size: body.len() as u64,
+                mtime: 1_700_000_000 + i as i64 * 120,
+            });
+        }
+
+        let out = room.join("out.zip");
+        create_zip(
+            &out,
+            &files,
+            Codec::Deflate,
+            Level::Normal,
+            4,
+            None,
+            &|_, _, _| true,
+        )
+        .unwrap();
+
+        let mut source = std::fs::File::open(&out).unwrap();
+        let a = ZipArchive::open(&mut source).unwrap();
+        let entries: Vec<Entry> = a.entries().to_vec();
+        drop(a);
+        assert_eq!(entries.len(), files.len());
+        for (e, want) in entries.iter().zip(&files) {
+            assert_eq!(e.name, want.name);
+            assert_eq!(e.size, want.size);
+            // A zip keeps the time as a DOS date, which counts in twos.
+            let got = e.mtime.expect("the time has to be there");
+            assert!(
+                (got - want.mtime).abs() <= 2,
+                "{}: {got} is not {}",
+                e.name,
+                want.mtime
+            );
+            let mut out_bytes = Vec::new();
+            extract_entry_with(&mut source, e, &mut out_bytes, None).unwrap();
+            let i: usize = e.name["sub/f".len()..e.name.len() - ".txt".len()]
+                .parse()
+                .unwrap();
+            assert_eq!(out_bytes, bodies[i]);
+        }
+        let _ = std::fs::remove_dir_all(&room);
+    }
+
+    // Saying no to "carry on?" has to stop it, and say so.
+    #[test]
+    fn create_zip_gives_up_when_it_is_told_to() {
+        let room = std::env::temp_dir().join(format!("arca-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&room);
+        std::fs::create_dir_all(&room).unwrap();
+        let mut files = Vec::new();
+        for i in 0..8 {
+            let path = room.join(format!("f{i}.txt"));
+            std::fs::write(&path, b"whatever").unwrap();
+            files.push(Source {
+                path,
+                name: format!("f{i}.txt"),
+                size: 8,
+                mtime: 0,
+            });
+        }
+        let e = create_zip(
+            &room.join("out.zip"),
+            &files,
+            Codec::Deflate,
+            Level::Normal,
+            2,
+            None,
+            &|_, _, _| false,
+        )
+        .unwrap_err();
+        assert!(matches!(e, Error::Cancelled), "{e:?}");
+        let _ = std::fs::remove_dir_all(&room);
     }
 
     #[test]

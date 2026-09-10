@@ -1,6 +1,6 @@
 use arca_core::{Codec, Error, Level, Result};
 use arca_tar::{TarReader, TarWriter};
-use arca_zip::{compress_block, seal_block, ZipArchive, ZipWriter};
+use arca_zip::ZipArchive;
 use clap::{Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -10,8 +10,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const BUF: usize = 256 * 1024;
-
-type Block = (usize, Vec<u8>, arca_core::Method, u32);
 
 #[derive(Parser)]
 #[command(
@@ -257,8 +255,6 @@ fn mtime_of(m: &fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-const IN_FLIGHT_PER_THREAD: u64 = 32 * 1024 * 1024;
-
 fn resolve_threads(requested: usize) -> usize {
     if requested > 0 {
         return requested;
@@ -278,32 +274,6 @@ fn resolve_codec(c: CodecArg, format_kind: Format) -> Codec {
             _ => Codec::Deflate,
         },
     }
-}
-
-fn batches(files: &[(PathBuf, String, u64, i64)], cap: u64) -> Vec<Vec<usize>> {
-    let mut v = Vec::new();
-    let mut current: Vec<usize> = Vec::new();
-    let mut sum = 0u64;
-    for (i, f) in files.iter().enumerate() {
-        if f.2 > cap {
-            if !current.is_empty() {
-                v.push(std::mem::take(&mut current));
-                sum = 0;
-            }
-            v.push(vec![i]);
-            continue;
-        }
-        if sum + f.2 > cap && !current.is_empty() {
-            v.push(std::mem::take(&mut current));
-            sum = 0;
-        }
-        current.push(i);
-        sum += f.2;
-    }
-    if !current.is_empty() {
-        v.push(current);
-    }
-    v
 }
 
 fn create(
@@ -327,58 +297,27 @@ fn create(
         return Err(Error::Format("there is nothing to add".into()));
     }
 
-    let mut files: Vec<(PathBuf, String, u64, i64)> = Vec::with_capacity(raw_list.len());
+    let mut files: Vec<arca_zip::Source> = Vec::with_capacity(raw_list.len());
     let mut total = 0u64;
     for (path, name) in raw_list {
         let m = fs::metadata(&path)?;
         total += m.len();
-        files.push((path, name, m.len(), mtime_of(&m)));
+        files.push(arca_zip::Source {
+            path,
+            name,
+            size: m.len(),
+            mtime: mtime_of(&m),
+        });
     }
 
     let t0 = Instant::now();
     match format_kind {
+        // Nothing to report while it runs -- the summary is printed at the end
+        // -- so the answer to "carry on?" is always yes.
         Format::Zip => {
-            let f = File::create(out)?;
-            let mut w = ZipWriter::new(BufWriter::with_capacity(BUF, f));
-            let cap = IN_FLIGHT_PER_THREAD * threads as u64;
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .map_err(|e| Error::Format(format!("could not create the thread pool: {e}")))?;
-
-            for batch in batches(&files, cap) {
-                if batch.len() == 1 && files[batch[0]].2 > cap {
-                    let (path, name, _, mt) = &files[batch[0]];
-                    let entrada = BufReader::with_capacity(BUF, File::open(path)?);
-                    w.add_with_password(name, entrada, codec, level, Some(*mt), password)?;
-                    continue;
-                }
-                // Sealing happens inside the worker on purpose: deriving the key
-                // is a thousand rounds of PBKDF2 per entry, and doing that back
-                // in the writer would put all of them on one thread.
-                let produced: Vec<Result<Block>> = pool.install(|| {
-                    batch
-                        .par_iter()
-                        .map(|&i| {
-                            let data = fs::read(&files[i].0)?;
-                            let (c, m, crc) = compress_block(&data, codec, level)?;
-                            match password {
-                                Some(pw) => Ok((i, seal_block(&c, pw)?, m, crc)),
-                                None => Ok((i, c, m, crc)),
-                            }
-                        })
-                        .collect()
-                });
-                for h in produced {
-                    let (i, c, m, crc) = h?;
-                    let (_, name, size, mt) = &files[i];
-                    match password {
-                        Some(_) => w.add_sealed(name, &c, *size, m, Some(*mt))?,
-                        None => w.add_compressed(name, &c, crc, *size, m, Some(*mt))?,
-                    }
-                }
-            }
-            w.finish()?;
+            arca_zip::create_zip(out, &files, codec, level, threads, password, &|_, _, _| {
+                true
+            })?
         }
         Format::Tar | Format::TarGz => {
             let f = BufWriter::with_capacity(BUF, File::create(out)?);
@@ -391,9 +330,9 @@ fn create(
                 Box::new(f)
             };
             let mut w = TarWriter::new(dest);
-            for (path, name, size, mt) in &files {
-                let entrada = BufReader::with_capacity(BUF, File::open(path)?);
-                w.add(name, *size, *mt, 0o644, entrada)?;
+            for s in &files {
+                let entrada = BufReader::with_capacity(BUF, File::open(&s.path)?);
+                w.add(&s.name, s.size, s.mtime, 0o644, entrada)?;
             }
             let mut d = w.finish()?;
             d.flush()?;

@@ -9,7 +9,7 @@ mod tree;
 
 use arca_core::{Codec, Entry, Level};
 use arca_tar::{TarReader, TarWriter};
-use arca_zip::{ZipArchive, ZipWriter};
+use arca_zip::ZipArchive;
 use eframe::egui;
 use egui::ThemePreference;
 use egui_extras::{Column, TableBuilder};
@@ -1007,6 +1007,18 @@ fn collect_files(inputs: &[PathBuf]) -> std::io::Result<Vec<(PathBuf, String)>> 
     Ok(v)
 }
 
+/// When a file was last written, as seconds since 1970.
+///
+/// Zero when the system will not say, which is what a zip means by leaving the
+/// field empty anyway.
+fn mtime_of(m: &fs::Metadata) -> i64 {
+    m.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn compress(
     out: &Path,
     inputs: &[PathBuf],
@@ -1028,18 +1040,22 @@ fn compress(
     let mut source_bytes = 0u64;
 
     match format {
+        // Every entry in a zip is compressed on its own, so this hands the
+        // whole list over and lets it run on every core. It is the same call
+        // the command line makes; there is one of these, not two.
         Format::Zip => {
-            let mut w = ZipWriter::new(BufWriter::with_capacity(BUF, File::create(out)?));
-            for (i, (path, name)) in files.iter().enumerate() {
-                if !notify(i, total, name) {
-                    return Err(arca_core::Error::Cancelled);
-                }
+            let mut sources = Vec::with_capacity(files.len());
+            for (path, name) in &files {
                 let meta = fs::metadata(path)?;
-                let f = BufReader::with_capacity(BUF, File::open(path)?);
-                w.add_with_password(name, f, codec, level, None, password)?;
                 source_bytes += meta.len();
+                sources.push(arca_zip::Source {
+                    path: path.clone(),
+                    name: name.clone(),
+                    size: meta.len(),
+                    mtime: mtime_of(&meta),
+                });
             }
-            w.finish()?;
+            arca_zip::create_zip(out, &sources, codec, level, 0, password, notify)?;
         }
         _ => {
             let raw = BufWriter::with_capacity(BUF, File::create(out)?);
