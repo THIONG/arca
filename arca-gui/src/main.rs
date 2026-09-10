@@ -2903,6 +2903,33 @@ impl Arca {
         rows
     }
 
+    /// Where a job about to start is going to be shown, and under what name.
+    ///
+    /// Work started from the list stays over the list: what is being worked on
+    /// is right there behind it, and a window that goes away and comes back
+    /// loses your place in it. Work started from the Explorer has no list
+    /// behind it and takes the whole window, which is all there is -- and then
+    /// the title bar is the only place left to say what is going on, the way
+    /// every other progress window on the machine does. A taskbar full of
+    /// windows called "Arca" tells nobody which is which.
+    ///
+    /// Every job goes through here, opening a file to look at it included: it
+    /// is the same thing being reported, and a panel that puts itself away when
+    /// it is done beats a screen that has to be dismissed.
+    fn show_job(&mut self, ctx: &egui::Context, verb: &str, subject: String) {
+        self.title = verb.to_string();
+        self.subject = subject;
+        self.overlay = matches!(self.view, View::Browse) && self.archive.is_some();
+        if !self.overlay {
+            self.view = View::Running;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(if self.subject.is_empty() {
+                "Arca".to_string()
+            } else {
+                format!("{} — {}", self.title, self.subject)
+            }));
+        }
+    }
+
     /// A fresh pair of flags for a job about to start, handed back so the
     /// worker and the window end up holding the same two.
     ///
@@ -3344,39 +3371,19 @@ impl Arca {
             }
         }
         let s: &'static Strings = self.s();
-        // Work started from the list stays over the list: what is being worked
-        // on is right there behind it, and a window that goes away and comes
-        // back loses your place in it. Work started from the command line has
-        // no list behind it and takes the whole window, which is all there is.
-        self.overlay = matches!(self.view, View::Browse) && self.archive.is_some();
-        if !self.overlay {
-            self.view = View::Running;
-        }
-        self.title = match &job {
-            Job::Extract { .. } => s.extracting.to_string(),
-            Job::Test { .. } => s.testing.to_string(),
-            Job::Password { .. } => s.changing_password.to_string(),
-            Job::Delete { .. } => s.deleting.to_string(),
-            Job::Rename { .. } => s.renaming.to_string(),
-            Job::CopyTo { .. } => s.copying_word.to_string(),
-            Job::NewFolder { .. } => s.adding.to_string(),
-            Job::Move { .. } => s.moving_word.to_string(),
-            Job::Compress { .. } => s.compressing.to_string(),
-            Job::Add { .. } => s.adding.to_string(),
+        let verb = match &job {
+            Job::Extract { .. } => s.extracting,
+            Job::Test { .. } => s.testing,
+            Job::Password { .. } => s.changing_password,
+            Job::Delete { .. } => s.deleting,
+            Job::Rename { .. } => s.renaming,
+            Job::CopyTo { .. } => s.copying_word,
+            Job::NewFolder { .. } => s.adding,
+            Job::Move { .. } => s.moving_word,
+            Job::Compress { .. } => s.compressing,
+            Job::Add { .. } => s.adding,
         };
-        self.subject = subject_of(&job);
-        // The little window a job opens on its own says what it is doing and to
-        // what, the way every other progress window on the machine does: a
-        // taskbar full of windows called "Arca" tells nobody which is which.
-        // The browsing window keeps the name of the archive it has open, since
-        // the job is a panel inside it and not the window itself.
-        if !self.overlay {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(if self.subject.is_empty() {
-                "Arca".to_string()
-            } else {
-                format!("{} — {}", self.title, self.subject)
-            }));
-        }
+        self.show_job(ctx, verb, subject_of(&job));
         self.close_when_done = !matches!(
             job,
             Job::Test { .. }
@@ -6398,9 +6405,18 @@ impl Arca {
         let password = self.archive_password.clone();
         let s = self.s();
         let ctx2 = ctx.clone();
+        // Only ever started from the list, so this is the panel over it, and it
+        // takes itself away when the file has been handed over. Not the whole
+        // window: what you were looking at is right behind it, and you are
+        // going to want it back the moment the other program opens.
         self.close_when_done = false;
-        self.title = s.opening.to_string();
-        self.view = View::Running;
+        let name = entry
+            .name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&entry.name)
+            .to_string();
+        self.show_job(ctx, s.opening, name);
         self.spawn(ctx, 1, move |tx| {
             let _ = tx.send(Message::Progress(0, 1, entry.name.clone()));
             ctx2.request_repaint();
