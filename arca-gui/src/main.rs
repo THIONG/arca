@@ -7472,8 +7472,15 @@ impl eframe::App for Arca {
         // Only a window somebody is browsing in: the small one a job runs in
         // would otherwise be what came back next time.
         if matches!(self.view, View::Browse) {
-            if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
-                self.geometry = Some([rect.min.x, rect.min.y, rect.width(), rect.height()]);
+            // El sitio de fuera y el tamano de dentro, cada uno de donde toca.
+            // La ventana se abre pidiendo un tamano interior y aqui se guardaba
+            // el exterior, que es el mismo mas la barra de titulo y los bordes:
+            // cada vez que se cerraba y se volvia a abrir, la ventana crecia esa
+            // barra de titulo. Abrir y cerrar diez veces la hacia un palmo mas
+            // alta sin que nadie la tocase.
+            let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+            if let (Some(outer), Some(inner)) = (outer, inner) {
+                self.geometry = Some([outer.min.x, outer.min.y, inner.width(), inner.height()]);
             }
         }
         self.ask_about_updates(ctx);
@@ -7664,7 +7671,10 @@ fn main() -> eframe::Result<()> {
     let size = match remembered {
         Some([_, _, w, h]) => [w, h],
         None if compact => [440.0, 192.0],
-        None => [1000.0, 660.0],
+        // Lo justo para la fila de comandos y una lista que se lea, y no mas:
+        // una ventana que se abre ocupando media pantalla la primera vez es una
+        // ventana que hay que colocar antes de poder usarla.
+        None => [840.0, 540.0],
     };
     // The browsing window needs room for the row of commands; the little job
     // window needs room for a progress bar and two buttons. One floor for both
