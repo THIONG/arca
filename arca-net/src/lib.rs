@@ -53,6 +53,12 @@ pub fn get(url: &str, agent: &str) -> Option<String> {
 /// plain `https` with a host is turned down rather than guessed at: this is
 /// about to be handed to the machine's HTTP client, and a caller who meant
 /// something else should hear about it here.
+///
+/// Only where it is used: off Windows there is no client to hand an address to,
+/// so the library has no caller for this and the compiler is right to say so.
+/// The tests are a caller everywhere, and what this turns down is worth testing
+/// on whatever machine happens to be running them.
+#[cfg(any(windows, test))]
 fn split(url: &str) -> Option<(String, String)> {
     let rest = url.strip_prefix("https://")?;
     // No credentials, no port, no fragment: none of them are needed and each
