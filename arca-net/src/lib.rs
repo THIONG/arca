@@ -23,8 +23,10 @@
 
 /// The most that will be read from a reply, in bytes.
 ///
-/// Room enough for what this is used for many times over, and small enough that
-/// a stranger cannot make the window swallow a gigabyte by answering with one.
+/// Room enough for what [`get`] is used for many times over, and small enough
+/// that a stranger cannot make the window swallow a gigabyte by answering with
+/// one. Something that knows what it is asking for -- an installer, whose size
+/// the release says beforehand -- passes its own to [`fetch`].
 pub const CEILING: usize = 256 * 1024;
 
 /// Asks `url` for its contents and gives them back as text.
@@ -32,8 +34,28 @@ pub const CEILING: usize = 256 * 1024;
 /// `https://` only, and only what fits under [`CEILING`]. `None` for every way
 /// it can fail, which includes a machine with no network, an address that does
 /// not answer, anything but a 200, and a body that is not text.
+pub fn get(url: &str, agent: &str) -> Option<String> {
+    let bytes = fetch(url, agent, CEILING, &|_, _| true)?;
+    String::from_utf8(bytes).ok()
+}
+
+/// The same, for something that is not text and does not fit in a line.
+///
+/// `ceiling` is what the caller is prepared to hold: anything longer than that
+/// is refused halfway rather than read to the end, because the only way to know
+/// how big a reply really is, is to have read it.
+///
+/// `watch` is told how many bytes have arrived and how many are expected -- nil
+/// when the other end does not say -- and answers whether to carry on. That is
+/// what a progress bar is drawn from, and what stops a download nobody is
+/// waiting for any more.
 #[cfg(not(windows))]
-pub fn get(_url: &str, _agent: &str) -> Option<String> {
+pub fn fetch(
+    _url: &str,
+    _agent: &str,
+    _ceiling: usize,
+    _watch: &dyn Fn(usize, Option<usize>) -> bool,
+) -> Option<Vec<u8>> {
     // Off Windows there is no system client to borrow. The one caller shows
     // nothing when there is no answer, which is what a machine with no network
     // gets too, so there is nothing here that needs writing yet.
@@ -41,9 +63,14 @@ pub fn get(_url: &str, _agent: &str) -> Option<String> {
 }
 
 #[cfg(windows)]
-pub fn get(url: &str, agent: &str) -> Option<String> {
+pub fn fetch(
+    url: &str,
+    agent: &str,
+    ceiling: usize,
+    watch: &dyn Fn(usize, Option<usize>) -> bool,
+) -> Option<Vec<u8>> {
     let (host, path) = split(url)?;
-    windows_impl::get(&host, &path, agent)
+    windows_impl::fetch(&host, &path, agent, ceiling, watch)
 }
 
 /// Splits `https://host/path...` into the host and everything after it.
@@ -102,7 +129,13 @@ mod windows_impl {
         }
     }
 
-    pub fn get(host: &str, path: &str, agent: &str) -> Option<String> {
+    pub fn fetch(
+        host: &str,
+        path: &str,
+        agent: &str,
+        ceiling: usize,
+        watch: &dyn Fn(usize, Option<usize>) -> bool,
+    ) -> Option<Vec<u8>> {
         let agent_w = wide(agent);
         let host_w = wide(host);
         let path_w = wide(path);
@@ -122,8 +155,10 @@ mod windows_impl {
                 return None;
             }
             // Time limits so that a server that accepts the connection and then
-            // says nothing cannot leave a thread of ours waiting for ever.
-            let _ = WinHttpSetTimeouts(session.0, 5_000, 5_000, 10_000, 10_000);
+            // says nothing cannot leave a thread of ours waiting for ever. The
+            // last one is per read, not for the whole download: a file of
+            // several megabytes takes many reads and each one has to answer.
+            let _ = WinHttpSetTimeouts(session.0, 5_000, 5_000, 10_000, 30_000);
 
             let connection = Handle(WinHttpConnect(
                 session.0,
@@ -157,8 +192,17 @@ mod windows_impl {
             if status(request.0)? != 200 {
                 return None;
             }
+            // What the other end says it is going to send, if it says. A number
+            // to draw a bar with, and nothing more: what is actually read is
+            // what is counted, and the ceiling is what decides when to stop.
+            let expected = header_number(request.0, WINHTTP_QUERY_CONTENT_LENGTH)
+                .filter(|n| *n as usize <= ceiling)
+                .map(|n| n as usize);
 
             let mut body: Vec<u8> = Vec::new();
+            if !watch(0, expected) {
+                return None;
+            }
             loop {
                 let mut waiting = 0u32;
                 if WinHttpQueryDataAvailable(request.0, &mut waiting).is_err() {
@@ -167,10 +211,10 @@ mod windows_impl {
                 if waiting == 0 {
                     break;
                 }
-                let want = (waiting as usize).min(super::CEILING - body.len());
+                let want = (waiting as usize).min(ceiling - body.len());
                 if want == 0 {
                     // At the ceiling with more still coming. Whatever this is,
-                    // it is not the short piece of text that was asked for.
+                    // it is not what was asked for.
                     return None;
                 }
                 let at = body.len();
@@ -190,9 +234,33 @@ mod windows_impl {
                 if read == 0 {
                     break;
                 }
+                if !watch(body.len(), expected) {
+                    return None;
+                }
             }
-            String::from_utf8(body).ok()
+            Some(body)
         }
+    }
+
+    /// A header that is a number, read as text and turned into one.
+    ///
+    /// Absent is not a failure: Content-Length is a courtesy and a reply that
+    /// does not carry it is still a reply. It only costs the progress bar its
+    /// end, which is why nothing here refuses anything over it.
+    unsafe fn header_number(request: *mut std::ffi::c_void, which: u32) -> Option<u64> {
+        let mut buffer = [0u16; 32];
+        let mut size = (buffer.len() * 2) as u32;
+        WinHttpQueryHeaders(
+            request,
+            which,
+            PCWSTR::null(),
+            Some(buffer.as_mut_ptr() as *mut _),
+            &mut size,
+            std::ptr::null_mut(),
+        )
+        .ok()?;
+        let end = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+        String::from_utf16_lossy(&buffer[..end]).trim().parse().ok()
     }
 
     /// The status line's number, which is asked for as text and turned into

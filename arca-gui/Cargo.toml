@@ -57,6 +57,10 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 sys-locale = "0.3"
 
+# SHA-256 para comprobar lo que se baja antes de ejecutarlo. RustCrypto, safe
+# Rust puro, la misma familia que el sha1 del cifrado de arca-zip.
+sha2 = "0.10"
+
 # CF_HDROP on the system clipboard, so Ctrl+C here pastes files in the
 # Explorer. A thin wrapper over the four clipboard calls Win32 has; taking the
 # `windows` crate for it would pull a far larger dependency in for the same
