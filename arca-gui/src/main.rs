@@ -760,6 +760,35 @@ pub enum Answer {
 
 // The worker asks the window and blocks until it answers. The "all" answers
 // stick, so the question is asked once and not per file.
+/// The name of the thing a job is being done to, without the path.
+///
+/// One archive is named; several are counted, because a list of ten paths in a
+/// title bar is no more use than none. Compressing has no archive yet, so it is
+/// the file about to be made.
+fn subject_of(job: &Job) -> String {
+    let named = |p: &Path| {
+        p.file_name()
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_default()
+    };
+    match job {
+        Job::Extract { archives, .. } => match archives.split_first() {
+            Some((only, [])) => named(only),
+            Some((_, rest)) => format!("{} +{}", named(&archives[0]), rest.len()),
+            None => String::new(),
+        },
+        Job::Compress { out, .. } => named(out),
+        Job::Test { archive, .. }
+        | Job::Password { archive, .. }
+        | Job::Delete { archive, .. }
+        | Job::CopyTo { archive, .. }
+        | Job::Move { archive, .. }
+        | Job::NewFolder { archive, .. }
+        | Job::Rename { archive, .. }
+        | Job::Add { archive, .. } => named(archive),
+    }
+}
+
 fn conflict_asker<'a>(
     tx: &'a Sender<Message>,
     ctx: &'a egui::Context,
@@ -2500,6 +2529,10 @@ struct Arca {
     output_name: String,
     close_when_done: bool,
     title: String,
+    // What the job is being done to: the archive, or the file about to be
+    // made. Shown under the verb, and put in the title bar of the little
+    // window a job opens on its own.
+    subject: String,
     current_dir: String,
     show_settings: bool,
     conflict: Option<String>,
@@ -2584,6 +2617,10 @@ struct Arca {
     // Raised to ask whatever is running to stop where it is. Shared with the
     // thread doing the work, which reads it every time it reports progress.
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // Raised to hold the work where it is without giving it up. Read in the
+    // same place as `stop`, which is the end of an entry: a file that has
+    // started is finished, and nothing new is begun until this comes down.
+    hold: std::sync::Arc<std::sync::atomic::AtomicBool>,
     // The folders of the archive, rebuilt when a listing arrives rather than
     // every frame: it is fifteen hundred paths split on every slash and the
     // answer only changes when the archive does.
@@ -2659,6 +2696,7 @@ impl Arca {
             output_name: String::new(),
             close_when_done: false,
             title: String::new(),
+            subject: String::new(),
             current_dir: String::new(),
             show_settings: false,
             conflict: None,
@@ -2698,6 +2736,7 @@ impl Arca {
             folder_input: String::new(),
             undo: None,
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hold: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             viewing: None,
             picking_group: None,
             mask: String::new(),
@@ -2864,6 +2903,25 @@ impl Arca {
         rows
     }
 
+    /// A fresh pair of flags for a job about to start, handed back so the
+    /// worker and the window end up holding the same two.
+    ///
+    /// Fresh rather than lowered: a thread that was told to stop may still be
+    /// on its way out, and it must not read the flag the next job is watching.
+    /// And handed back rather than cloned by the caller, because these used to
+    /// be replaced inside `spawn`, after the worker had already taken a copy of
+    /// the old one -- which left Cancel writing to a flag nobody was reading.
+    fn fresh_flags(
+        &mut self,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.hold = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (self.stop.clone(), self.hold.clone())
+    }
+
     fn spawn<F>(&mut self, ctx: &egui::Context, total: usize, work: F)
     where
         F: FnOnce(&Sender<Message>) + Send + 'static,
@@ -2877,10 +2935,6 @@ impl Arca {
         self.total_count = total;
         self.current_file.clear();
         self.started = Some(Instant::now());
-        // A fresh flag for a fresh job, rather than lowering the old one: the
-        // thread that was told to stop may still be on its way out, and it must
-        // not read this one and carry on.
-        self.stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             work(&tx);
@@ -3310,6 +3364,19 @@ impl Arca {
             Job::Compress { .. } => s.compressing.to_string(),
             Job::Add { .. } => s.adding.to_string(),
         };
+        self.subject = subject_of(&job);
+        // The little window a job opens on its own says what it is doing and to
+        // what, the way every other progress window on the machine does: a
+        // taskbar full of windows called "Arca" tells nobody which is which.
+        // The browsing window keeps the name of the archive it has open, since
+        // the job is a panel inside it and not the window itself.
+        if !self.overlay {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(if self.subject.is_empty() {
+                "Arca".to_string()
+            } else {
+                format!("{} — {}", self.title, self.subject)
+            }));
+        }
         self.close_when_done = !matches!(
             job,
             Job::Test { .. }
@@ -3360,11 +3427,18 @@ impl Arca {
         let (reply_tx, reply_rx) = channel::<Answer>();
         self.replies = Some(reply_tx);
         let ctx2 = ctx.clone();
-        let stop = self.stop.clone();
+        let (stop, hold) = self.fresh_flags();
         self.spawn(ctx, 0, move |tx| {
             let notify = |i: usize, n: usize, name: &str| {
                 let _ = tx.send(Message::Progress(i, n, name.to_string()));
                 ctx2.request_repaint();
+                // Held right here while it is paused. This is the end of an
+                // entry, which is the one moment the work is not in the middle
+                // of something; stopping still gets through, so a paused job
+                // can be given up on without being let go first.
+                while hold.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                }
                 // The answer to "carry on?". Read on every step because that is
                 // the only place a long job looks up from what it is doing.
                 !stop.load(Ordering::Relaxed)
@@ -3680,11 +3754,18 @@ impl Arca {
         let (reply_tx, reply_rx) = channel::<Answer>();
         self.replies = Some(reply_tx);
         let ctx2 = ctx.clone();
-        let stop = self.stop.clone();
+        let (stop, hold) = self.fresh_flags();
         self.spawn(ctx, total, move |tx| {
             let notify = |i: usize, n: usize, name: &str| {
                 let _ = tx.send(Message::Progress(i, n, name.to_string()));
                 ctx2.request_repaint();
+                // Held right here while it is paused. This is the end of an
+                // entry, which is the one moment the work is not in the middle
+                // of something; stopping still gets through, so a paused job
+                // can be given up on without being let go first.
+                while hold.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                }
                 // The answer to "carry on?". Read on every step because that is
                 // the only place a long job looks up from what it is doing.
                 !stop.load(Ordering::Relaxed)
@@ -3827,11 +3908,18 @@ impl Arca {
         let pw = self.archive_password.clone();
         self.close_when_done = false;
         let ctx2 = ctx.clone();
-        let stop = self.stop.clone();
+        let (stop, hold) = self.fresh_flags();
         self.spawn(ctx, total, move |tx| {
             let notify = |i: usize, n: usize, name: &str| {
                 let _ = tx.send(Message::Progress(i, n, name.to_string()));
                 ctx2.request_repaint();
+                // Held right here while it is paused. This is the end of an
+                // entry, which is the one moment the work is not in the middle
+                // of something; stopping still gets through, so a paused job
+                // can be given up on without being let go first.
+                while hold.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                }
                 // The answer to "carry on?". Read on every step because that is
                 // the only place a long job looks up from what it is doing.
                 !stop.load(Ordering::Relaxed)
@@ -5505,11 +5593,139 @@ impl Arca {
     // and one of tidying up. This is the shape every other archiver uses --
     // a small window over the work, saying what, how far, how long, and how to
     // stop -- and it goes away by itself when the work is done.
+    /// The inside of the progress window: what is being worked on, how far
+    /// along it is, and how long it has been going.
+    ///
+    /// Drawn the same whether it is the panel over the list or the little
+    /// window a job opens on its own, because it is the same thing being said.
+    /// Every line is there on every frame, with or without anything to put in
+    /// it, so the window does not change height while it works.
+    fn progress_body(&self, ui: &mut egui::Ui) {
+        let s = self.s();
+        let fraction = if self.total_count == 0 {
+            0.0
+        } else {
+            self.done_count as f32 / self.total_count as f32
+        };
+        // What it is being done to. The verb is in the title, so this is only
+        // the name, and it is the line that says which of several windows this
+        // one is.
+        if !self.subject.is_empty() {
+            ui.add(egui::Label::new(egui::RichText::new(&self.subject).strong()).truncate());
+            ui.add_space(6.0);
+        }
+        ui.add(
+            egui::ProgressBar::new(fraction)
+                .text(if self.total_count == 0 {
+                    format!("{:.0}%", fraction * 100.0)
+                } else {
+                    format!("{} / {}", self.done_count, self.total_count)
+                })
+                .desired_width(ui.available_width()),
+        );
+        ui.add_space(5.0);
+        // The file of the moment, and under it the clock. Both small and quiet:
+        // they change several times a second and nobody reads them line by
+        // line, they are there to say it is still moving.
+        ui.add(egui::Label::new(egui::RichText::new(&self.current_file).weak().small()).truncate());
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            let held = self.hold.load(std::sync::atomic::Ordering::Relaxed);
+            if let Some(t) = self.started {
+                let gone = t.elapsed().as_secs_f64();
+                ui.label(
+                    egui::RichText::new(format!("{} {}", s.elapsed_word, clock(gone)))
+                        .weak()
+                        .small(),
+                );
+                // Guessed from how long the part already done took, and only
+                // once enough of it is done for the guess to be worth reading:
+                // at two per cent it would say an hour and then a minute. A
+                // paused job is not going anywhere, so it says nothing.
+                if self.busy && !held && fraction > 0.05 {
+                    let left = gone / fraction as f64 - gone;
+                    ui.label(
+                        egui::RichText::new(format!("· {} {}", s.time_left, clock(left)))
+                            .weak()
+                            .small(),
+                    );
+                }
+            }
+            if held {
+                ui.label(
+                    egui::RichText::new(format!("· {}", s.paused_word))
+                        .weak()
+                        .small(),
+                );
+            }
+        });
+    }
+
+    /// What can be pressed while a job runs, and what is left when it stops.
+    /// Answers whether the window should go.
+    fn progress_buttons(&self, ui: &mut egui::Ui) -> bool {
+        use std::sync::atomic::Ordering;
+        let s = self.s();
+        let mut close = false;
+        if self.busy {
+            let asked = self.stop.load(Ordering::Relaxed);
+            let held = self.hold.load(Ordering::Relaxed);
+            ui.horizontal(|ui| {
+                // Pausing lets go at the end of an entry, not the end of a
+                // byte, so a file that has started still has to finish.
+                if ui
+                    .add_enabled(
+                        !asked,
+                        egui::Button::new(if held { s.resume_word } else { s.pause_word }),
+                    )
+                    .clicked()
+                {
+                    self.hold.store(!held, Ordering::Relaxed);
+                }
+                // A way out of anything that is going to take a while. The
+                // button goes quiet once it is pressed, because the job is over
+                // as far as the person pressing it is concerned.
+                if ui
+                    .add_enabled(!asked, egui::Button::new(s.cancel))
+                    .clicked()
+                {
+                    self.stop.store(true, Ordering::Relaxed);
+                    // Let it go first, or the news would sit unread until
+                    // somebody pressed Resume.
+                    self.hold.store(false, Ordering::Relaxed);
+                }
+                if asked {
+                    ui.label(egui::RichText::new(s.stopping).weak().small());
+                }
+            });
+        } else {
+            // Only ever reached when something went wrong or was given up on: a
+            // job that finishes takes this window with it. What it says wraps
+            // rather than being cut, because it is the reason the window is
+            // still here.
+            let (word, color) = if self.error {
+                (s.failed, ui.visuals().error_fg_color)
+            } else {
+                (s.done, ui.visuals().text_color())
+            };
+            ui.label(egui::RichText::new(word).color(color).strong());
+            if !self.notice.is_empty() {
+                ui.add_space(2.0);
+                ui.label(&self.notice);
+            }
+            ui.add_space(10.0);
+            if ui.button(s.close).clicked() {
+                close = true;
+            }
+        }
+        close
+    }
+
+    /// The job as a panel over the list it was started from.
     fn progress_window(&mut self, ctx: &egui::Context) {
         if !self.overlay {
             return;
         }
-        let s = self.s();
         // The list behind is dimmed rather than left bright: it is not what is
         // being asked about, and anything pressed in it would be a second job
         // on an archive that is being rewritten.
@@ -5520,151 +5736,38 @@ impl Arca {
         ))
         .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(120));
 
-        let fraction = if self.total_count == 0 {
-            0.0
-        } else {
-            self.done_count as f32 / self.total_count as f32
-        };
         let mut close = false;
         egui::Window::new(&self.title)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                ui.set_min_width(420.0);
-                ui.add_space(4.0);
-                // What it is on right now. A fixed line whether or not there is
-                // a name yet, so the window does not change height as it works.
-                ui.add(egui::Label::new(egui::RichText::new(&self.current_file).weak()).truncate());
-                ui.add_space(6.0);
-                ui.add(
-                    egui::ProgressBar::new(fraction)
-                        .text(format!("{:.0}%", fraction * 100.0))
-                        .desired_width(ui.available_width()),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if let Some(t) = self.started {
-                        let gone = t.elapsed().as_secs_f64();
-                        ui.label(
-                            egui::RichText::new(format!("{} {}", s.elapsed_word, clock(gone)))
-                                .weak()
-                                .small(),
-                        );
-                        // Guessed from how long the part already done took, and
-                        // only once enough of it is done for the guess to be
-                        // worth reading: at two per cent it would say an hour
-                        // and then a minute.
-                        if self.busy && fraction > 0.05 {
-                            let left = gone / fraction as f64 - gone;
-                            ui.label(
-                                egui::RichText::new(format!("· {} {}", s.time_left, clock(left)))
-                                    .weak()
-                                    .small(),
-                            );
-                        }
-                    }
-                });
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if self.busy {
-                        let asked = self.stop.load(std::sync::atomic::Ordering::Relaxed);
-                        if ui
-                            .add_enabled(!asked, egui::Button::new(s.cancel))
-                            .clicked()
-                        {
-                            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        if asked {
-                            ui.label(egui::RichText::new(s.stopping).weak());
-                        }
-                    } else {
-                        // Only ever seen when something went wrong: a job that
-                        // finishes takes this window with it.
-                        if ui.button(s.close).clicked() {
-                            close = true;
-                        }
-                        ui.colored_label(ui.visuals().error_fg_color, &self.notice);
-                    }
-                });
-                ui.add_space(4.0);
+                ui.set_width(400.0);
+                ui.add_space(2.0);
+                self.progress_body(ui);
+                ui.add_space(12.0);
+                close = self.progress_buttons(ui);
+                ui.add_space(2.0);
             });
         if close {
             self.overlay = false;
         }
     }
 
+    /// The job as the whole window, which is what a job started from the
+    /// Explorer gets: there is no list behind it to go back to.
     fn running_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let s = self.s();
-        ui.add_space(12.0);
-        ui.heading(&self.title);
-        ui.add_space(10.0);
-
-        let fraction = if self.total_count == 0 {
-            0.0
-        } else {
-            self.done_count as f32 / self.total_count as f32
-        };
-        ui.add(
-            egui::ProgressBar::new(fraction)
-                .text(format!("{} / {}", self.done_count, self.total_count))
-                .desired_width(ui.available_width()),
-        );
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new(&self.current_file).weak());
-
-        if let Some(t) = self.started {
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(format!("{:.1} s", t.elapsed().as_secs_f64()))
-                    .weak()
-                    .small(),
-            );
-        }
-
-        // A way out of anything that is going to take a while. The work stops
-        // at the next entry rather than the next byte, so a single enormous
-        // file still has to finish being read; everything else gives up at
-        // once. The button goes quiet after it is pressed, because the job is
-        // over as far as the person pressing it is concerned.
-        if self.busy {
-            ui.add_space(12.0);
-            let asked = self.stop.load(std::sync::atomic::Ordering::Relaxed);
-            if ui
-                .add_enabled(!asked, egui::Button::new(s.cancel))
-                .clicked()
-            {
-                self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            if asked {
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new(s.stopping).weak());
-            }
-        }
-
-        if !self.busy {
-            ui.add_space(12.0);
-            let color = if self.error {
-                egui::Color32::from_rgb(220, 90, 90)
-            } else {
-                ui.visuals().text_color()
-            };
-            ui.colored_label(color, if self.error { s.failed } else { s.done });
-            ui.add_space(4.0);
-            ui.label(&self.notice);
-            ui.add_space(12.0);
-            if ui.button(s.close).clicked() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
+        // No heading here: the title bar of this window already says the verb
+        // and the name, and saying it twice in a window this small is most of
+        // the window.
+        ui.add_space(8.0);
+        self.progress_body(ui);
+        ui.add_space(14.0);
+        if self.progress_buttons(ui) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
-    // What a finished rename does with what was typed.
-    //
-    // The checks are the ones the archive cannot make for itself: a name is a
-    // name and not a path, nothing else in this folder is already called that,
-    // and a rename to the same name is not a rewrite of the whole archive for
-    // nothing. Anything else the zip will refuse on its own and say so.
     fn rename_to(&mut self, ctx: &egui::Context, rows: &[Row], path: &str, name: &str) {
         let Some(row) = rows.iter().find(|r| r.path == path) else {
             return;
@@ -7475,8 +7578,17 @@ fn main() -> eframe::Result<()> {
     let remembered = (!compact).then_some(settings.window).flatten();
     let size = match remembered {
         Some([_, _, w, h]) => [w, h],
-        None if compact => [560.0, 300.0],
+        None if compact => [440.0, 192.0],
         None => [1000.0, 660.0],
+    };
+    // The browsing window needs room for the row of commands; the little job
+    // window needs room for a progress bar and two buttons. One floor for both
+    // was the browsing one, so the job window was being held open at more than
+    // twice the size of what it had to show.
+    let floor = if compact {
+        [380.0, 180.0]
+    } else {
+        [720.0, 320.0]
     };
     // The icon compiled into the executable covers the Explorer and the
     // shortcut, but winit does not read it for the window itself, so the title
@@ -7486,7 +7598,7 @@ fn main() -> eframe::Result<()> {
         // Wide enough for the row of commands, now that every one of them says
         // its name. Below this the filter box at the end of it has no width
         // left to be given and the bar starts running off its own edge.
-        .with_min_inner_size([720.0, 320.0])
+        .with_min_inner_size(floor)
         .with_title("Arca");
     if let Some([x, y, _, _]) = remembered {
         viewport = viewport.with_position([x, y]);
