@@ -5541,7 +5541,31 @@ impl Arca {
                 self.format_row(ui);
                 ui.add_space(6.0);
                 ui.checkbox(&mut self.into_subfolder, s.into_subfolder);
-                ui.add_space(8.0);
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                // Which Arca this is. Baked in at build time, so it is the
+                // version of the program that is running and not of whatever is
+                // installed somewhere else -- which is the whole point of
+                // showing it: with two copies on the disk there was no way to
+                // tell them apart from the inside. Next to it, when there is
+                // one, the version that is out, so the two numbers that matter
+                // are in the same sentence.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Arca {}", env!("CARGO_PKG_VERSION")))
+                            .weak()
+                            .small(),
+                    );
+                    if let Some(tag) = &self.update {
+                        ui.label(
+                            egui::RichText::new(format!("· {tag}"))
+                                .small()
+                                .color(theme::cursor(ui.visuals()).color),
+                        );
+                    }
+                });
+                ui.add_space(6.0);
             });
         self.show_settings = open;
     }
