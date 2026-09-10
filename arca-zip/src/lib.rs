@@ -1401,6 +1401,7 @@ fn rewrite(
     // than finishing a copy nobody is waiting for.
     notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
 ) -> Result<u64> {
+    use rayon::prelude::*;
     use std::fs::File;
     use std::io::{BufReader, BufWriter};
 
@@ -1472,13 +1473,26 @@ fn rewrite(
     bytes += write_in_parallel(&mut w, &fresh, 0, new, &done, total, notify)?;
     w.finish()?.flush()?;
 
-    let mut check = ZipArchive::open(File::open(out)?)?;
-    for i in 0..check.len() {
-        if check.entries()[i].is_dir {
-            continue;
-        }
-        check.extract_to_with(i, io::sink(), new)?;
-    }
+    // Read back before anybody is told it worked. Rewriting somebody's archive
+    // is the one place where a quiet mistake costs the original, so every entry
+    // comes out again and its checksum is checked against what the archive
+    // claims. Nothing is kept: it goes straight to a sink.
+    //
+    // On every core, like the rest of this: the entries do not depend on each
+    // other, so each worker opens the finished file for itself and reads its
+    // own. Not cancellable, unlike the writing -- by here the archive is whole,
+    // and giving up would throw away a good one over the wait.
+    let written: Vec<Entry> = ZipArchive::open(File::open(out)?)?
+        .entries()
+        .iter()
+        .filter(|e| !e.is_dir)
+        .cloned()
+        .collect();
+    written.par_iter().try_for_each(|e| -> Result<()> {
+        let mut source = BufReader::with_capacity(STREAM_BUF, File::open(out)?);
+        extract_entry_with(&mut source, e, io::sink(), new)?;
+        Ok(())
+    })?;
     let _ = notify(total, total, "");
     Ok(bytes)
 }
