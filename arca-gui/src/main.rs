@@ -7749,6 +7749,116 @@ impl Arca {
         );
         self.carry(ui, &visible, &row_rects, out.inner_rect);
         self.wheel_scroll(ui, out.inner_rect, out.state.offset.y, reach);
+        // El hueco de debajo de la ultima fila. Ahi no hay ninguna entrada, asi
+        // que lo que se ofrece no es lo de una fila sino lo de la lista entera:
+        // lo que se puede hacer sin haber senalado nada. Es donde WinRAR pone
+        // el suyo, y hasta ahora aqui el boton derecho no hacia nada.
+        let below = row_rects
+            .last()
+            .map(|(_, r)| r.bottom())
+            .unwrap_or(out.inner_rect.top())
+            .max(out.inner_rect.top());
+        // Solo un zip se deja escribir. Se mira antes de entrar en el menu
+        // porque ahi dentro `self` ya no se puede tocar.
+        let is_zip = self.format == Format::Zip;
+        let mut pick_all = false;
+        let mut flip_all = false;
+        let mut drop_all = false;
+        let mut new_folder = false;
+        if out.inner_rect.bottom() - below > 4.0 {
+            let empty = egui::Rect::from_x_y_ranges(
+                out.inner_rect.x_range(),
+                below..=out.inner_rect.bottom(),
+            );
+            // Sense::click y nada mas. Arrastrar por aqui dibuja la seleccion
+            // de banda, que lee el raton por su cuenta; algo que sintiera el
+            // arrastre se lo quitaria.
+            let hueco = ui.interact(
+                empty,
+                egui::Id::new("arca-empty-space"),
+                egui::Sense::click(),
+            );
+            hueco.context_menu(|ui| {
+                if ui.button(format!("{}\tCtrl+A", s.select_all)).clicked() {
+                    pick_all = true;
+                    ui.close_menu();
+                }
+                if ui
+                    .button(format!("{}\tCtrl+I", s.invert_selection))
+                    .clicked()
+                {
+                    flip_all = true;
+                    ui.close_menu();
+                }
+                if ui.button(format!("{}\tEsc", s.clear_selection)).clicked() {
+                    drop_all = true;
+                    ui.close_menu();
+                }
+                ui.separator();
+                // Solo un zip se deja escribir, asi que en lo demas esto no se
+                // ofrece en vez de ofrecerse y negarse.
+                if is_zip && ui.button(s.new_folder).clicked() {
+                    new_folder = true;
+                    ui.close_menu();
+                }
+                // Siempre, sin mirar antes lo que hay dentro: el portapapeles
+                // es un cerrojo global y abrirlo en cada fotograma que el menu
+                // este abierto seria quitarselo a quien lo quiera. Si esta
+                // vacio lo dice la barra de estado.
+                if clipboard::AVAILABLE && ui.button(format!("{}\tCtrl+V", s.paste_word)).clicked()
+                {
+                    wants_paste.set(true);
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.menu_button(s.sort_by, |ui| {
+                    for which in std::iter::once(SortColumn::Name).chain(shown.iter().copied()) {
+                        let on = order.0 == which;
+                        let arrow = if !on {
+                            ""
+                        } else if order.1 {
+                            " \u{25B2}"
+                        } else {
+                            " \u{25BC}"
+                        };
+                        if ui
+                            .selectable_label(on, format!("{}{arrow}", Columns::label(which, s)))
+                            .clicked()
+                        {
+                            requested = Some(which);
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.menu_button(s.columns_word, |ui| {
+                    for (which, _) in Columns::ALL {
+                        let mut on = columns.on(which);
+                        if ui.checkbox(&mut on, Columns::label(which, s)).clicked() {
+                            toggle_column.set(Some(which));
+                            ui.close_menu();
+                        }
+                    }
+                });
+            });
+        }
+        if pick_all {
+            for r in &visible {
+                self.set_checked(r, true);
+            }
+        }
+        if flip_all {
+            let flipped: Vec<bool> = visible.iter().map(|r| !self.is_checked(r)).collect();
+            for (r, on) in visible.iter().zip(flipped) {
+                self.set_checked(r, on);
+            }
+        }
+        if drop_all {
+            self.clear_picked();
+        }
+        if new_folder {
+            self.folder_input.clear();
+            self.asking_folder = true;
+        }
         if let Some(index) = opened {
             let target = &visible[index];
             if target.is_dir {
