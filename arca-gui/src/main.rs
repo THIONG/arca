@@ -7927,13 +7927,20 @@ impl eframe::App for Arca {
                 // everywhere else. That margin was also what left the rules
                 // between the columns short of the foot.
                 //
-                // The sides keep theirs. Run to the edges there too and a
-                // picked row spills its blue off both cantos of the window,
-                // which was tried and looked worse than the gap it saved.
+                // Ni a la derecha: la lista llega al canto de la ventana, como
+                // la del Explorador y la de WinRAR. Ahi no hay nada despues de
+                // la ultima columna, asi que el margen solo dejaba una franja
+                // negra al final de la fila de cabeceras.
+                //
+                // La izquierda si guarda el suyo. Correrla a los dos lados se
+                // probo: la fila azul se derrama por los dos cantos y queda
+                // peor que el hueco que ahorra. Por la derecha no se derrama
+                // nada, porque ahi lo que hay es el final de la tabla.
                 self.tree_panel(ctx);
                 let mut frame = egui::Frame::central_panel(&ctx.style());
                 frame.inner_margin.top = 0.0;
                 frame.inner_margin.bottom = 0.0;
+                frame.inner_margin.right = 0.0;
                 egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
                     if self.entries.is_empty() {
                         let text = self.s().drop_here;
