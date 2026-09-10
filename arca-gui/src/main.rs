@@ -33,6 +33,13 @@ const ROW_HEIGHT: f32 = 29.0;
 const NAME_WIDE: f32 = 320.0;
 const NAME_LEAST: f32 = 140.0;
 const CELL_WIDE: f32 = 95.0;
+/// Lo que se aparta del canto lo que va dentro de la primera columna.
+///
+/// La lista llega al borde de la ventana, que es lo que hace que no parezca
+/// metida en una caja. Su contenido no: un icono pegado al canto no lo tiene
+/// ninguna lista de ficheros, ni la del Explorador ni la de WinRAR.
+const NAME_INSET: f32 = 8.0;
+
 const CELL_LEAST: f32 = 60.0;
 // A second click on the same row within this opens it. Half a second, which is
 // what Windows uses for the same gesture by default.
@@ -7160,6 +7167,11 @@ impl Arca {
             // the word, so the mark that says which way the sort runs was
             // allocated past the edge of the cell and clipped away.
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            // La misma sangria que llevan las filas, para que la palabra quede
+            // sobre el icono de debajo y no medio caracter a su izquierda.
+            if col == SortColumn::Name {
+                ui.add_space(NAME_INSET);
+            }
             ui.add(egui::Label::new(egui::RichText::new(text).strong()).selectable(false));
             if order.0 == col {
                 // A small triangle beside the name rather than a caret typed
@@ -7283,6 +7295,10 @@ impl Arca {
                         || r.entry
                             .is_some_and(|i| self.cut_names.contains(&self.entries[i].name));
                     row.col(|ui| {
+                        // La lista llega al canto de la ventana; lo que hay
+                        // dentro de ella, no. Sin esto el icono sale pegado al
+                        // borde, que es lo que ninguna lista de ficheros hace.
+                        ui.add_space(NAME_INSET);
                         // The system icon when the desktop has one, and the
                         // drawn one when it does not, which is every platform
                         // that is not Windows so far.
