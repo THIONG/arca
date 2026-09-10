@@ -221,6 +221,19 @@ fn archive_stem(p: &Path) -> String {
     name
 }
 
+/// Lo mas pequena que se le deja ser a la ventana de navegar.
+///
+/// Un solo numero para dos sitios que tienen que estar de acuerdo: el suelo con
+/// el que se abre la ventana, y la comprobacion que decide si vale la pena
+/// recordar un tamano guardado. Mientras no coincidieron, una ventana hecha mas
+/// pequena que la comprobacion se tiraba al cerrar y volvia como estaba.
+///
+/// El ancho es el que necesita la fila de comandos entera: los seis botones con
+/// su palabra, los separadores, y una caja de buscar que se pueda leer. Estaba
+/// en 720, que es lo que ocupan los botones y nada mas, asi que a la caja no le
+/// quedaba ancho ninguno y salia aplastada contra el borde.
+const WINDOW_MIN: [f32; 2] = [840.0, 340.0];
+
 fn config_file() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)
@@ -342,7 +355,7 @@ impl Settings {
                         // A window smaller than the minimum, or one left on a
                         // screen that is no longer plugged in, is not a window
                         // anybody can use.
-                        if w >= 720.0 && h >= 320.0 {
+                        if w >= WINDOW_MIN[0] && h >= WINDOW_MIN[1] {
                             s.window = Some([x, y, w, h]);
                         }
                     }
@@ -5239,6 +5252,16 @@ impl Arca {
                 // something that had not finished loading.
                 let tall = (glyphs::SIZE + ui.spacing().button_padding.y * 2.0)
                     .max(ui.spacing().interact_size.y);
+                // Todo el ancho que queda, sin restarle nada: la region en la
+                // que va la caja empieza ya despues del hueco que separa dos
+                // cosas cualesquiera de la fila, asi que la separacion esta
+                // puesta y quitarle otro tanto la deja mas suelta que el resto.
+                //
+                // Cuando parecia pegada al boton de al lado no era por falta de
+                // hueco, era por falta de sitio: la fila no cabia en la ventana
+                // y a la caja no le quedaban ni cuatro pixeles. Eso lo arregla
+                // WINDOW_MIN, que es lo ancha que tiene que poder ser la ventana
+                // para que la fila entera quepa.
                 let wide = ui.available_width();
                 ui.add_sized(
                     egui::vec2(wide, tall),
@@ -7647,11 +7670,7 @@ fn main() -> eframe::Result<()> {
     // window needs room for a progress bar and two buttons. One floor for both
     // was the browsing one, so the job window was being held open at more than
     // twice the size of what it had to show.
-    let floor = if compact {
-        [380.0, 180.0]
-    } else {
-        [720.0, 320.0]
-    };
+    let floor = if compact { [380.0, 180.0] } else { WINDOW_MIN };
     // The icon compiled into the executable covers the Explorer and the
     // shortcut, but winit does not read it for the window itself, so the title
     // bar and the taskbar keep the generic one unless it is set here too.
