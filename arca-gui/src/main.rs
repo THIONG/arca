@@ -7220,12 +7220,18 @@ impl eframe::App for Arca {
                             }
                         });
                     });
-                // No gap under the list: it ends against the status bar, the
-                // way a file list ends against the bottom of its window
-                // everywhere else. The margin left there was the reason the
-                // rules between the columns stopped short of the foot.
+                // No gap above the list or below it: the headings sit against
+                // the line under the toolbar and the last row against the
+                // status bar, the way a file list meets the edges of its window
+                // everywhere else. That margin was also what left the rules
+                // between the columns short of the foot.
+                //
+                // The sides keep theirs. Run to the edges there too and a
+                // picked row spills its blue off both cantos of the window,
+                // which was tried and looked worse than the gap it saved.
                 self.tree_panel(ctx);
                 let mut frame = egui::Frame::central_panel(&ctx.style());
+                frame.inner_margin.top = 0.0;
                 frame.inner_margin.bottom = 0.0;
                 egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
                     if self.entries.is_empty() {
