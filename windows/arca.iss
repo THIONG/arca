@@ -246,10 +246,25 @@ begin
     Exec(ExpandConstant('{win}\explorer.exe'), '', '', SW_SHOW, ewNoWait, Code);
 end;
 
+// Whether Arca itself asked for this install, updating in place.
+//
+// Run by hand, killing the Explorer is a second of flicker in exchange for the
+// context menu being current there and then. Updating on its own it is not:
+// nobody asked for their desktop to blink. The DLL entry carries
+// restartreplace, so a locked one is put in place at the next boot, and the old
+// one keeps working meanwhile -- all it does is start arca-gui.exe with
+// arguments. What actually changes between versions are the executables, and
+// those are copied either way.
+function QuietUpgrade(): Boolean;
+begin
+  Result := ExpandConstant('{param:update|0}') = '1';
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   // Before copying: on an upgrade the DLL is already loaded and locked.
-  if (CurStep = ssInstall) and FileExists(ExpandConstant('{app}\arca_shell.dll')) then
+  if (CurStep = ssInstall) and FileExists(ExpandConstant('{app}\arca_shell.dll'))
+     and not QuietUpgrade() then
     RestartExplorer();
 
   if CurStep = ssPostInstall then

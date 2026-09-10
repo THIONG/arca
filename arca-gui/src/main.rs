@@ -682,10 +682,16 @@ fn launch_with_system(path: &Path) -> arca_core::Result<()> {
 
 /// Lanza el instalador ya comprobado y deja que reemplace a este programa.
 ///
-/// En silencio, que es lo que se le pide a algo que ya se ha decidido: sin
-/// asistente y sin preguntas. Tampoco hay ventana de permisos, porque el
-/// instalador es por usuario y se queda en la carpeta del usuario -- si pidiera
-/// permisos de administrador esto no seria un boton, seria un susto.
+/// En silencio del todo: sin asistente, sin barra y sin preguntas, que es lo
+/// que se le pide a algo que ya se ha decidido. Tampoco hay ventana de
+/// permisos, porque el instalador es por usuario y se queda en la carpeta del
+/// usuario -- si pidiera permisos de administrador esto no seria un boton,
+/// seria un susto.
+///
+/// `/update=1` es cosa nuestra, no de Inno: le dice al instalador que esto no
+/// lo ha pedido nadie con el raton y que no reinicie el Explorador para
+/// reemplazar la DLL del menu contextual. La deja puesta para el proximo
+/// arranque y la vieja sigue valiendo mientras tanto.
 ///
 /// No se cierra Arca aqui a proposito. Inno Setup ve que el programa que va a
 /// reemplazar esta abierto, lo cierra el mismo y lo vuelve a abrir al terminar;
@@ -693,7 +699,7 @@ fn launch_with_system(path: &Path) -> arca_core::Result<()> {
 #[cfg(windows)]
 fn install_update(path: &Path) -> std::result::Result<(), String> {
     std::process::Command::new(path)
-        .args(["/SILENT", "/NOCANCEL", "/NORESTART"])
+        .args(["/VERYSILENT", "/NOCANCEL", "/NORESTART", "/update=1"])
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -3139,10 +3145,17 @@ impl Arca {
     /// Every job goes through here, opening a file to look at it included: it
     /// is the same thing being reported, and a panel that puts itself away when
     /// it is done beats a screen that has to be dismissed.
-    fn show_job(&mut self, ctx: &egui::Context, verb: &str, subject: String) {
+    ///
+    /// `from_here` es que el trabajo se ha pedido desde esta ventana, con lo
+    /// que hay detras. Lo que decide el sitio no es que haya un archivo
+    /// abierto: es si hay algo detras a lo que volver. Bajar una version nueva
+    /// se pide desde el menu, siempre, y sin esto se llevaba la ventana entera
+    /// por delante cuando no habia ningun archivo abierto -- una barra de
+    /// progreso de novecientos setenta de ancho para bajar cuatro megas.
+    fn show_job(&mut self, ctx: &egui::Context, verb: &str, subject: String, from_here: bool) {
         self.title = verb.to_string();
         self.subject = subject;
-        self.overlay = matches!(self.view, View::Browse) && self.archive.is_some();
+        self.overlay = matches!(self.view, View::Browse) && from_here;
         if !self.overlay {
             self.view = View::Running;
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(if self.subject.is_empty() {
@@ -3614,7 +3627,10 @@ impl Arca {
             _ => verb.to_string(),
         };
         self.in_bytes = matches!(job, Job::Update { .. });
-        self.show_job(ctx, &heading, subject_of(&job));
+        // Bajar la version nueva se pide desde el menu de esta ventana; lo
+        // demas puede venir del Explorador, y entonces no hay lista detras.
+        let from_here = self.archive.is_some() || matches!(job, Job::Update { .. });
+        self.show_job(ctx, &heading, subject_of(&job), from_here);
         self.close_when_done = !matches!(
             job,
             Job::Test { .. }
@@ -6763,7 +6779,7 @@ impl Arca {
             .next()
             .unwrap_or(&entry.name)
             .to_string();
-        self.show_job(ctx, s.opening, name);
+        self.show_job(ctx, s.opening, name, true);
         self.spawn(ctx, 1, move |tx| {
             let _ = tx.send(Message::Progress(0, 1, entry.name.clone()));
             ctx2.request_repaint();
