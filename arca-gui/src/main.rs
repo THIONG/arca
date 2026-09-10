@@ -242,6 +242,10 @@ struct Settings {
     flat: bool,
     // The folders of the archive down the left hand side.
     tree: bool,
+    // Whether to ask, once when the window opens, if there is a newer Arca.
+    // It is the only thing this program does on the network, and it is asked
+    // here rather than assumed.
+    updates: bool,
     // Which code page an unflagged zip has its names written in. Only the
     // person looking at the archive can know, so it is remembered: somebody
     // whose archives all come from one machine says it once.
@@ -284,6 +288,7 @@ impl Default for Settings {
             columns: Columns::default(),
             flat: false,
             tree: false,
+            updates: true,
             page: arca_zip::pages::Page::default(),
             window: None,
             recent: Vec::new(),
@@ -294,11 +299,22 @@ impl Default for Settings {
 
 impl Settings {
     fn load() -> Self {
-        let mut s = Settings::default();
-        let Some(p) = config_file() else { return s };
-        let Ok(text) = fs::read_to_string(p) else {
-            return s;
+        let Some(p) = config_file() else {
+            return Settings::default();
         };
+        match fs::read_to_string(p) {
+            Ok(text) => Settings::parse(&text),
+            Err(_) => Settings::default(),
+        }
+    }
+
+    /// Reads a settings file. The other half of [`text`](Settings::text), and
+    /// apart from the disk for the same reason.
+    ///
+    /// A line it does not know is skipped rather than refused: a file written
+    /// by a newer Arca has to keep working in an older one.
+    fn parse(text: &str) -> Settings {
+        let mut s = Settings::default();
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else {
                 continue;
@@ -311,6 +327,7 @@ impl Settings {
                 ("theme", _) => s.theme = ThemePreference::System,
                 ("flat", v) => s.flat = v == "yes",
                 ("tree", v) => s.tree = v == "yes",
+                ("updates", v) => s.updates = v != "no",
                 ("page", v) => {
                     if let Some(p) = arca_zip::pages::Page::from_code(v) {
                         s.page = p;
@@ -372,33 +389,49 @@ impl Settings {
         if let Some(dir) = p.parent() {
             let _ = fs::create_dir_all(dir);
         }
+        let _ = fs::write(p, self.text());
+    }
+
+    /// The settings file as text.
+    ///
+    /// Apart from `save` so that what is written can be read back and compared
+    /// without going near a disk. That is not tidiness: five settings were
+    /// being read at startup and never written, because the line that builds
+    /// this had quietly stopped mentioning them, and nothing said so. A
+    /// round trip that never touches a file is the only way that stays fixed.
+    fn text(&self) -> String {
         let lang = self.lang.map(|l| l.code()).unwrap_or("system");
         let theme = match self.theme {
             ThemePreference::Light => "light",
             ThemePreference::Dark => "dark",
             ThemePreference::System => "system",
         };
+        let yes = |b: bool| if b { "yes" } else { "no" };
         let columns: Vec<&str> = Columns::ALL
             .iter()
             .filter(|(which, _)| self.columns.on(*which))
             .map(|(_, name)| *name)
             .collect();
         let widths: Vec<String> = self.widths.iter().map(|w| format!("{w:.1}")).collect();
-        let mut tail = String::new();
+
+        let mut out = String::new();
+        out.push_str(&format!("lang = {lang}\n"));
+        out.push_str(&format!("theme = {theme}\n"));
+        out.push_str(&format!("flat = {}\n", yes(self.flat)));
+        out.push_str(&format!("tree = {}\n", yes(self.tree)));
+        out.push_str(&format!("updates = {}\n", yes(self.updates)));
+        out.push_str(&format!("page = {}\n", self.page.code()));
+        out.push_str(&format!("columns = {}\n", columns.join(",")));
+        out.push_str(&format!("widths = {}\n", widths.join(",")));
         if let Some([x, y, w, h]) = self.window {
-            tail.push_str(&format!("window = {x:.0},{y:.0},{w:.0},{h:.0}\n"));
+            out.push_str(&format!("window = {x:.0},{y:.0},{w:.0},{h:.0}\n"));
         }
+        // One line each: a path can hold anything a filename can and there is
+        // no separator left that it could not.
         for path in &self.recent {
-            tail.push_str(&format!("recent = {path}\n"));
+            out.push_str(&format!("recent = {path}\n"));
         }
-        let _ = fs::write(
-            p,
-            format!(
-                "lang = {lang}\ntheme = {theme}\ncolumns = {}\nwidths = {}\n",
-                columns.join(","),
-                widths.join(",")
-            ),
-        );
+        out
     }
 
     fn effective_lang(&self) -> Lang {
@@ -1760,6 +1793,7 @@ enum View {
 #[derive(Clone)]
 enum More {
     Test,
+    Release,
     Undo,
     NewFolder,
     Page(arca_zip::pages::Page),
@@ -2176,6 +2210,78 @@ fn clock(seconds: f64) -> String {
     }
 }
 
+/// Where the newest release is announced, and where somebody is sent to get it.
+const RELEASES_API: &str = "https://api.github.com/repos/THIONG/arca/releases/latest";
+const RELEASES_PAGE: &str = "https://github.com/THIONG/arca/releases/latest";
+
+/// Pulls the release's name out of what the announcement page answered.
+///
+/// Hand written rather than a JSON library, because this asks one question of
+/// one field and the answer is a short string. A parser for the whole language
+/// would be a dependency, a build, and a surface, all so that a version number
+/// could be read once when the window opens.
+///
+/// What it must not do is find the wrong `tag_name`. There is only one at the
+/// top level of that reply, so the first is the right one; anything unexpected
+/// gives nothing, and nothing means the window says nothing.
+fn tag_of(reply: &str) -> Option<String> {
+    let at = reply.find("\"tag_name\"")? + "\"tag_name\"".len();
+    let rest = reply.get(at..)?;
+    let colon = rest.find(':')?;
+    let after = rest.get(colon + 1..)?;
+    let open = after.find('"')?;
+    let value = after.get(open + 1..)?;
+    let close = value.find('"')?;
+    let tag = value.get(..close)?.trim();
+    // A name of nothing, or one long enough to be somebody being funny, is not
+    // a version.
+    (!tag.is_empty() && tag.len() <= 32).then(|| tag.to_string())
+}
+
+/// Whether `latest` is a later version than `running`.
+///
+/// Numbers separated by dots, a leading `v` forgiven, and compared a part at a
+/// time rather than as text: as text, `0.10.0` comes before `0.9.0` and the
+/// window would either nag for ever or never say anything at all.
+///
+/// A version with something after the numbers -- `0.6.0-rc1` -- counts as
+/// earlier than the plain one, which is what those names mean everywhere. And
+/// anything that is not a version at all answers no: silence is the right
+/// behaviour for an announcement nobody can read.
+fn newer(running: &str, latest: &str) -> bool {
+    fn parts(v: &str) -> Option<(Vec<u32>, bool)> {
+        let v = v.trim().trim_start_matches(['v', 'V']);
+        if v.is_empty() {
+            return None;
+        }
+        let (numbers, tail) = match v.find(['-', '+']) {
+            Some(cut) => (&v[..cut], true),
+            None => (v, false),
+        };
+        let mut out = Vec::new();
+        for piece in numbers.split('.') {
+            out.push(piece.parse::<u32>().ok()?);
+        }
+        (!out.is_empty()).then_some((out, tail))
+    }
+
+    let (Some((mine, mine_tail)), Some((theirs, theirs_tail))) = (parts(running), parts(latest))
+    else {
+        return false;
+    };
+    // Missing parts count as zero, so 0.6 and 0.6.0 are the same version.
+    let deep = mine.len().max(theirs.len());
+    for i in 0..deep {
+        let a = mine.get(i).copied().unwrap_or(0);
+        let b = theirs.get(i).copied().unwrap_or(0);
+        if a != b {
+            return b > a;
+        }
+    }
+    // The same numbers: the one without a suffix is the finished one.
+    mine_tail && !theirs_tail
+}
+
 /// Whether a name is a folder's, which in a zip is the slash on the end of it
 /// and nothing else. Both slashes, because archives from Windows use theirs.
 fn is_folder_name(name: &str) -> bool {
@@ -2439,6 +2545,12 @@ struct Arca {
     // with the same word. Never written anywhere: see `default_password_window`.
     default_password: Option<String>,
     asking_default_password: bool,
+    // The version somebody else is running, once it is known to be newer than
+    // this one, and the way it arrives. Both empty unless there is something
+    // to say.
+    update: Option<String>,
+    update_rx: Option<std::sync::mpsc::Receiver<String>>,
+    asked_about_updates: bool,
     // Set while a job is being shown as a window over the list rather than as
     // the whole window. Cleared when the job finishes without a complaint.
     overlay: bool,
@@ -2561,6 +2673,9 @@ impl Arca {
             rename_fresh: false,
             default_password: None,
             asking_default_password: false,
+            update: None,
+            update_rx: None,
+            asked_about_updates: false,
             overlay: false,
             carrying: None,
             asking_folder: false,
@@ -2844,6 +2959,39 @@ impl Arca {
         self.notice = self.summary();
         self.error = false;
         ctx.request_repaint();
+    }
+
+    // Asks once, when the window opens, whether there is a newer Arca.
+    //
+    // On a thread of its own and through its own channel, not the one the jobs
+    // use: those put the window into its working state, and a question nobody
+    // asked must not make the window look busy. If the answer never comes --
+    // no network, no reply, a machine that says no -- nothing happens and
+    // nothing is said. There is nothing here worth a complaint.
+    fn ask_about_updates(&mut self, ctx: &egui::Context) {
+        if self.asked_about_updates || !self.settings.updates {
+            return;
+        }
+        self.asked_about_updates = true;
+        let (tx, rx) = channel::<String>();
+        self.update_rx = Some(rx);
+        let ctx = ctx.clone();
+        let running = env!("CARGO_PKG_VERSION").to_string();
+        std::thread::spawn(move || {
+            // GitHub turns away anything that does not name itself, and naming
+            // the program and its version is what a user agent is for. Nothing
+            // else is sent: no machine, no user, no archive.
+            let agent = format!("Arca/{running}");
+            let Some(reply) = arca_net::get(RELEASES_API, &agent) else {
+                return;
+            };
+            if let Some(tag) = tag_of(&reply) {
+                if newer(&running, &tag) {
+                    let _ = tx.send(tag);
+                    ctx.request_repaint();
+                }
+            }
+        });
     }
 
     // A folder made inside the archive, in the one you are looking at.
@@ -3216,6 +3364,14 @@ impl Arca {
     }
 
     fn receive(&mut self, ctx: &egui::Context) {
+        // The answer about a newer version, if it ever came. Its own channel,
+        // because it is not a job and must not make the window look busy.
+        if let Some(rx) = &self.update_rx {
+            if let Ok(tag) = rx.try_recv() {
+                self.update = Some(tag);
+                self.update_rx = None;
+            }
+        }
         let mut close = false;
         let mut finished_ok = false;
         if let Some(rx) = &self.channel {
@@ -3398,6 +3554,18 @@ impl Arca {
                     }
                 }
             });
+
+        // The only thing this program does on the network, so it is asked here
+        // rather than assumed. What goes out is the address of a public page
+        // and the name and version of this program, which is what any browser
+        // sends to anyone; what comes back is looked at and thrown away.
+        ui.separator();
+        if ui
+            .checkbox(&mut self.settings.updates, s.check_updates)
+            .changed()
+        {
+            changed = true;
+        }
 
         if changed {
             self.settings.save();
@@ -4714,6 +4882,16 @@ impl Arca {
             // becoming a row of unexplained pictures.
             let mut wants = None;
             let more = tool_button(ui, glyphs::Glyph::More, s.more_word, idle, "");
+            // A dot on the button when there is a newer Arca. The word for it
+            // is inside the menu, and a notice inside a menu is a notice nobody
+            // reads: something has to say from the outside that there is
+            // anything in there worth opening. Small and in the corner, because
+            // it is news and not a problem.
+            if self.update.is_some() {
+                let at = more.rect.right_top() + egui::vec2(-5.0, 5.0);
+                ui.painter()
+                    .circle_filled(at, 3.5, theme::cursor(ui.visuals()).color);
+            }
             let more_id = egui::Id::new("arca-more-menu");
             if more.clicked() {
                 ui.memory_mut(|m| m.toggle_popup(more_id));
@@ -4725,6 +4903,17 @@ impl Arca {
                 egui::PopupCloseBehavior::CloseOnClick,
                 |ui| {
                     ui.set_min_width(215.0);
+                    // Only when there is one, and at the top, where something
+                    // that was not there yesterday belongs.
+                    if let Some(tag) = self.update.clone() {
+                        if ui
+                            .button(fill(s.update_ready, &[("version", &tag)]))
+                            .clicked()
+                        {
+                            wants = Some(More::Release);
+                        }
+                        ui.separator();
+                    }
                     if ui
                         .add_enabled(has, egui::Button::new(format!("{}\tCtrl+T", s.test_word)))
                         .clicked()
@@ -4880,6 +5069,9 @@ impl Arca {
                     self.clear_picked();
                     self.cursor = None;
                     self.settings.save();
+                }
+                Some(More::Release) => {
+                    let _ = launch_with_system(Path::new(RELEASES_PAGE));
                 }
                 Some(More::Undo) => self.undo_last(ctx),
                 Some(More::NewFolder) => {
@@ -7080,6 +7272,7 @@ impl eframe::App for Arca {
                 self.geometry = Some([rect.min.x, rect.min.y, rect.width(), rect.height()]);
             }
         }
+        self.ask_about_updates(ctx);
         self.receive(ctx);
         // Getting the keyboard back is when whatever was done elsewhere has
         // been done. Only on the change, not every frame it is focused.
@@ -7377,6 +7570,106 @@ mod tests {
         assert_eq!(clock(-5.0), "0:00");
         assert_eq!(clock(f64::NAN), "0:00");
         assert_eq!(clock(f64::INFINITY), "0:00");
+    }
+
+    // Everything that is remembered has to come back.
+    //
+    // This is here because five settings were being read at startup and never
+    // written: the line that built the file had stopped mentioning them and
+    // nothing complained. Each of them worked perfectly until the window was
+    // closed. Adding a setting without adding it here makes this fail, which is
+    // the whole point.
+    #[test]
+    fn every_setting_survives_being_written_and_read_again() {
+        let mut before = Settings {
+            lang: Some(Lang::Es),
+            theme: ThemePreference::Light,
+            flat: true,
+            tree: true,
+            updates: false,
+            page: arca_zip::pages::Page::Cp1252,
+            ..Default::default()
+        };
+        before.columns.set(SortColumn::Crc, true);
+        before.columns.set(SortColumn::Size, false);
+        before.widths[0] = 271.0;
+        before.widths[3] = 88.0;
+        before.window = Some([12.0, 34.0, 1000.0, 700.0]);
+        before.recent = vec!["C:\\uno.zip".into(), "D:\\dos, con coma.zip".into()];
+
+        let after = Settings::parse(&before.text());
+
+        assert_eq!(after.lang, before.lang);
+        assert_eq!(after.theme, before.theme);
+        assert_eq!(after.flat, before.flat);
+        assert_eq!(after.tree, before.tree);
+        assert_eq!(after.updates, before.updates);
+        assert_eq!(after.page, before.page);
+        assert_eq!(after.widths, before.widths);
+        assert_eq!(after.window, before.window);
+        assert_eq!(
+            after.recent, before.recent,
+            "y una coma en un nombre no parte nada"
+        );
+        for (which, name) in Columns::ALL {
+            assert_eq!(
+                after.columns.on(which),
+                before.columns.on(which),
+                "la columna {name}"
+            );
+        }
+    }
+
+    // The one thing this has to get right is the order, and the one that is
+    // easy to get wrong is comparing versions as text: 0.10.0 sorts before
+    // 0.9.0 that way, and the window would nag about an update that is older
+    // than what is running.
+    #[test]
+    fn a_later_version_is_the_one_with_the_larger_numbers() {
+        assert!(newer("0.5.1", "0.6.0"));
+        assert!(newer("0.9.0", "0.10.0"), "ten comes after nine");
+        assert!(newer("0.5.1", "v0.5.2"), "a leading v is forgiven");
+        assert!(!newer("0.6.0", "0.5.9"), "older is not newer");
+        assert!(!newer("0.6.0", "0.6.0"), "the same is not newer");
+        assert!(!newer("0.10.0", "0.9.0"), "and the other way round too");
+        // Missing parts are zero, so these are the same version.
+        assert!(!newer("0.6", "0.6.0"));
+        assert!(!newer("0.6.0", "0.6"));
+        // A release candidate is earlier than the release it is a candidate for.
+        assert!(newer("0.6.0-rc1", "0.6.0"));
+        assert!(!newer("0.6.0", "0.6.0-rc1"));
+    }
+
+    // Anything unreadable has to answer no. A window that cannot tell what the
+    // announcement said should say nothing, not guess.
+    #[test]
+    fn nonsense_never_announces_an_update() {
+        assert!(!newer("0.5.1", ""));
+        assert!(!newer("0.5.1", "manana"));
+        assert!(!newer("0.5.1", "0.5.uno"));
+        assert!(!newer("", "9.9.9"));
+        assert!(
+            !newer("0.5.1", "99999999999999999999"),
+            "past what a number holds"
+        );
+    }
+
+    #[test]
+    fn the_release_name_comes_out_of_the_reply() {
+        let reply = r#"{"url":"https://x/1","tag_name":"v0.6.0","name":"Arca 0.6.0"}"#;
+        assert_eq!(tag_of(reply).as_deref(), Some("v0.6.0"));
+        // Spacing is the writer's business, not ours.
+        assert_eq!(
+            tag_of(r#"{ "tag_name" : "0.7.0" }"#).as_deref(),
+            Some("0.7.0")
+        );
+        // And everything that is not an answer is not an answer.
+        assert_eq!(tag_of("{}"), None);
+        assert_eq!(tag_of(""), None);
+        assert_eq!(tag_of(r#"{"tag_name":""}"#), None, "a name of nothing");
+        assert_eq!(tag_of(r#"{"tag_name":"x"}"#).as_deref(), Some("x"));
+        let long = format!(r#"{{"tag_name":"{}"}}"#, "v".repeat(64));
+        assert_eq!(tag_of(&long), None, "somebody being funny");
     }
 
     #[test]

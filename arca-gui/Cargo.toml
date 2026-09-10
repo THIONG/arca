@@ -71,3 +71,9 @@ winresource = "0.1"
 # porque es COM y unsafe, que aqui no se admite.
 [target."cfg(windows)".dependencies.arca-drag]
 path = "../arca-drag"
+
+# Preguntar si hay una version nueva. En todas las plataformas: fuera de
+# Windows el crate compila vacio y contesta que no, que es lo mismo que
+# contesta una maquina sin red.
+[dependencies.arca-net]
+path = "../arca-net"

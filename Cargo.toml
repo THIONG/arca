@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["arca-core", "arca-zip", "arca-tar", "arca-cli", "arca-gui", "arca-icons", "arca-drag"]
+members = [
+    "arca-core",
+    "arca-zip",
+    "arca-tar",
+    "arca-cli",
+    "arca-gui",
+    "arca-icons",
+    "arca-drag",
+    "arca-net",
+]
 # Solo compila en Windows: se queda fuera del workspace para que
 # `cargo build` siga funcionando en Linux y macOS.
 exclude = ["windows/arca-shell"]
