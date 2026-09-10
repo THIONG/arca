@@ -695,18 +695,29 @@ fn launch_with_system(path: &Path) -> arca_core::Result<()> {
 /// usuario -- si pidiera permisos de administrador esto no seria un boton,
 /// seria un susto.
 ///
-/// `/update=1` es cosa nuestra, no de Inno: le dice al instalador que esto no
-/// lo ha pedido nadie con el raton y que no reinicie el Explorador para
-/// reemplazar la DLL del menu contextual. La deja puesta para el proximo
-/// arranque y la vieja sigue valiendo mientras tanto.
+/// `/update=1` es cosa nuestra, no de Inno, y le dice dos cosas al instalador:
+/// que no reinicie el Explorador para reemplazar la DLL del menu contextual
+/// -- la deja puesta para el proximo arranque y la vieja sigue valiendo -- y
+/// que al terminar vuelva a abrir Arca.
 ///
-/// No se cierra Arca aqui a proposito. Inno Setup ve que el programa que va a
-/// reemplazar esta abierto, lo cierra el mismo y lo vuelve a abrir al terminar;
-/// cerrarnos antes le quitaria eso ultimo y la ventana no volveria.
+/// No se cierra Arca aqui a proposito: Inno ve que el programa que va a
+/// reemplazar esta abierto y lo cierra el mismo. Reabrirlo tambien sabe
+/// hacerlo, con el Restart Manager, pero medido no lo hizo -- la ventana se
+/// fue y no volvio -- asi que eso lo hace ahora el instalador por su cuenta y
+/// aqui se le dice que el Restart Manager no lo intente, o saldrian dos.
 #[cfg(windows)]
 fn install_update(path: &Path) -> std::result::Result<(), String> {
     std::process::Command::new(path)
-        .args(["/VERYSILENT", "/NOCANCEL", "/NORESTART", "/update=1"])
+        .args([
+            "/VERYSILENT",
+            "/NOCANCEL",
+            "/NORESTART",
+            // Que no la reabra el Restart Manager: de eso se encarga el propio
+            // instalador, que con /update=1 tiene una linea para ello. Si
+            // hiciesen las dos cosas saldrian dos ventanas.
+            "/NORESTARTAPPLICATIONS",
+            "/update=1",
+        ])
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())

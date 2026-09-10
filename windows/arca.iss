@@ -330,3 +330,9 @@ Type: dirifempty; Name: "{app}"
 
 [Run]
 Filename: "{app}\arca-gui.exe"; Description: "{cm:LaunchProgram,Arca}"; Flags: nowait postinstall skipifsilent
+; Cuando Arca se actualiza sola se cierra para dejarse reemplazar, y alguien
+; tiene que volver a abrirla. Inno lo hace por su cuenta con el Restart Manager
+; -- cierra lo que estorba y lo reabre -- pero medido no lo hizo: la ventana se
+; fue y no volvio. Asi que se abre aqui, a mano y sin esperar, que es una linea
+; y no depende de que el Restart Manager haga su parte.
+Filename: "{app}\arca-gui.exe"; Flags: nowait; Check: QuietUpgrade
