@@ -24,6 +24,7 @@ use gpui::{
     UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::dialog::{Dialog, DialogAction, DialogClose, DialogFooter};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::separator::Separator;
@@ -31,7 +32,7 @@ use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_component::status_bar::StatusBar;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Icon, IconName};
-use gpui_component::{Disableable, Root, TitleBar, TITLE_BAR_HEIGHT};
+use gpui_component::{Disableable, Root, TitleBar, WindowExt, TITLE_BAR_HEIGHT};
 use gpui_platform::application;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -87,6 +88,10 @@ struct GpuiShell {
     list_focus: FocusHandle,
     list_scroll: UniformListScrollHandle,
     dialog: Option<Receiver<DialogResult>>,
+    /// Which modal the kit's dialog stack currently holds. The shell derives
+    /// its modal from controller state, the kit opens and closes one
+    /// imperatively; this is what tells the two apart.
+    open_modal: Option<ModalKind>,
     overflow_open: bool,
     breadcrumbs_open: bool,
     overflow_trigger_focus: FocusHandle,
@@ -419,6 +424,7 @@ impl GpuiShell {
             list_focus: cx.focus_handle(),
             list_scroll: UniformListScrollHandle::new(),
             dialog: None,
+            open_modal: None,
             overflow_open: false,
             breadcrumbs_open: false,
             overflow_trigger_focus: cx.focus_handle(),
@@ -900,6 +906,62 @@ impl GpuiShell {
         item
     }
 
+    /// The answer a modal gets when it is dismissed rather than answered.
+    ///
+    /// One map for every way out -- escape, the kit's close button, its
+    /// backdrop -- because a dismissal that does not clear the state leaves
+    /// the worker waiting on an answer that is never coming.
+    fn cancel_modal(&mut self, kind: ModalKind) {
+        match kind {
+            ModalKind::Password => self.controller.dispatch(AppAction::CancelPassword),
+            ModalKind::Conflict => self.answer_conflict(Answer::Cancel),
+            ModalKind::Delete => self.controller.dispatch(AppAction::ConfirmDelete(false)),
+            ModalKind::Drop => self
+                .controller
+                .dispatch(AppAction::AnswerDrop(DropChoice::Cancel)),
+            ModalKind::Add => self.controller.state.view = View::Browse,
+            ModalKind::Viewer => self.controller.state.viewing = None,
+            ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask => self.close_name(),
+            ModalKind::DefaultPassword => {
+                self.controller.state.asking_default_password = false;
+                self.controller.state.password_input.clear();
+            }
+            ModalKind::Settings => self.controller.state.show_settings = false,
+            ModalKind::Shortcuts => self.controller.state.show_shortcuts = false,
+        }
+    }
+
+    /// The modals that already draw with the kit's `Dialog`. The rest still
+    /// render as overlays in `dialogs`, so the migration lands one kind at a
+    /// time and never draws both for the same modal.
+    fn kit_dialog(kind: ModalKind) -> bool {
+        matches!(kind, ModalKind::Delete)
+    }
+
+    /// Reconcile the derived modal with the kit's dialog stack.
+    ///
+    /// Must run between frames: opening a dialog notifies `Root`, and doing
+    /// that inside `render` would repaint from inside a repaint.
+    fn sync_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let want = self.modal_kind().filter(|kind| Self::kit_dialog(*kind));
+        if want == self.open_modal {
+            return;
+        }
+        if self.open_modal.is_some() {
+            window.close_all_dialogs(cx);
+        }
+        if let Some(kind) = want {
+            let shell = cx.weak_entity();
+            window.open_dialog(cx, move |dialog, window, cx| {
+                let Some(shell) = shell.upgrade() else {
+                    return dialog;
+                };
+                build_dialog(kind, &shell, dialog, window, cx)
+            });
+        }
+        self.open_modal = want;
+    }
+
     fn modal_kind(&self) -> Option<ModalKind> {
         if self.controller.state.waiting_on_password.is_some() {
             Some(ModalKind::Password)
@@ -1031,6 +1093,12 @@ impl GpuiShell {
         if current == self.modal_seen {
             return;
         }
+        // A kit dialog focuses itself when it opens and restores the previous
+        // focus when it closes; steering focus at it would fight that.
+        if current.is_some_and(Self::kit_dialog) {
+            self.modal_seen = current;
+            return;
+        }
         if current == Some(ModalKind::Conflict) {
             self.remember_conflict_focus();
         }
@@ -1074,23 +1142,7 @@ impl GpuiShell {
             return;
         }
         if key == "escape" {
-            match kind {
-                ModalKind::Password => self.controller.dispatch(AppAction::CancelPassword),
-                ModalKind::Conflict => self.answer_conflict(Answer::Cancel),
-                ModalKind::Delete => self.controller.dispatch(AppAction::ConfirmDelete(false)),
-                ModalKind::Drop => self
-                    .controller
-                    .dispatch(AppAction::AnswerDrop(DropChoice::Cancel)),
-                ModalKind::Add => self.controller.state.view = View::Browse,
-                ModalKind::Viewer => self.controller.state.viewing = None,
-                ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask => self.close_name(),
-                ModalKind::DefaultPassword => {
-                    self.controller.state.asking_default_password = false;
-                    self.controller.state.password_input.clear();
-                }
-                ModalKind::Settings => self.controller.state.show_settings = false,
-                ModalKind::Shortcuts => self.controller.state.show_shortcuts = false,
-            }
+            self.cancel_modal(kind);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -2144,7 +2196,12 @@ impl GpuiShell {
         if matches!(self.controller.state.view, View::Add) {
             return Some(self.add_dialog(cx));
         }
-        match self.modal_kind()? {
+        let kind = self.modal_kind()?;
+        // Already drawn by the kit's dialog layer.
+        if Self::kit_dialog(kind) {
+            return None;
+        }
+        match kind {
             ModalKind::Password => {
                 let setting = matches!(
                     self.controller.state.waiting_on_password,
@@ -5517,12 +5574,111 @@ impl Render for GpuiShell {
         if let Some(dialog) = self.dialogs(cx) {
             root = root.child(dialog);
         }
-        // `Root` owns the dialog, sheet and notification stacks, but it does
-        // not mount them itself: the window's own view has to, or a dialog the
-        // kit considers open never reaches the screen.
-        root.children(Root::render_sheet_layer(window, cx))
+        // The kit's stack is imperative and this shell's modal is derived, so
+        // they are reconciled after the frame rather than during it.
+        if self.modal_kind().filter(|kind| Self::kit_dialog(*kind)) != self.open_modal {
+            let shell = cx.weak_entity();
+            window.on_next_frame(move |window, cx| {
+                if let Some(shell) = shell.upgrade() {
+                    shell.update(cx, |this, cx| this.sync_dialog(window, cx));
+                }
+            });
+        }
+        root
+    }
+}
+
+/// The window's first view under `Root`: the shell, plus the kit's own layers.
+///
+/// `Root` owns the dialog, sheet and notification stacks but does not mount
+/// them, so somebody has to. It cannot be `GpuiShell` itself: a dialog body
+/// reads the shell, and mounting the layer inside the shell's own `render`
+/// runs that read while the shell is exclusively borrowed, which aborts the
+/// process. As a sibling of the shell rather than a part of it, the borrow is
+/// over by the time the layer builds.
+struct Frame {
+    shell: Entity<GpuiShell>,
+}
+
+impl Render for Frame {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .child(self.shell.clone())
+            .children(Root::render_sheet_layer(window, cx))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
+    }
+}
+
+/// The body of a kit dialog.
+///
+/// Free function taking the shell by entity: it runs from the dialog layer in
+/// `Frame`, so it may read the shell, but it must never write it -- a write
+/// here would repaint from inside a paint. The handlers below are fine,
+/// because a click is dispatched between frames.
+fn build_dialog(
+    kind: ModalKind,
+    shell: &Entity<GpuiShell>,
+    dialog: Dialog,
+    _window: &mut Window,
+    cx: &mut App,
+) -> Dialog {
+    let s = shell.read(cx).controller.s();
+    let weak = shell.downgrade();
+    // Escape, the backdrop and the close button all leave the controller still
+    // asking the question, and the next frame would reopen the dialog.
+    // Answering for the user keeps the two in step -- but only while the state
+    // is still on this question, because `on_close` also runs right after ok or
+    // cancel already answered it.
+    let dialog = dialog.on_close({
+        let weak = weak.clone();
+        move |_, _, cx| {
+            let _ = weak.update(cx, |this, cx| {
+                if this.modal_kind() == Some(kind) {
+                    this.cancel_modal(kind);
+                    cx.notify();
+                }
+            });
+        }
+    });
+    match kind {
+        ModalKind::Delete => {
+            let names = shell
+                .read(cx)
+                .controller
+                .state
+                .confirm_delete
+                .clone()
+                .unwrap_or_default();
+            let confirm = weak.clone();
+            dialog
+                .title(s.delete_word)
+                .child(div().child(fill(s.confirm_delete, &[("n", &names.len().to_string())])))
+                // `button_props` alone draws nothing: the kit only renders
+                // action buttons when a footer asks for them. `DialogClose`
+                // and `DialogAction` are what route a press back into
+                // `on_close` and `on_ok`.
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            DialogClose::new()
+                                .child(Button::new("delete-cancel").label(s.cancel).outline()),
+                        )
+                        .child(
+                            DialogAction::new()
+                                .child(Button::new("delete-confirm").label(s.delete_word).danger()),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = confirm.update(cx, |this, cx| {
+                        this.controller.dispatch(AppAction::ConfirmDelete(true));
+                        cx.notify();
+                    });
+                    true
+                })
+        }
+        _ => dialog,
     }
 }
 
@@ -5813,7 +5969,8 @@ pub(crate) fn run() {
                         let shell_focus = shell.read(cx).focus_handle.clone();
                         window.focus(&shell_focus, cx);
                         window.set_window_title("Arca");
-                        cx.new(|cx| Root::new(shell, window, cx))
+                        let frame = cx.new(|_| Frame { shell });
+                        cx.new(|cx| Root::new(frame, window, cx))
                     },
                 )
                 .expect("open GPUI shell window");
