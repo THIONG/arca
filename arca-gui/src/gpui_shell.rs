@@ -25,6 +25,7 @@ use gpui::{
 use gpui_component::separator::Separator;
 use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::status_bar::StatusBar;
 use gpui_component::tooltip::Tooltip;
@@ -520,7 +521,7 @@ impl Focusable for FilterInput {
 
 struct GpuiShell {
     controller: AppController,
-    filter: Entity<FilterInput>,
+    filter: Entity<InputState>,
     password: Entity<FilterInput>,
     output_name: Entity<FilterInput>,
     add_password: Entity<FilterInput>,
@@ -737,20 +738,20 @@ impl GpuiShell {
     fn new(window: &mut Window, cx: &mut Context<Self>, startup: Startup) -> Self {
         let owner = cx.weak_entity();
         let strings = super::strings(Settings::load().effective_lang());
-        let filter = cx.new(|cx| FilterInput {
-            owner: owner.clone(),
-            strings,
-            label: strings.find_word,
-            focus_handle: cx.focus_handle(),
-            enabled: true,
-            kind: TextFieldKind::Filter,
-            masked: false,
-            content: String::new(),
-            selected_range: 0..0,
-            marked_range: None,
-            last_layout: None,
-            last_bounds: None,
+        let filter = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(strings.find_word)
+                .context_menu(false)
         });
+        cx.subscribe_in(&filter, window, |shell, state, event, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                shell
+                    .controller
+                    .dispatch(AppAction::SetFilter(state.read(cx).value().to_string()));
+                cx.notify();
+            }
+        })
+        .detach();
         let password = cx.new(|cx| FilterInput {
             owner: owner.clone(),
             strings,
@@ -1097,7 +1098,7 @@ impl GpuiShell {
             cx.stop_propagation();
             return;
         }
-        let handle = self.filter.read(cx).focus_handle.clone();
+        let handle = self.filter.read(cx).focus_handle(cx).clone();
         window.focus(&handle, cx);
     }
 
@@ -3219,9 +3220,10 @@ impl GpuiShell {
     /// key, not a command -- so the shortcuts that carry no modifier stand
     /// aside while one has the focus.
     fn typing(&self, window: &Window, cx: &App) -> bool {
-        [&self.filter, &self.password, &self.output_name, &self.add_password]
-            .iter()
-            .any(|input| input.read(cx).focus_handle.is_focused(window))
+        self.filter.read(cx).focus_handle(cx).is_focused(window)
+            || [&self.password, &self.output_name, &self.add_password]
+                .iter()
+                .any(|input| input.read(cx).focus_handle.is_focused(window))
     }
 
     /// The shortcuts that belong to the window rather than to the list.
@@ -3486,7 +3488,8 @@ impl GpuiShell {
     }
 
     fn clipboard_focus_is_safe(&self, window: &Window, cx: &mut Context<Self>) -> bool {
-        !self.filter.read(cx).focus_handle.is_focused(window) && self.modal_kind().is_none()
+        !self.filter.read(cx).focus_handle(cx).is_focused(window)
+            && self.modal_kind().is_none()
     }
 
     fn dispatch_clipboard(&mut self, cut: bool, window: &Window, cx: &mut Context<Self>) {
@@ -4340,14 +4343,10 @@ impl Render for GpuiShell {
             }
         });
         let state_filter = self.controller.state.filter.clone();
-        self.filter.update(cx, |input, _| {
-            input.strings = s;
-            input.label = s.find_word;
-            input.enabled = idle;
-        });
-        if let Some(value) = filter_value_to_sync(&self.filter.read(cx).content, &state_filter) {
-            self.filter
-                .update(cx, |input, _| input.sync_from_state(value));
+        if self.filter.read(cx).value().as_ref() != state_filter {
+            self.filter.update(cx, |input, cx| {
+                input.set_value(state_filter.clone(), window, cx);
+            });
         }
         let has_archive = self.controller.state.archive.is_some();
         let selected = self.selected_count();
@@ -4758,7 +4757,11 @@ impl Render for GpuiShell {
         // The filter sits at the far end of the bar, the way a search field
         // does in every file manager on the desktop, instead of stretching
         // across whatever room the buttons left over.
-        let filter_input = self.filter.clone();
+        let filter_input = Input::new(&self.filter)
+            .aria_label(s.find_word)
+            .focus_bordered(false)
+            .cleanable(true)
+            .disabled(!idle);
         toolbar = toolbar
             .child(div().flex_1().min_w(px(8.)))
             .child(div().w(px(220.)).flex_none().child(filter_input));
@@ -6237,8 +6240,8 @@ pub(crate) fn run() {
                 .expect("open GPUI shell window");
             window
                 .update(cx, |shell, window, cx| {
-                    let filter_focus = shell.filter.read(cx).focus_handle.clone();
-                    window.focus(&filter_focus, cx);
+                    let shell_focus = shell.focus_handle.clone();
+                    window.focus(&shell_focus, cx);
                     cx.activate(true);
                     window.set_window_title("Arca");
                 })
