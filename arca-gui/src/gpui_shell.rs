@@ -3676,29 +3676,55 @@ impl GpuiShell {
                 }),
             );
 
-            // GPUI owns the threshold and gesture lifetime. Once the pointer
-            // leaves the row, the Windows bridge takes over and runs the
-            // existing lazy IDataObject drag; no archive bytes are extracted
-            // merely to begin a drag. On other platforms there is deliberately
-            // no fake drag affordance because arca-drag has no backend there.
-            #[cfg(windows)]
-            if selected {
-                let shell = cx.entity();
-                item = item.on_drag(index, move |_, _, window, app| {
-                    let _ = shell.update(app, |shell, cx| {
-                        shell.controller.drag_out();
+            // A folder takes what is dropped on it and the entries move there,
+            // which is a rewrite of the archive and not a copy out of it.
+            // Dropping a folder into itself is not a move, so it is refused.
+            if row.is_dir {
+                let target = row.path.clone();
+                item = item.on_drop(cx.listener(
+                    move |this: &mut Self, _: &DraggedRows, _window, cx| {
+                        let carried = this.controller.selected_roots();
+                        let into_itself = carried.iter().any(|carried| {
+                            carried.trim_end_matches('/') == target.trim_end_matches('/')
+                        });
+                        if !carried.is_empty() && !into_itself {
+                            this.controller.move_into(&carried, &target);
+                        }
                         cx.notify();
-                    });
-                    // arca-drag owns the native release/cancel loop. GPUI's
-                    // on_drag installs its internal drag immediately after
-                    // this constructor returns, so clear that stale state on
-                    // the following frame; otherwise the consumed mouse-up
-                    // could leave GPUI believing a drag is still active.
-                    window.on_next_frame(|window, app| {
-                        app.stop_active_drag(window);
-                    });
+                    },
+                ));
+            }
+
+            // GPUI owns the threshold and gesture lifetime. Where the drag is
+            // going is not decided here: a folder of this archive takes it as a
+            // move, and everything else on Windows hands it to arca-drag's lazy
+            // IDataObject, so no archive bytes are extracted merely to begin a
+            // drag. On other platforms there is no drag out, because arca-drag
+            // has no backend there, but a move inside the archive still works.
+            if selected {
+                item = item.on_drag(DraggedRows, move |_, _, _window, app| {
                     app.new(|_| gpui::Empty)
                 });
+                #[cfg(windows)]
+                {
+                    let shell = cx.entity();
+                    item = item.on_drag_move(move |event: &gpui::DragMoveEvent<DraggedRows>, window, app| {
+                        // Out of the list is out of the archive. Started here
+                        // rather than at the press, because the instant the
+                        // native drag begins the system takes the pointer and
+                        // there is no way back into the list.
+                        if event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        let _ = shell.update(app, |shell, cx| {
+                            shell.controller.drag_out();
+                            cx.notify();
+                        });
+                        window.on_next_frame(|window, app| {
+                            app.stop_active_drag(window);
+                        });
+                    });
+                }
             }
         }
         item
@@ -5097,6 +5123,11 @@ enum OverflowAction {
     SaveCopy,
     DefaultPassword,
 }
+
+/// The selection while it is in the air. An empty marker rather than the rows
+/// themselves: what is carried is whatever is picked when it lands, and the
+/// selection cannot change while the button is down.
+struct DraggedRows;
 
 /// What a key press means to the window, as opposed to the list.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
