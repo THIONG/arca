@@ -571,6 +571,13 @@ struct GpuiShell {
     /// business knowing about a half-typed folder name, so it stays here until
     /// the dialog is answered.
     name_value: String,
+    /// Text, Hex and Picture, in that order.
+    viewer_focus: Vec<FocusHandle>,
+    viewer_scroll: UniformListScrollHandle,
+    /// The decoded picture, kept by the name it came out of the archive under.
+    /// Handing GPUI a fresh `Image` every frame would decode a thirty megabyte
+    /// photograph sixty times a second.
+    viewer_image: Option<(String, std::sync::Arc<gpui::Image>)>,
     drop_paths: Vec<PathBuf>,
 }
 
@@ -583,6 +590,7 @@ enum RowAction {
     ExtractSelection,
     ExtractHere,
     TestSelection,
+    View,
     Rename,
     Delete,
     Copy,
@@ -593,11 +601,12 @@ enum RowAction {
 }
 
 impl RowAction {
-    const ALL: [RowAction; 11] = [
+    const ALL: [RowAction; 12] = [
         RowAction::Open,
         RowAction::ExtractSelection,
         RowAction::ExtractHere,
         RowAction::TestSelection,
+        RowAction::View,
         RowAction::Rename,
         RowAction::Delete,
         RowAction::Copy,
@@ -615,6 +624,7 @@ impl RowAction {
             RowAction::ExtractSelection => (s.extract_selected, "Ctrl+E"),
             RowAction::ExtractHere => (s.extract_here, "Alt+W"),
             RowAction::TestSelection => (s.test_selection, ""),
+            RowAction::View => (s.view_word, "F3"),
             RowAction::Rename => (s.rename_word, "F2"),
             RowAction::Delete => (s.delete_word, "Supr"),
             RowAction::Copy => (s.copy_word, "Ctrl+C"),
@@ -680,6 +690,7 @@ enum ModalKind {
     Delete,
     Drop,
     Add,
+    Viewer,
     NewFolder,
     Rename,
     Mask,
@@ -857,6 +868,9 @@ impl GpuiShell {
                 .map(|_| cx.focus_handle().tab_stop(true))
                 .collect(),
             name_value: String::new(),
+            viewer_focus: (0..3).map(|_| cx.focus_handle().tab_stop(true)).collect(),
+            viewer_scroll: UniformListScrollHandle::new(),
+            viewer_image: None,
             drop_paths: Vec::new(),
         }
     }
@@ -1254,6 +1268,8 @@ impl GpuiShell {
             Some(ModalKind::Drop)
         } else if matches!(self.controller.state.view, View::Add) {
             Some(ModalKind::Add)
+        } else if self.controller.state.viewing.is_some() {
+            Some(ModalKind::Viewer)
         } else if self.controller.state.asking_folder {
             Some(ModalKind::NewFolder)
         } else if self.controller.state.renaming.is_some() {
@@ -1298,6 +1314,7 @@ impl GpuiShell {
                 self.dialog_cancel_focus.clone(),
             ],
             ModalKind::Add => self.add_focus_targets(cx),
+            ModalKind::Viewer => self.viewer_focus.clone(),
             ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask => vec![
                 self.name_input.read(cx).focus_handle.clone(),
                 self.dialog_primary_focus.clone(),
@@ -1381,6 +1398,7 @@ impl GpuiShell {
                 self.dialog_primary_focus.clone()
             }
             Some(ModalKind::Add) => self.output_name.read(cx).focus_handle.clone(),
+            Some(ModalKind::Viewer) => self.viewer_focus[0].clone(),
             Some(ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask) => {
                 self.name_input.read(cx).focus_handle.clone()
             }
@@ -1421,6 +1439,7 @@ impl GpuiShell {
                     .controller
                     .dispatch(AppAction::AnswerDrop(DropChoice::Cancel)),
                 ModalKind::Add => self.controller.state.view = View::Browse,
+                ModalKind::Viewer => self.controller.state.viewing = None,
                 ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask => self.close_name(),
                 ModalKind::DefaultPassword => {
                     self.controller.state.asking_default_password = false;
@@ -1519,6 +1538,20 @@ impl GpuiShell {
                     self.controller.state.password_input.clear();
                 } else {
                     self.keep_default_password();
+                }
+            }
+            ModalKind::Viewer => {
+                if let Some(look) = [super::Look::Text, super::Look::Hex, super::Look::Picture]
+                    .into_iter()
+                    .enumerate()
+                    .find(|(index, _)| focused(&self.viewer_focus[*index]))
+                    .map(|(_, look)| look)
+                {
+                    if let Some(view) = &mut self.controller.state.viewing {
+                        view.look = look;
+                    }
+                } else {
+                    self.controller.state.viewing = None;
                 }
             }
             ModalKind::Shortcuts => self.controller.state.show_shortcuts = false,
@@ -1620,6 +1653,163 @@ impl GpuiShell {
                 self.controller.state.asking_default_password = true;
             }
         }
+    }
+
+    /// An entry out of the archive, looked at without taking it out: as text,
+    /// as hex, or as the picture it is.
+    ///
+    /// The text and the hex go through `uniform_list`, so only the lines on
+    /// screen are laid out and a log of a million lines opens as fast as a
+    /// note of three.
+    fn viewer_dialog(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
+        let s = self.controller.s();
+        let Some(view) = &self.controller.state.viewing else {
+            return div().id("viewer-missing");
+        };
+        let name = view.name.clone();
+        let size = human(view.bytes.len() as u64);
+        let look = view.look;
+        let picture = view.picture;
+        let bytes = view.bytes.clone();
+        let lines = view.lines.clone();
+
+        let mut tabs = div().flex().items_center().gap_2();
+        for (index, (candidate, label)) in [
+            (super::Look::Text, s.as_text),
+            (super::Look::Hex, s.as_hex),
+            (super::Look::Picture, s.as_picture),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Only where there is a picture to show. A tab that says "picture"
+            // over a text file is a tab that lies.
+            if candidate == super::Look::Picture && !picture {
+                continue;
+            }
+            tabs = tabs.child(
+                Self::dialog_button(
+                    ("viewer-tab", index),
+                    label,
+                    &self.viewer_focus[index],
+                    look == candidate,
+                    cx,
+                )
+                .aria_selected(look == candidate)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(view) = &mut this.controller.state.viewing {
+                        view.look = candidate;
+                    }
+                    cx.notify();
+                })),
+            );
+        }
+        tabs = tabs.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(size),
+        );
+
+        let content = match look {
+            super::Look::Picture => {
+                let image = self.viewer_picture(&name, &bytes);
+                div()
+                    .id("viewer-picture")
+                    .flex_1()
+                    .min_h(px(1.))
+                    .overflow_scroll()
+                    .children(image.map(gpui::img))
+                    .into_any_element()
+            }
+            super::Look::Text => {
+                let total = lines.len();
+                uniform_list(
+                    "viewer-text",
+                    total,
+                    move |range: Range<usize>, _window, _cx| {
+                        range
+                            .map(|index| {
+                                div()
+                                    .font_family("monospace")
+                                    .text_xs()
+                                    .child(lines[index].clone())
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                )
+                .track_scroll(&self.viewer_scroll)
+                .size_full()
+                .into_any_element()
+            }
+            super::Look::Hex => {
+                let total = bytes.len().div_ceil(16);
+                uniform_list(
+                    "viewer-hex",
+                    total,
+                    move |range: Range<usize>, _window, _cx| {
+                        range
+                            .map(|row| {
+                                let at = row * 16;
+                                let end = (at + 16).min(bytes.len());
+                                div()
+                                    .font_family("monospace")
+                                    .text_xs()
+                                    .child(super::hex_line(at, &bytes[at..end]))
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                )
+                .track_scroll(&self.viewer_scroll)
+                .size_full()
+                .into_any_element()
+            }
+        };
+
+        let body = div()
+            .id("viewer-dialog-body")
+            .flex()
+            .flex_col()
+            .gap_3()
+            .w(px(760.))
+            .h(px(460.))
+            .child(tabs)
+            .child(Separator::horizontal())
+            .child(
+                div()
+                    .id("viewer-content")
+                    .flex_1()
+                    .min_h(px(1.))
+                    .overflow_hidden()
+                    .child(content),
+            );
+        self.dialog_overlay(ModalKind::Viewer, name, s.view_word, body, cx)
+    }
+
+    /// The decoded picture for the entry being looked at, decoded once.
+    fn viewer_picture(
+        &mut self,
+        name: &str,
+        bytes: &std::sync::Arc<[u8]>,
+    ) -> Option<std::sync::Arc<gpui::Image>> {
+        if let Some((cached, image)) = &self.viewer_image {
+            if cached == name {
+                return Some(image.clone());
+            }
+        }
+        let format = match image::guess_format(bytes).ok()? {
+            image::ImageFormat::Png => gpui::ImageFormat::Png,
+            image::ImageFormat::Jpeg => gpui::ImageFormat::Jpeg,
+            image::ImageFormat::Gif => gpui::ImageFormat::Gif,
+            image::ImageFormat::Bmp => gpui::ImageFormat::Bmp,
+            image::ImageFormat::WebP => gpui::ImageFormat::Webp,
+            // The `image` crate is built with five decoders on purpose; any
+            // other tag here is a format this build cannot read anyway.
+            _ => return None,
+        };
+        let image = std::sync::Arc::new(gpui::Image::from_bytes(format, bytes.to_vec()));
+        self.viewer_image = Some((name.to_string(), image.clone()));
+        Some(image)
     }
 
     /// Shuts whichever text dialog is open and forgets what was typed in it.
@@ -2078,7 +2268,10 @@ impl GpuiShell {
                 div()
                     .id(("gpui-dialog-card", kind as usize))
                     .m_8()
-                    .max_w(px(620.))
+                    // Wide enough for the viewer, which is the only dialog that
+                    // holds content rather than a question. The rest are sized
+                    // by what is in them and never reach it.
+                    .max_w(px(920.))
                     .p_5()
                     .gap_3()
                     .flex()
@@ -2575,6 +2768,7 @@ impl GpuiShell {
             kind @ (ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask) => {
                 Some(self.name_dialog(kind, cx))
             }
+            ModalKind::Viewer => Some(self.viewer_dialog(cx)),
             ModalKind::DefaultPassword => Some(self.default_password_dialog(cx)),
             ModalKind::Settings => Some(self.settings_dialog(cx)),
             ModalKind::Shortcuts => Some(self.shortcuts_dialog(cx)),
@@ -2611,6 +2805,13 @@ impl GpuiShell {
                 self.begin_dialog(DialogKind::Extract { only_checked: true }, cx)
             }
             RowAction::ExtractHere => self.controller.extract_here(),
+            // Only a file has anything to look at. A folder is a prefix on
+            // some names, not a thing with bytes.
+            RowAction::View => {
+                if let Some(entry) = row.as_ref().and_then(|row| row.entry) {
+                    self.controller.view_entry(entry);
+                }
+            }
             RowAction::TestSelection => {
                 let names = self.controller.selected_names();
                 if let Some(archive) = self.controller.state.archive.clone() {
@@ -2702,10 +2903,18 @@ impl GpuiShell {
             .focus_visible(focus_ring(cx))
             .on_key_down(cx.listener(Self::row_menu_key_down));
         let writable = self.controller.state.format == super::Format::Zip;
-        for action in RowAction::ALL
-            .into_iter()
-            .filter(|a| a.offered() && (*a != RowAction::Rename || writable))
-        {
+        // Only a file has anything to look at, so a folder is not offered a
+        // viewer it would refuse.
+        let is_file = self
+            .controller
+            .visible_rows()
+            .get(index)
+            .is_some_and(|row| row.entry.is_some());
+        for action in RowAction::ALL.into_iter().filter(|a| {
+            a.offered()
+                && (*a != RowAction::Rename || writable)
+                && (*a != RowAction::View || is_file)
+        }) {
             let (label, keys) = action.label(s);
             let item_focus = self.row_menu_item_focus[action as usize].clone();
             let item = Self::menu_item(
@@ -2838,10 +3047,19 @@ impl GpuiShell {
                 self.name_value.clear();
                 self.controller.state.picking_group = Some(adding);
             }
+            Shortcut::View if archive.is_some() => {
+                let cursor = self.controller.state.cursor;
+                let rows = self.controller.visible_rows();
+                match cursor.and_then(|index| rows.get(index)).and_then(|row| row.entry) {
+                    Some(entry) => self.controller.view_entry(entry),
+                    None => return,
+                }
+            }
             Shortcut::ExtractAll
             | Shortcut::ExtractHere
             | Shortcut::Undo
             | Shortcut::Rename
+            | Shortcut::View
             | Shortcut::PickGroup(_) => return,
         }
         cx.stop_propagation();
@@ -2856,6 +3074,7 @@ impl GpuiShell {
             ("Ctrl+N", s.compress),
             ("Ctrl+E", s.extract_all),
             ("Alt+W", s.extract_here),
+            ("F3", s.view_word),
             ("Ctrl+T", s.test_word),
             ("F5", s.refresh_word),
             ("Ctrl+F", s.find_word),
@@ -4895,6 +5114,7 @@ enum Shortcut {
     Undo,
     DefaultPassword,
     Rename,
+    View,
     /// A mask that picks names, or one that drops them.
     PickGroup(bool),
 }
@@ -4935,6 +5155,7 @@ fn shortcut_for(
     match key {
         "f1" => Some(Shortcut::Shortcuts),
         "f2" => Some(Shortcut::Rename),
+        "f3" => Some(Shortcut::View),
         "f5" => Some(Shortcut::Refresh),
         "escape" => Some(Shortcut::ClearSelection),
         // The keypad plus and minus, where WinRAR has kept picking a group by
@@ -5256,6 +5477,10 @@ mod tests {
         assert_eq!(
             shortcut_for(true, false, false, "z", false),
             Some(Shortcut::Undo)
+        );
+        assert_eq!(
+            shortcut_for(false, false, false, "f3", false),
+            Some(Shortcut::View)
         );
     }
 
