@@ -23,7 +23,7 @@
 //! the only saturated pixels Arca paints.
 
 use crate::ThemePreference;
-use gpui::{px, App, Hsla, Rgba, Window};
+use gpui::{px, App, Hsla, Window};
 use gpui_component::theme::{Theme, ThemeMode};
 
 /// Corners. Small enough to read as a finish rather than as a shape.
@@ -79,7 +79,7 @@ const LIGHT: Palette = Palette {
 
 /// A hex literal as GPUI sees colours.
 fn hex(value: u32) -> Hsla {
-    Rgba::from(gpui::rgb(value)).into()
+    gpui::rgb(value).into()
 }
 
 /// The same colour at a fraction of its opacity.
@@ -119,12 +119,6 @@ pub fn apply(preference: ThemePreference, window: Option<&mut Window>, cx: &mut 
     Theme::change(mode, window, cx);
     paint(mode, cx);
     Theme::sync_base(cx);
-}
-
-/// Whether the theme currently in force is the dark one. The shell asks this to
-/// pick between two icon sets, not to pick a colour.
-pub fn is_dark(cx: &App) -> bool {
-    Theme::global(cx).is_dark()
 }
 
 fn paint(mode: ThemeMode, cx: &mut App) {

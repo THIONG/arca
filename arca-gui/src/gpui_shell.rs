@@ -22,15 +22,15 @@ use gpui::{
     Stateful, Style, TextRun, UTF16Selection, UniformListScrollHandle, WeakEntity, Window,
     WindowBounds, WindowOptions,
 };
-use gpui_component::separator::Separator;
-use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::separator::Separator;
+use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_component::status_bar::StatusBar;
 use gpui_component::tooltip::Tooltip;
-use gpui_component::{Disableable, TitleBar, TITLE_BAR_HEIGHT};
 use gpui_component::{ActiveTheme, Icon, IconName};
+use gpui_component::{Disableable, TitleBar, TITLE_BAR_HEIGHT};
 use gpui_platform::application;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -90,7 +90,6 @@ enum DialogResult {
 /// same UTF-16 contract used by platform IMEs, while the controller stores UTF-8.
 #[derive(Clone, Copy)]
 enum TextFieldKind {
-    Filter,
     Password,
     OutputName,
     AddPassword,
@@ -182,7 +181,6 @@ impl FilterInput {
         let kind = self.kind;
         let _ = self.owner.update(cx, |shell, cx| {
             match kind {
-                TextFieldKind::Filter => shell.controller.dispatch(AppAction::SetFilter(content)),
                 TextFieldKind::Password => shell
                     .controller
                     .dispatch(AppAction::SetPasswordInput(content)),
@@ -387,7 +385,6 @@ impl Element for FilterElement {
         let input = self.input.read(cx);
         let value = if input.content.is_empty() {
             match input.kind {
-                TextFieldKind::Filter => input.strings.filter_hint.to_string(),
                 TextFieldKind::Password => input.strings.password_hint.to_string(),
                 TextFieldKind::OutputName => "archive.zip".to_string(),
                 TextFieldKind::AddPassword => input.strings.password_optional.to_string(),
@@ -471,7 +468,6 @@ impl Render for FilterInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut input = div()
             .id(match self.kind {
-                TextFieldKind::Filter => "filter-input",
                 TextFieldKind::Password => "password-input",
                 TextFieldKind::OutputName => "output-name-input",
                 TextFieldKind::AddPassword => "add-password-input",
@@ -667,15 +663,17 @@ impl RowAction {
     /// moving it through the clipboard and working on the selection are four
     /// different things, and twelve entries in one run is a wall.
     fn starts_group(self) -> bool {
-        matches!(self, RowAction::Rename | RowAction::Copy | RowAction::CopyNames)
+        matches!(
+            self,
+            RowAction::Rename | RowAction::Copy | RowAction::CopyNames
+        )
     }
 
     /// Copy, cut and paste are left out rather than greyed out where the shell
     /// has nowhere to put them: a menu entry that can never do anything is
     /// worse than no entry.
     fn offered(self) -> bool {
-        !matches!(self, RowAction::Copy | RowAction::Cut | RowAction::Paste)
-            || clipboard::AVAILABLE
+        !matches!(self, RowAction::Copy | RowAction::Cut | RowAction::Paste) || clipboard::AVAILABLE
     }
 }
 
@@ -1306,10 +1304,9 @@ impl GpuiShell {
     /// A row of the menu: what it does on the left, the keys that do the same
     /// on the right.
     ///
-    /// Two children rather than one string with a tab in it. egui turned a `\t`
-    /// into a right-aligned column; GPUI lays out text and a tab is nothing at
-    /// all there, so the keys came out stuck to the word -- "OpenEnter",
-    /// "ViewF3". The keys are quieter than the name, because they are a way in
+    /// Two children rather than one string with a tab in it. GPUI lays out text
+    /// and a tab is nothing at all there, so the keys came out stuck to the word
+    /// -- "OpenEnter", "ViewF3". The keys are quieter than the name, because they are a way in
     /// and not a second thing to read.
     fn menu_item(
         id: impl Into<ElementId>,
@@ -1672,8 +1669,12 @@ impl GpuiShell {
                 self.controller
                     .dispatch(AppAction::SetLanguage(Some(super::Lang::Es)));
             }
-            SettingsControl::ThemeSystem => self.set_theme(super::ThemePreference::System, window, cx),
-            SettingsControl::ThemeLight => self.set_theme(super::ThemePreference::Light, window, cx),
+            SettingsControl::ThemeSystem => {
+                self.set_theme(super::ThemePreference::System, window, cx)
+            }
+            SettingsControl::ThemeLight => {
+                self.set_theme(super::ThemePreference::Light, window, cx)
+            }
             SettingsControl::ThemeDark => self.set_theme(super::ThemePreference::Dark, window, cx),
             SettingsControl::Format => self.cycle_format(),
             SettingsControl::Codec => self.cycle_codec(),
@@ -2018,11 +2019,17 @@ impl GpuiShell {
         };
         let ok = Self::dialog_button("name-ok", confirm, &self.dialog_primary_focus, true, cx)
             .on_click(cx.listener(move |this, _, _, cx| this.confirm_name(kind, cx)));
-        let cancel = Self::dialog_button("name-cancel", s.cancel, &self.dialog_cancel_focus, false, cx)
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.close_name();
-                cx.notify();
-            }));
+        let cancel = Self::dialog_button(
+            "name-cancel",
+            s.cancel,
+            &self.dialog_cancel_focus,
+            false,
+            cx,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.close_name();
+            cx.notify();
+        }));
         let body = div()
             .id("name-dialog-body")
             .flex()
@@ -2568,13 +2575,7 @@ impl GpuiShell {
         body = body
             .child(format!("{count} {}", s.files_word))
             .child(div().flex().gap_2().child(start).child(cancel));
-        self.dialog_overlay(
-            ModalKind::Add,
-            s.add_to_archive,
-            s.defaults_title,
-            body,
-            cx,
-        )
+        self.dialog_overlay(ModalKind::Add, s.add_to_archive, s.defaults_title, body, cx)
     }
 
     fn dialogs(&mut self, cx: &mut Context<Self>) -> Option<Stateful<gpui::Div>> {
@@ -2586,7 +2587,7 @@ impl GpuiShell {
             ModalKind::Password => {
                 let setting = matches!(
                     self.controller.state.waiting_on_password,
-                    Some(Pending::NewPassword(_) | Pending::CurrentPassword(_))
+                    Some(Pending::CurrentPassword(_))
                 );
                 let title = if setting {
                     s.set_password
@@ -2805,13 +2806,18 @@ impl GpuiShell {
                     .confirm_drop
                     .clone()
                     .unwrap_or_default();
-                let open =
-                    Self::dialog_button("drop-open", s.open_word, &self.dialog_primary_focus, true, cx)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.controller
-                                .dispatch(AppAction::AnswerDrop(DropChoice::Open));
-                            cx.notify();
-                        }));
+                let open = Self::dialog_button(
+                    "drop-open",
+                    s.open_word,
+                    &self.dialog_primary_focus,
+                    true,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.controller
+                        .dispatch(AppAction::AnswerDrop(DropChoice::Open));
+                    cx.notify();
+                }));
                 let add = Self::dialog_button(
                     "drop-add",
                     s.add_to_archive,
@@ -2820,10 +2826,10 @@ impl GpuiShell {
                     cx,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
-                            this.controller
-                                .dispatch(AppAction::AnswerDrop(DropChoice::Add));
-                            cx.notify();
-                        }));
+                    this.controller
+                        .dispatch(AppAction::AnswerDrop(DropChoice::Add));
+                    cx.notify();
+                }));
                 let cancel = Self::dialog_button(
                     "drop-cancel",
                     s.cancel,
@@ -3334,7 +3340,10 @@ impl GpuiShell {
             Shortcut::View if archive.is_some() => {
                 let cursor = self.controller.state.cursor;
                 let rows = self.controller.visible_rows();
-                match cursor.and_then(|index| rows.get(index)).and_then(|row| row.entry) {
+                match cursor
+                    .and_then(|index| rows.get(index))
+                    .and_then(|row| row.entry)
+                {
                     Some(entry) => self.controller.view_entry(entry),
                     None => return,
                 }
@@ -3388,9 +3397,9 @@ impl GpuiShell {
             ("Tab", s.jump_word),
         ];
         let column = |rows: &[(&str, &str)]| {
-            rows.iter()
-                .filter(|(key, _)| !key.is_empty())
-                .fold(div().flex().flex_col().gap_1(), |column, (key, what)| {
+            rows.iter().filter(|(key, _)| !key.is_empty()).fold(
+                div().flex().flex_col().gap_1(),
+                |column, (key, what)| {
                     column.child(
                         div()
                             .flex()
@@ -3405,7 +3414,8 @@ impl GpuiShell {
                             )
                             .child(what.to_string()),
                     )
-                })
+                },
+            )
         };
         let close = Self::dialog_button(
             "shortcuts-close",
@@ -3488,8 +3498,7 @@ impl GpuiShell {
     }
 
     fn clipboard_focus_is_safe(&self, window: &Window, cx: &mut Context<Self>) -> bool {
-        !self.filter.read(cx).focus_handle(cx).is_focused(window)
-            && self.modal_kind().is_none()
+        !self.filter.read(cx).focus_handle(cx).is_focused(window) && self.modal_kind().is_none()
     }
 
     fn dispatch_clipboard(&mut self, cut: bool, window: &Window, cx: &mut Context<Self>) {
@@ -3990,7 +3999,7 @@ impl GpuiShell {
             if selected {
                 let shell = cx.entity();
                 item = item.on_drag(DraggedRows, move |_, _, _window, app| {
-                    let _ = shell.update(app, |shell, _| shell.carrying = true);
+                    shell.update(app, |shell, _| shell.carrying = true);
                     app.new(|_| gpui::Empty)
                 });
             }
@@ -4269,12 +4278,17 @@ impl GpuiShell {
 enum DialogKind {
     Open,
     Compress,
-    Extract { only_checked: bool },
+    Extract {
+        only_checked: bool,
+    },
     /// Files to put inside the archive that is already open.
     AddFiles,
     /// A copy of the open archive under another name, which is the thing to do
     /// before a change nobody is sure about.
-    SaveCopy { name: String, directory: PathBuf },
+    SaveCopy {
+        name: String,
+        directory: PathBuf,
+    },
 }
 
 impl Focusable for GpuiShell {
@@ -4518,11 +4532,15 @@ impl Render for GpuiShell {
                                     .disabled(!has_archive)
                                     .on_click(move |_, _, cx| {
                                         let _ = test_owner.update(cx, |this, cx| {
-                                            if let Some(archive) = this.controller.state.archive.clone() {
-                                                this.controller.dispatch(AppAction::Run(Job::Test {
-                                                    archive,
-                                                    only: None,
-                                                }));
+                                            if let Some(archive) =
+                                                this.controller.state.archive.clone()
+                                            {
+                                                this.controller.dispatch(AppAction::Run(
+                                                    Job::Test {
+                                                        archive,
+                                                        only: None,
+                                                    },
+                                                ));
                                             }
                                             cx.notify();
                                         });
@@ -4530,20 +4548,32 @@ impl Render for GpuiShell {
                             )
                             .separator()
                             .item(
-                                Self::popup_action(add_owner, s.add_to_archive, OverflowAction::AddFiles)
-                                    .disabled(!writable),
+                                Self::popup_action(
+                                    add_owner,
+                                    s.add_to_archive,
+                                    OverflowAction::AddFiles,
+                                )
+                                .disabled(!writable),
                             )
                             .item(
-                                Self::popup_action(folder_owner, s.new_folder, OverflowAction::NewFolder)
-                                    .disabled(!writable),
+                                Self::popup_action(
+                                    folder_owner,
+                                    s.new_folder,
+                                    OverflowAction::NewFolder,
+                                )
+                                .disabled(!writable),
                             )
                             .item(
                                 Self::popup_action(undo_owner, s.undo_word, OverflowAction::Undo)
                                     .disabled(!can_undo),
                             )
                             .item(
-                                Self::popup_action(save_owner, s.save_copy, OverflowAction::SaveCopy)
-                                    .disabled(!has_archive),
+                                Self::popup_action(
+                                    save_owner,
+                                    s.save_copy,
+                                    OverflowAction::SaveCopy,
+                                )
+                                .disabled(!has_archive),
                             )
                             .item(
                                 Self::popup_action(
@@ -4625,21 +4655,20 @@ impl Render for GpuiShell {
                                     .disabled(!can_copy)
                                     .on_click(move |_, _, cx| {
                                         let _ = copy_owner.update(cx, |this, cx| {
-                                            this.controller.dispatch(AppAction::Copy { cut: false });
+                                            this.controller
+                                                .dispatch(AppAction::Copy { cut: false });
                                             cx.notify();
                                         });
                                     }),
                             )
-                            .item(
-                                PopupMenuItem::new(s.cut_word)
-                                    .disabled(!can_copy)
-                                    .on_click(move |_, _, cx| {
-                                        let _ = cut_owner.update(cx, |this, cx| {
-                                            this.controller.dispatch(AppAction::Copy { cut: true });
-                                            cx.notify();
-                                        });
-                                    }),
-                            )
+                            .item(PopupMenuItem::new(s.cut_word).disabled(!can_copy).on_click(
+                                move |_, _, cx| {
+                                    let _ = cut_owner.update(cx, |this, cx| {
+                                        this.controller.dispatch(AppAction::Copy { cut: true });
+                                        cx.notify();
+                                    });
+                                },
+                            ))
                             .item(
                                 PopupMenuItem::new(s.paste_word)
                                     .disabled(!can_paste)
@@ -4657,25 +4686,25 @@ impl Render for GpuiShell {
                 let recent_menu = recent.clone();
                 menu = menu.submenu(s.recent_group, window, popup_cx, move |submenu, _, _| {
                     let mut submenu = submenu;
-                    for path in recent_menu.iter().cloned() {
+                    for path in recent_menu.iter() {
                         let open_owner = recent_owner.clone();
-                        let target = PathBuf::from(&path);
+                        let target = PathBuf::from(path);
                         let leaf = target
                             .file_name()
                             .map(|name| name.to_string_lossy().to_string())
                             .unwrap_or(path.clone());
-                        submenu = submenu.item(PopupMenuItem::new(leaf).on_click(
-                            move |_, _, cx| {
+                        submenu =
+                            submenu.item(PopupMenuItem::new(leaf).on_click(move |_, _, cx| {
                                 let _ = open_owner.update(cx, |this, cx| {
                                     this.controller.dispatch(AppAction::Open(target.clone()));
                                     cx.notify();
                                 });
-                            },
-                        ));
+                            }));
                     }
                     submenu.item(
-                        PopupMenuItem::new(s.clear_history).disabled(recent_menu.is_empty()).on_click(
-                            {
+                        PopupMenuItem::new(s.clear_history)
+                            .disabled(recent_menu.is_empty())
+                            .on_click({
                                 let history_owner = recent_owner.clone();
                                 move |_, _, cx| {
                                     let _ = history_owner.update(cx, |this, cx| {
@@ -4684,8 +4713,7 @@ impl Render for GpuiShell {
                                         cx.notify();
                                     });
                                 }
-                            },
-                        ),
+                            }),
                     )
                 });
 
@@ -4732,25 +4760,30 @@ impl Render for GpuiShell {
                 });
 
                 let app_owner = owner.clone();
-                menu.submenu(s.application_group, window, popup_cx, move |submenu, _, _| {
-                    let shortcuts_owner = app_owner.clone();
-                    let settings_owner = app_owner.clone();
-                    submenu
-                        .item(PopupMenuItem::new(s.shortcuts_title).on_click(
-                            move |_, _, cx| {
-                                let _ = shortcuts_owner.update(cx, |this, cx| {
-                                    this.controller.state.show_shortcuts = true;
+                menu.submenu(
+                    s.application_group,
+                    window,
+                    popup_cx,
+                    move |submenu, _, _| {
+                        let shortcuts_owner = app_owner.clone();
+                        let settings_owner = app_owner.clone();
+                        submenu
+                            .item(PopupMenuItem::new(s.shortcuts_title).on_click(
+                                move |_, _, cx| {
+                                    let _ = shortcuts_owner.update(cx, |this, cx| {
+                                        this.controller.state.show_shortcuts = true;
+                                        cx.notify();
+                                    });
+                                },
+                            ))
+                            .item(PopupMenuItem::new(s.settings).on_click(move |_, _, cx| {
+                                let _ = settings_owner.update(cx, |this, cx| {
+                                    this.controller.state.show_settings = true;
                                     cx.notify();
                                 });
-                            },
-                        ))
-                        .item(PopupMenuItem::new(s.settings).on_click(move |_, _, cx| {
-                            let _ = settings_owner.update(cx, |this, cx| {
-                                this.controller.state.show_settings = true;
-                                cx.notify();
-                            });
-                        }))
-                })
+                            }))
+                    },
+                )
             });
         toolbar = toolbar.child(overflow);
 
@@ -4825,8 +4858,7 @@ impl Render for GpuiShell {
                 nav = nav.child(div().text_color(cx.theme().muted_foreground).child("/"));
             }
             if position == 1 && !hidden.is_empty() {
-                let more =
-                    Self::button("crumb-more", "…", s.hidden_folders.to_string(), idle, cx)
+                let more = Self::button("crumb-more", "…", s.hidden_folders.to_string(), idle, cx)
                     .track_focus(&self.breadcrumbs_trigger_focus)
                     .aria_expanded(self.breadcrumbs_open);
                 nav = nav.child(more.on_click(cx.listener(|this, _, window, cx| {
@@ -5060,38 +5092,42 @@ impl Render for GpuiShell {
                     // the pointer has left the thing it started on, so the move
                     // and the release are watched on the window.
                     let dragging = view.clone();
-                    window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, window, app| {
-                        if !phase.bubble() {
-                            return;
-                        }
-                        let leaving = dragging.update(app, |shell, cx| {
-                            shell.pointer = event.position;
-                            let mut moved = false;
-                            if let Some((slot, from, width)) = shell.resizing {
-                                shell
-                                    .set_column_width(slot, width + f32::from(event.position.x) - from);
-                                moved = true;
+                    window.on_mouse_event(
+                        move |event: &gpui::MouseMoveEvent, phase, window, app| {
+                            if !phase.bubble() {
+                                return;
                             }
-                            moved |= shell.drag_band(event.position);
-                            moved |= shell.wheel.is_some();
-                            if moved {
-                                cx.notify();
-                            }
-                            shell.carrying && shell.left_the_list(event.position)
-                        });
-                        // Out of the list is out of the archive. Started here
-                        // and not at the press, because the instant the native
-                        // drag begins the system takes the pointer and there is
-                        // no way back into the list to drop on a folder.
-                        if leaving {
-                            app.stop_active_drag(window);
-                            let _ = dragging.update(app, |shell, cx| {
-                                shell.carrying = false;
-                                shell.controller.drag_out();
-                                cx.notify();
+                            let leaving = dragging.update(app, |shell, cx| {
+                                shell.pointer = event.position;
+                                let mut moved = false;
+                                if let Some((slot, from, width)) = shell.resizing {
+                                    shell.set_column_width(
+                                        slot,
+                                        width + f32::from(event.position.x) - from,
+                                    );
+                                    moved = true;
+                                }
+                                moved |= shell.drag_band(event.position);
+                                moved |= shell.wheel.is_some();
+                                if moved {
+                                    cx.notify();
+                                }
+                                shell.carrying && shell.left_the_list(event.position)
                             });
-                        }
-                    });
+                            // Out of the list is out of the archive. Started here
+                            // and not at the press, because the instant the native
+                            // drag begins the system takes the pointer and there is
+                            // no way back into the list to drop on a folder.
+                            if leaving {
+                                app.stop_active_drag(window);
+                                dragging.update(app, |shell, cx| {
+                                    shell.carrying = false;
+                                    shell.controller.drag_out();
+                                    cx.notify();
+                                });
+                            }
+                        },
+                    );
                     let pressed = view.clone();
                     window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, _, app| {
                         if !phase.bubble() {
@@ -5625,7 +5661,7 @@ impl Render for GpuiShell {
                     .tab_stop(menu_enabled);
                 let label = fill(s.update_ready, &[("version", &release.tag)]);
                 let item = Self::menu_item("release", label.clone(), "", label, menu_enabled, cx)
-                .track_focus(&release_focus);
+                    .track_focus(&release_focus);
                 menu = menu.child(item.on_click(cx.listener(|this, _, _, cx| {
                     if this.menu_enabled() {
                         this.overflow_action(OverflowAction::Release, cx);
@@ -5833,8 +5869,7 @@ impl Render for GpuiShell {
                 let label = Columns::label(column, s);
                 let shown = self.controller.state.settings.columns.on(column);
                 let action = if shown { s.hide_word } else { s.show_word };
-                let item_focus = self.overflow_item_focus
-                    [position + RECENT_SLOT + RECENT_MAX + 4]
+                let item_focus = self.overflow_item_focus[position + RECENT_SLOT + RECENT_MAX + 4]
                     .clone()
                     .tab_stop(columns_available);
                 let item = Self::menu_item(
@@ -6139,10 +6174,6 @@ fn drop_paths_for_enter(paths: &[PathBuf], allowed: bool) -> Vec<PathBuf> {
     }
 }
 
-fn filter_value_to_sync<'a>(input: &str, state: &'a str) -> Option<&'a str> {
-    (input != state).then_some(state)
-}
-
 fn empty_state_aria_label(error: bool, filter: &str, s: &'static Strings) -> &'static str {
     if error {
         s.cannot_open
@@ -6298,12 +6329,6 @@ mod tests {
             assert_eq!(rx.recv().unwrap(), answer);
             assert!(controller.state.conflict.is_none());
         }
-    }
-
-    #[test]
-    fn filter_sync_only_replaces_stale_input() {
-        assert_eq!(filter_value_to_sync("old", "new"), Some("new"));
-        assert_eq!(filter_value_to_sync("same", "same"), None);
     }
 
     #[test]
@@ -6469,7 +6494,7 @@ mod tests {
         // Both languages, because the point of the label is that it says the
         // folder is empty rather than that the archive is unreadable, and a
         // translation that loses the difference is the same bug in Spanish.
-        for lang in super::super::Lang::ALL {
+        for lang in [super::super::Lang::En, super::super::Lang::Es] {
             let s = super::super::strings(lang);
             assert_eq!(empty_state_aria_label(false, "", s), s.empty_folder);
             assert_eq!(empty_state_aria_label(false, "  ", s), s.empty_folder);

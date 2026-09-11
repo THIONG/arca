@@ -1,19 +1,19 @@
 # Portar `AppController` al `main.rs` de hoy
 
-Estado: transformación hecha; `cargo test --workspace`, `cargo test -p arca-gui --features gpui` y `cargo fmt -p arca-gui -- --check` pasan.
+Estado: transformación hecha; `cargo test --workspace`, `cargo test -p arca-gui` y `cargo fmt -p arca-gui -- --check` pasan.
 
 Hecho en esta tanda:
 
-- `AppState` + `AppController` separados de `Arca`; la superficie egui conserva sus gestos y texturas.
-- `AppAction` + `dispatch` disponibles para egui y GPUI.
-- `spawn` y los métodos de trabajo ya no dependen de `egui::Context`.
+- `AppState` + `AppController` separados de `Arca`; la superficie GPUI conserva sus gestos y texturas.
+- `AppAction` + `dispatch` disponibles para GPUI.
+- `spawn` y los métodos de trabajo no dependen del toolkit visual.
 - `gpui_shell` usa `tree::Folder` y `state.folders`, sin caché duplicada.
 
 ## Dónde está cada cosa
 
 | | qué es |
 | --- | --- |
-| `gpui-kit-redesign-v2` | **la rama viva**. Sale del `main` de hoy. Trae GPUI Kit, el spike, los planes y `gpui_shell.rs`/`gpui_theme.rs` en el árbol pero **sin declarar** en `main.rs`, así que no se compilan. Verde en `cargo test --workspace` y en `cargo check -p arca-gui --features gpui`. |
+| `gpui-kit-redesign-v2` | **la rama viva**. Sale del `main` de hoy. Trae GPUI Kit y los módulos de shell/tema declarados en `main.rs`. Verde en `cargo test --workspace` y en `cargo check -p arca-gui`. |
 | `gpui-kit-redesign` | la rama vieja, sobre `c4c0354`. **No borrar**: su `main.rs` es la implementación de referencia de la extracción. |
 | PR #1 | apunta a la rama vieja, en borrador y en conflicto. Cuando la v2 esté completa, se repunta o se abre otra. |
 
@@ -94,7 +94,7 @@ No es negociable: si algo de esto no existe, la ventana GPUI no compila.
 `struct Arca` en `origin/main` tiene 63 campos. El reparto es:
 
 - **`Arca` se queda 4**: `controller`, `icons`, `band`, `wheel`. Son los únicos
-  con tipos de egui (`TextureHandle`, `Pos2`) o estado de gesto del ratón.
+  con tipos específicos del backend visual o estado de gesto del ratón.
 - **`AppState` se lleva los otros 60**, más 3 que añadió la extracción y que no
   existen ni en la base ni en `main`: `cancel_token`, `extract_dialog`,
   `window_title`.
@@ -106,7 +106,7 @@ Los 8 campos nuevos de `main` van **todos** a `AppState`: son datos puros.
 | `types` | caché de texto por extensión, no una textura (esa es `icons`) |
 | `renaming`, `rename_fresh` | ruta y texto a medio escribir; GPUI también renombrará |
 | `folders` | `tree::Folder`, el árbol de carpetas |
-| `viewing` | `Viewed` no lleva tipos de egui |
+| `viewing` | `Viewed` no lleva tipos del backend visual |
 | `picking_group`, `mask` | selección por máscara |
 | `geometry` | cuatro `f32` para que `on_exit` tenga qué escribir |
 
@@ -133,7 +133,7 @@ Los 8 campos nuevos de `main` van **todos** a `AppState`: son datos puros.
 
 ## El punto que no es mecánico
 
-`spawn` toma `&egui::Context` en `main` y llama a `ctx.request_repaint()`. La
+`spawn` recibía contexto visual en `main` y solicitaba repintado. La
 extracción tiene que quitarle ese parámetro y sustituir el repintado por algo
 que los dos backends puedan pedir. Es el único sitio donde la transformación no
 es renombrar: lo demás es mover el método y reescribir el receptor.
@@ -141,16 +141,16 @@ es renombrar: lo demás es mover el método y reescribir el receptor.
 ## Orden de ejecución
 
 1. Partir `struct Arca` en `AppState` + `AppController` + `Arca`.
-2. Partir `impl Arca` en dos bloques moviendo los 22 métodos de egui al final.
+2. Partir `impl Arca` en dos bloques moviendo los métodos de UI al final.
 3. Reescribir receptores, que es una regla por bloque:
    - en `impl AppController`: `self.<campo>` → `self.state.<campo>`
    - en `impl Arca`: `self.<campo>` → `self.controller.state.<campo>` y
      `self.<metodo_movido>()` → `self.controller.<metodo_movido>()`
 4. Añadir `enum AppAction` y `dispatch`.
-5. Quitar `&egui::Context` de `spawn`.
+5. Quitar el contexto visual de `spawn`.
 6. Compilar y arreglar hasta que `cargo check` calle. **Este es el paso que
    verifica**: cada acceso que se escape sale como error.
-7. `mod gpui_shell` / `mod gpui_theme` y el `main` con `#[cfg(feature = "gpui")]`.
+7. `mod gpui_shell` / `mod gpui_theme` y el `main` que arranca GPUI Kit.
 8. Simplificar `gpui_shell.rs`: borrar el `struct Folder` y su caché hechos a
    mano y usar `tree::folders_of` y `state.folders`, que `main` ya trae.
 
@@ -160,13 +160,13 @@ Automático:
 
 ```sh
 cargo test --workspace
-cargo test -p arca-gui --features gpui
+cargo test -p arca-gui
 cargo fmt -p arca-gui -- --check
 ```
 
 Y **a mano, que es lo que de verdad comprueba esto**: `cargo test` no toca la
-UI de egui, así que si la extracción se come una de las funciones que trajo
-`main`, la suite pasa igual de verde. Hay que abrir la ventana de egui
+UI, así que si la extracción se come una de las funciones que trajo
+`main`, la suite pasa igual de verde. Hay que abrir la ventana de GPUI
 (`cargo run -p arca-gui`) y probar una por una:
 
 - [ ] renombrar una entrada con F2 y desde el menú
@@ -178,7 +178,7 @@ UI de egui, así que si la extracción se come una de las funciones que trajo
 - [ ] el árbol de carpetas del panel lateral
 - [ ] el modo oscuro en blanco y negro
 
-Y la ventana GPUI (`cargo run -p arca-gui --features gpui`), que antes del
+Y la ventana GPUI (`cargo run -p arca-gui`), que antes del
 conflicto quedó funcionando: barra de acciones, ruta, árbol lateral, tabla,
 barra de estado, claro y oscuro.
 

@@ -1,6 +1,6 @@
 # G0/G1 GPUI spike baseline
 
-Estado: spike aislado; `arca-gui` sigue usando egui/eframe.
+Estado: spike aislado; `arca-gui` ya usa GPUI y GPUI Kit.
 
 ## G0 congelado
 
@@ -71,4 +71,4 @@ ventana productiva y no materializa entradas para drag-out. El feature
 `clipboard-win` y `arca-drag`; el check realizado demuestra que sus APIs
 públicas compilan juntas, pero no sustituye una prueba interactiva de OLE,
 clipboard o diálogos. Si falla input/IME, AccessKit, file-drop, `arca-drag` o
-el loop de UI, se conserva egui y se detiene la migración.
+el loop de UI, se detiene la migración.

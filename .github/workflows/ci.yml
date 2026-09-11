@@ -20,11 +20,13 @@ jobs:
       - name: Reference tools
         run: sudo apt-get update && sudo apt-get install -y zip unzip p7zip-full zstd
 
-      # The window is part of the workspace, so this job builds it too. eframe
+      # The window is part of the workspace, so this job builds it too. GPUI
       # needs these headers on Linux; on Windows and macOS nothing is required
       # because the system already ships them.
       - name: Window dependencies
-        run: sudo apt-get install -y libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev libgl1-mesa-dev libxcursor-dev libxinerama-dev
+        run: >-
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxrandr-dev
+          libxi-dev libgl1-mesa-dev libxcursor-dev libxinerama-dev
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - name: Build without the C codecs (pure Rust)
@@ -41,7 +43,8 @@ jobs:
           test -x "$HOME/.local/bin/arca" && test -x "$HOME/.local/bin/arca-gui"
           "$HOME/.local/bin/arca" --version
           ./install.sh --uninstall
-          test ! -e "$HOME/.local/bin/arca" && test ! -e "$HOME/.local/bin/arca-gui"
+          test ! -e "$HOME/.local/bin/arca" && \
+            test ! -e "$HOME/.local/bin/arca-gui"
 
   windows:
     name: Build on Windows
@@ -77,13 +80,14 @@ jobs:
           # Pascal, whose strings go through the ANSI code page: lossless only
           # while that file stays ASCII. It used to be Spanish with accents,
           # and no amount of Pascal made that survive the round trip.
-          if LC_ALL=C grep -n '[^[:print:][:space:]]' windows/AppxManifest.xml; then
+          if LC_ALL=C grep -n '[^[:print:][:space:]]' \
+            windows/AppxManifest.xml; then
             echo "AppxManifest.xml has non-ASCII bytes on those lines"; exit 1
           fi
           ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
           test -f "$ISCC" || choco install innosetup -y --no-progress
-          BIN='//DBinDir=..\target\x86_64-pc-windows-msvc\release'
-          SHELL_DIR='//DShellDir=arca-shell\target\x86_64-pc-windows-msvc\release'
+          BIN='//DBinDir=..\\target\\x86_64-pc-windows-msvc\\release'
+          SHELL_DIR='//DShellDir=arca-shell\\target\\x86_64-pc-windows-msvc\\release'
           "$ISCC" //DVersion=0.0.0 "$BIN" "$SHELL_DIR" windows/arca.iss
           test -f dist/arca-setup-0.0.0-x86_64.exe
 
@@ -101,4 +105,5 @@ jobs:
           test -x "$HOME/.local/bin/arca" && test -x "$HOME/.local/bin/arca-gui"
           "$HOME/.local/bin/arca" --version
           ./install.sh --uninstall
-          test ! -e "$HOME/.local/bin/arca" && test ! -e "$HOME/.local/bin/arca-gui"
+          test ! -e "$HOME/.local/bin/arca" && \
+            test ! -e "$HOME/.local/bin/arca-gui"

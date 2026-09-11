@@ -1,8 +1,8 @@
-# Plan de migración de `arca-gui` de egui/eframe a GPUI
+# Plan de migración de `arca-gui` a GPUI Kit
 
 ## Resumen
 
-Migrar únicamente la interfaz de Arca —no `arca-core`, `arca-zip`, `arca-tar`, CLI ni los formatos— desde `eframe 0.29 + egui_extras` a GPUI, conservando el comportamiento actual y haciendo la transición por fases. La dependencia de GPUI quedará fijada a un commit/tag concreto del repositorio de Zed para evitar cambios involuntarios de API.
+Migrar únicamente la interfaz de Arca —no `arca-core`, `arca-zip`, `arca-tar`, CLI ni los formatos— a GPUI Kit, conservando el comportamiento actual y haciendo la transición por fases. La dependencia de GPUI queda fijada por `Cargo.lock` para evitar cambios involuntarios de API.
 
 El punto de partida real es `arca-gui`: una ventana de aproximadamente 4.600 líneas en `src/main.rs`, más `theme.rs`, `tree.rs`, `glyphs.rs`, `clipboard.rs`, `i18n.rs` y `build.rs`. La UI actual incluye exploración jerárquica de ZIP/TAR/TAR.GZ, tabla con columnas configurables, selección de filas y carpetas, ordenación/redimensionado, filtro, breadcrumbs, doble clic, atajos, temas claro/oscuro/sistema, inglés/español, progreso, diálogos, drag-and-drop, clipboard Windows y drag-out mediante `arca-drag`.
 
@@ -16,7 +16,7 @@ El punto de partida real es `arca-gui`: una ventana de aproximadamente 4.600 lí
   - compilación/prueba específica en Windows.
   - prueba manual de ZIP, TAR y TAR.GZ, contraseña, conflictos, selección, clipboard y drag-and-drop.
 - Capturar una matriz de comportamiento y dimensiones mínimas de ventana para usarla como criterio de paridad.
-- Añadir GPUI como dependencia de `arca-gui` desde el commit/tag fijado, sin retirar todavía egui.
+- Añadir GPUI Kit como dependencia de `arca-gui` desde la versión fijada.
 - Crear una ventana mínima GPUI que compile y arranque en las plataformas soportadas.
 - Verificar en este spike:
   - versión mínima de Rust requerida;
@@ -25,7 +25,7 @@ El punto de partida real es `arca-gui`: una ventana de aproximadamente 4.600 lí
   - integración con `rfd`, `clipboard-win` y `arca-drag`.
 - Si el commit viable no soporta Rust 1.75, elevar `rust-version` y actualizar CI/documentación al mínimo requerido por GPUI. No se mantendrá una compatibilidad artificial con una versión de Rust que GPUI no soporte.
 
-### 2. Separar el estado de aplicación de egui
+### 2. Separar el estado de aplicación del toolkit anterior
 
 Sin reescribir la lógica de compresión:
 
@@ -35,21 +35,17 @@ Sin reescribir la lógica de compresión:
   - configuración, idioma, tema y columnas;
   - trabajos activos, progreso, errores y avisos;
   - estados pendientes de contraseña, conflicto, borrado y drop.
-- Mantener `Job`, `Message`, `Answer`, `Pending`, `Format`, `Columns`, `SortColumn` y las funciones de archivo en Rust normal, eliminando de esos módulos los tipos `egui::*` que no sean estrictamente visuales.
-- Sustituir el acoplamiento a `egui::Context` en el controlador por eventos/acciones explícitos: abrir, extraer, comprimir, borrar, añadir, copiar, pegar, navegar y cancelar.
+- Mantener `Job`, `Message`, `Answer`, `Pending`, `Format`, `Columns`, `SortColumn` y las funciones de archivo en Rust normal, aislados de las APIs visuales.
+- Mantener el controlador desacoplado mediante eventos/acciones explícitos: abrir, extraer, comprimir, borrar, añadir, copiar, pegar, navegar y cancelar.
 - Mantener los workers en hilos separados y el canal de mensajes; GPUI solo recibirá eventos y solicitará actualización de la vista. Ninguna operación de disco o compresión debe bloquear el hilo de UI.
 - Conservar las pruebas existentes de `tree.rs` y de `main.rs`; trasladar a pruebas puras las reglas de selección, navegación, ordenación, nombres libres, progreso y transiciones de diálogos.
 
 ### 3. Shell de aplicación GPUI
 
-G3 queda implementado como un shell opt-in: `arca-gui` conserva el binario egui
-por defecto y `cargo run -p arca-gui --features gpui` activa el binario/módulo
-GPUI sobre el pin de `spikes/gpui`. El shell usa `AppController` sin tipos egui,
-pero no migra todavía toolbar, tabla ni diálogos. El feature GPUI requiere Rust
-1.97.1 (el workspace por defecto conserva MSRV 1.75); esta diferencia es
-intencional y reversible hasta que GPUI sea el backend por defecto.
+G3 queda implementado con GPUI Kit como backend único. El shell usa
+`AppController`, toolbar, tabla y diálogos GPUI. GPUI requiere Rust 1.97.1.
 
-- Reemplazar `eframe::run_native`, `eframe::App` y `ViewportBuilder` por el ciclo de aplicación, ventana y root view de GPUI del commit fijado.
+- Usar el ciclo de aplicación, ventana y root view de GPUI Kit.
 - Preservar:
   - título dinámico `nombre — Arca`;
   - tamaño inicial compacto para acciones de línea de comandos;
@@ -62,7 +58,7 @@ intencional y reversible hasta que GPUI sea el backend por defecto.
 
 ### 4. Migración de la UI por superficies
 
-Implementar y validar cada superficie antes de retirar su equivalente egui:
+Implementar y validar cada superficie con GPUI Kit:
 
 1. **Toolbar y navegación**
    - Abrir, comprimir, extraer todo, extraer selección, contraseña y menú de overflow.
@@ -71,7 +67,7 @@ Implementar y validar cada superficie antes de retirar su equivalente egui:
    - Contador de visibles/seleccionados.
 
 2. **Listado de archivos**
-   - Sustituir `egui_extras::TableBuilder` por el componente de lista/scroll de GPUI disponible en el commit fijado; si no ofrece tabla virtualizada, implementar una lista virtualizada mínima dentro de `arca-gui`.
+   - Usar la lista virtualizada de GPUI para la tabla dentro de `arca-gui`.
    - Mantener columnas Nombre, Tamaño, Packed, Método, Ahorro, Modificado y CRC32.
    - Mantener columnas configurables y persistencia en `gui.conf`.
    - Mantener ordenación, indicador triangular, redimensionado desde cabecera, filas de carpetas antes que archivos y renderizado de iconos.
@@ -100,7 +96,7 @@ Implementar y validar cada superficie antes de retirar su equivalente egui:
 - Portar `glyphs.rs` a la primitiva de dibujo de GPUI disponible; no añadir una librería de iconos para sustituir ocho figuras ya dibujadas.
 - Portar el icono de tipo de archivo y la caché por extensión. La caché deberá guardar el equivalente GPUI de textura/imagen y recordar fallos igual que ahora.
 - Portar las formas especiales: triángulo de ordenación, cursor, selección de goma, overlay de drop y puntero de autoscroll.
-- Revisar contraste y semántica accesible de botones, filas, menús, campos y diálogos. La paridad funcional no se dará por terminada si se pierde la exposición al lector de pantalla que se habilitó explícitamente con `accesskit` en egui.
+- Revisar contraste y semántica accesible de botones, filas, menús, campos y diálogos mediante AccessKit/GPUI.
 
 ### 6. Integraciones de plataforma
 
@@ -142,7 +138,7 @@ Después de alcanzar la paridad funcional, validar accesibilidad y completar la 
 
 - **G7.1 hecho** — dependencia GPUI Kit, `gpui_theme.rs` monocromo claro/oscuro/
   sistema, y los 67 colores incrustados de `gpui_shell.rs` sustituidos por
-  tokens. `cargo test --workspace` y `cargo test -p arca-gui --features gpui`
+  tokens. `cargo test --workspace` y `cargo test -p arca-gui`
   en verde.
 - **G7.2 hecho** — layout. La referencia es **Nohrs** (mismo problema: un
   explorador de ficheros) con la densidad de **DBFlux**. La ventana deja de ser
@@ -183,14 +179,14 @@ Después de alcanzar la paridad funcional, validar accesibilidad y completar la 
   lo que permite cambiar tema e idioma sin editar `gui.conf`. Hasta entonces la
   preferencia se lee al arrancar y `System` sigue al escritorio.
 
-### 8. Retirada de egui
+### 8. Retirada del backend anterior
 
 Cuando la vista GPUI alcance la matriz de paridad:
 
-- Eliminar `eframe`, `egui`, `egui_extras` y sus comentarios/configuración del `Cargo.toml` y regenerar `Cargo.lock`.
-- Retirar imports y tipos egui de `main.rs`, `theme.rs`, `tree.rs` y `glyphs.rs`.
-- Eliminar el `impl eframe::App` y los tests que dependan de coordenadas egui; conservar sus invariantes como pruebas del nuevo modelo o del renderizado donde corresponda.
-- Revisar comentarios que describan egui para que documenten GPUI o el comportamiento de Arca, no la implementación anterior.
+- Mantener únicamente GPUI y GPUI Kit en `Cargo.toml` y regenerar `Cargo.lock`.
+- Retirar imports y tipos del toolkit anterior de los módulos de interfaz.
+- Eliminar el adaptador y los tests que dependan de coordenadas del backend anterior; conservar sus invariantes como pruebas del nuevo modelo.
+- Revisar comentarios para documentar GPUI o el comportamiento de Arca, no la implementación anterior.
 - Actualizar README y cualquier documentación de build con la nueva dependencia, MSRV y requisitos de plataforma.
 
 ## Criterios de aceptación
@@ -201,7 +197,7 @@ Cuando la vista GPUI alcance la matriz de paridad:
 - Se conserva la paridad de ZIP, TAR, TAR.GZ, cifrado AES-256, extracción, compresión, test, borrado y adición.
 - Se conserva la matriz de interacción: teclado, ratón, doble clic, selección múltiple, cursor, filtro, ordenación, redimensionado, rueda/autoscroll, menús y Escape.
 - Se conserva la configuración existente de idioma, tema y columnas sin cambiar el formato `gui.conf`.
-- Se validan lectores de pantalla y foco de teclado en Windows; cualquier limitación de accesibilidad bloquea la retirada de egui.
+- Se validan lectores de pantalla y foco de teclado en Windows.
 - Se comprueba que ninguna operación pesada se ejecuta en el hilo de UI y que el progreso sigue actualizándose durante compresión/extracción.
 - Se realiza una comparación visual manual de toolbar, tabla, diálogos, temas y estados vacíos contra la línea base, aceptando solo diferencias propias de GPUI que no alteren jerarquía ni legibilidad.
 
@@ -212,4 +208,4 @@ Cuando la vista GPUI alcance la matriz de paridad:
 - La transición será incremental, pero GPUI será el backend final único.
 - GPUI se fijará a un commit/tag reproducible del repositorio de Zed; la selección exacta se hará en el spike de compilación y quedará registrada en `Cargo.toml`/`Cargo.lock`.
 - Se reutilizarán dependencias existentes (`rfd`, `clipboard-win`, `arca-drag`) y no se añadirá una librería de tabla o iconos salvo que el spike demuestre que GPUI no puede cubrir una capacidad imprescindible.
-- No se migrará la lógica de archivos ni se introducirán abstracciones de negocio nuevas: solo se separará el estado mínimo necesario para que la vista no dependa de egui.
+- No se migrará la lógica de archivos ni se introducirán abstracciones de negocio nuevas: solo se separará el estado mínimo necesario para que la vista no dependa del toolkit.
