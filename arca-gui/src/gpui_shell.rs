@@ -47,6 +47,12 @@ const COMPACT_SIZE: (f32, f32) = (560.0, 300.0);
 const NORMAL_SIZE: (f32, f32) = (1000.0, 660.0);
 const MINIMUM_SIZE: (f32, f32) = (720.0, 320.0);
 
+/// Where the recently opened archives start in `overflow_item_focus`, and how
+/// many of them the menu keeps room for. Ten is about as many as anybody scans
+/// before giving up and going to the folder instead.
+const RECENT_SLOT: usize = 12;
+const RECENT_MAX: usize = 10;
+
 actions!(
     arca_gpui,
     [
@@ -643,11 +649,15 @@ enum SettingsControl {
     Codec,
     Level,
     Subfolder,
+    /// Which code page an unflagged zip has its names written in. Only the
+    /// person looking at the archive can know, so it is a choice, and a choice
+    /// that is remembered is a setting.
+    NamePage,
     Close,
 }
 
 impl SettingsControl {
-    const ALL: [SettingsControl; 11] = [
+    const ALL: [SettingsControl; 12] = [
         SettingsControl::LangSystem,
         SettingsControl::LangEn,
         SettingsControl::LangEs,
@@ -658,6 +668,7 @@ impl SettingsControl {
         SettingsControl::Codec,
         SettingsControl::Level,
         SettingsControl::Subfolder,
+        SettingsControl::NamePage,
         SettingsControl::Close,
     ];
 }
@@ -812,8 +823,9 @@ impl GpuiShell {
             overflow_menu_focus: cx.focus_handle(),
             breadcrumbs_menu_focus: cx.focus_handle(),
             // Test/select/invert/clear, copy/cut/paste, the five that change
-            // the archive, flat view, shortcuts, settings, then the columns.
-            overflow_item_focus: (0..(15 + Columns::ALL.len()))
+            // the archive, the recent list and its broom, flat view,
+            // shortcuts, settings, then the columns.
+            overflow_item_focus: (0..(RECENT_SLOT + RECENT_MAX + 4 + Columns::ALL.len()))
                 .map(|_| cx.focus_handle().tab_stop(true))
                 .collect(),
             breadcrumbs_item_focus: Vec::new(),
@@ -1080,7 +1092,20 @@ impl GpuiShell {
                 items.push(self.overflow_item_focus[6].clone());
             }
             if self.menu_enabled() {
-                items.extend(self.overflow_item_focus[7..].iter().cloned());
+                items.extend(self.overflow_item_focus[7..RECENT_SLOT].iter().cloned());
+                // Only the recent slots that have an archive behind them: an
+                // empty slot is a stop on the way down that lands on nothing.
+                let recent = self.recent_shown();
+                items.extend(
+                    self.overflow_item_focus[RECENT_SLOT..RECENT_SLOT + recent]
+                        .iter()
+                        .cloned(),
+                );
+                items.extend(
+                    self.overflow_item_focus[RECENT_SLOT + RECENT_MAX..]
+                        .iter()
+                        .cloned(),
+                );
             }
             Self::menu_key_down(event, &items, window, cx);
         }
@@ -1538,6 +1563,15 @@ impl GpuiShell {
             SettingsControl::Subfolder => {
                 self.controller.state.into_subfolder = !self.controller.state.into_subfolder;
             }
+            SettingsControl::NamePage => {
+                let pages = arca_zip::pages::Page::ALL;
+                let at = pages
+                    .iter()
+                    .position(|(page, _, _)| *page == self.controller.state.settings.page)
+                    .unwrap_or(0);
+                self.controller
+                    .reread_names(pages[(at + 1) % pages.len()].0);
+            }
             SettingsControl::Close => self.controller.state.show_settings = false,
         }
     }
@@ -1945,6 +1979,22 @@ impl GpuiShell {
             true,
             cx,
         );
+        let page = arca_zip::pages::Page::ALL
+            .iter()
+            .find(|(page, _, _)| *page == self.controller.state.settings.page)
+            .map(|(_, _, label)| *label)
+            .unwrap_or("");
+        let name_page = row(
+            s.name_encoding,
+            vec![choice(
+                self,
+                SettingsControl::NamePage,
+                page,
+                false,
+                true,
+                cx,
+            )],
+        );
         let close = choice(self, SettingsControl::Close, s.close, true, true, cx);
         let body = div()
             .id("settings-dialog-body")
@@ -1953,6 +2003,7 @@ impl GpuiShell {
             .gap_3()
             .child(languages)
             .child(themes)
+            .child(name_page)
             .child(Separator::horizontal())
             .child(defaults)
             .child(subfolder)
@@ -2893,6 +2944,11 @@ impl GpuiShell {
             && !self.overflow_open
             && !self.breadcrumbs_open
             && self.row_menu.is_none()
+    }
+
+    /// How many of the recent archives the menu actually draws.
+    fn recent_shown(&self) -> usize {
+        self.controller.state.settings.recent.len().min(RECENT_MAX)
     }
 
     fn menu_enabled(&self) -> bool {
@@ -4618,8 +4674,67 @@ impl Render for GpuiShell {
                 })));
             }
 
+            // The archives opened lately, newest first, by path rather than by
+            // name so that two called the same thing are told apart.
+            let recent: Vec<String> = self
+                .controller
+                .state
+                .settings
+                .recent
+                .iter()
+                .take(RECENT_MAX)
+                .cloned()
+                .collect();
+            for (position, path) in recent.iter().enumerate() {
+                let leaf = std::path::Path::new(path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.clone());
+                let item_focus = self.overflow_item_focus[RECENT_SLOT + position]
+                    .clone()
+                    .tab_stop(menu_enabled);
+                let target = PathBuf::from(path);
+                let item = Self::menu_item(
+                    ("recent", position),
+                    leaf,
+                    format!("{} {path}", s.recent_word),
+                    menu_enabled,
+                    cx,
+                )
+                .track_focus(&item_focus);
+                menu = menu.child(item.on_click(cx.listener(move |this, _, _, cx| {
+                    if this.menu_enabled() {
+                        this.controller.dispatch(AppAction::Open(target.clone()));
+                    }
+                    this.overflow_open = false;
+                    cx.notify();
+                })));
+            }
+            let clear_history_enabled = menu_enabled && !recent.is_empty();
+            let clear_history_focus = self.overflow_item_focus[RECENT_SLOT + RECENT_MAX]
+                .clone()
+                .tab_stop(clear_history_enabled);
+            let clear_history = Self::menu_item(
+                "clear-history",
+                s.clear_history,
+                s.clear_history.to_string(),
+                clear_history_enabled,
+                cx,
+            )
+            .track_focus(&clear_history_focus);
+            menu = menu.child(clear_history.on_click(cx.listener(|this, _, _, cx| {
+                if this.menu_enabled() {
+                    this.controller.state.settings.recent.clear();
+                    this.controller.state.settings.save();
+                }
+                this.overflow_open = false;
+                cx.notify();
+            })));
+
             let flat = self.controller.state.settings.flat;
-            let flat_focus = self.overflow_item_focus[12].clone().tab_stop(has);
+            let flat_focus = self.overflow_item_focus[RECENT_SLOT + RECENT_MAX + 1]
+                .clone()
+                .tab_stop(has);
             let flat_item = Self::menu_item(
                 "flat-view",
                 if flat {
@@ -4651,7 +4766,9 @@ impl Render for GpuiShell {
                 cx.notify();
             })));
 
-            let shortcuts_focus = self.overflow_item_focus[13].clone().tab_stop(menu_enabled);
+            let shortcuts_focus = self.overflow_item_focus[RECENT_SLOT + RECENT_MAX + 2]
+                .clone()
+                .tab_stop(menu_enabled);
             let shortcuts_item = Self::menu_item(
                 "shortcuts",
                 format!("{}\tF1", s.shortcuts_title),
@@ -4669,7 +4786,9 @@ impl Render for GpuiShell {
                 cx.notify();
             })));
 
-            let settings_focus = self.overflow_item_focus[14].clone().tab_stop(menu_enabled);
+            let settings_focus = self.overflow_item_focus[RECENT_SLOT + RECENT_MAX + 3]
+                .clone()
+                .tab_stop(menu_enabled);
             let settings_item = Self::menu_item(
                 "settings",
                 s.settings,
@@ -4692,7 +4811,8 @@ impl Render for GpuiShell {
                 let label = Columns::label(column, s);
                 let shown = self.controller.state.settings.columns.on(column);
                 let action = if shown { s.hide_word } else { s.show_word };
-                let item_focus = self.overflow_item_focus[position + 15]
+                let item_focus = self.overflow_item_focus
+                    [position + RECENT_SLOT + RECENT_MAX + 4]
                     .clone()
                     .tab_stop(columns_available);
                 let item = Self::menu_item(
