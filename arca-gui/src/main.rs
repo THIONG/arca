@@ -4134,7 +4134,17 @@ impl AppController {
                 };
             }
             let o = match col {
-                SortColumn::Name => x.label.to_lowercase().cmp(&y.label.to_lowercase()),
+                // Folded a character at a time rather than through two new
+                // strings. `to_lowercase()` here allocated twice per
+                // comparison, which for fifteen hundred rows is some thirty
+                // thousand allocations every time the list is built -- and the
+                // list is built on every pointer move while a band is being
+                // pulled.
+                SortColumn::Name => x
+                    .label
+                    .chars()
+                    .flat_map(char::to_lowercase)
+                    .cmp(y.label.chars().flat_map(char::to_lowercase)),
                 SortColumn::Size => x.size.cmp(&y.size),
                 SortColumn::Packed => x.packed.cmp(&y.packed),
                 SortColumn::Method => x.method.cmp(y.method),

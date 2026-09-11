@@ -576,6 +576,13 @@ struct GpuiShell {
     /// A selection is in the air. Where it lands is not decided until it leaves
     /// the list or is dropped on a folder.
     carrying: bool,
+    /// How many rows the list last drew.
+    ///
+    /// Kept because `visible_rows` walks every entry, allocates a `Row` for
+    /// each and sorts the lot: asking it for nothing but a count, twice per
+    /// pointer move, was most of why dragging a band felt heavy. Render is the
+    /// one place that already has the answer.
+    row_count: usize,
     /// Which column edge is in hand: its slot in `Settings::widths`, where the
     /// pointer was when it was grabbed, and how wide the column was then.
     /// Kept as the state at the grab rather than as a running delta, so a
@@ -894,6 +901,7 @@ impl GpuiShell {
             wheel: None,
             pointer: point(px(0.), px(0.)),
             carrying: false,
+            row_count: 0,
             resizing: None,
             row_menu: None,
             row_menu_focus: cx.focus_handle(),
@@ -3031,8 +3039,7 @@ impl GpuiShell {
     /// Whether the pointer has left the list. What is being carried goes to the
     /// system from here; inside, it is still a move between folders.
     fn left_the_list(&self, at: gpui::Point<gpui::Pixels>) -> bool {
-        let count = self.controller.visible_rows().len();
-        let Some(view) = self.list_view(count) else {
+        let Some(view) = self.list_view(self.row_count) else {
             return false;
         };
         let (x, y) = (f32::from(at.x), f32::from(at.y));
@@ -3083,6 +3090,7 @@ impl GpuiShell {
         }
         self.band = Some(Band {
             origin: at,
+            rows: rows.clone(),
             // Begun in the empty space under the list, where there is no row to
             // hang the band on: it still picks everything between there and
             // wherever it goes.
@@ -3099,32 +3107,33 @@ impl GpuiShell {
 
     /// The band following the pointer, and the list following it past an edge.
     fn drag_band(&mut self, at: gpui::Point<gpui::Pixels>) -> bool {
-        let Some(band) = &mut self.band else {
+        // Taken out and put back, so the rows frozen inside it can be read
+        // while the controller is being written to.
+        let Some(mut band) = self.band.take() else {
             return false;
         };
         band.head = at;
-        let travelled = (f32::from(at.x) - f32::from(band.origin.x)).hypot(
-            f32::from(at.y) - f32::from(band.origin.y),
-        );
+        let travelled = (f32::from(at.x) - f32::from(band.origin.x))
+            .hypot(f32::from(at.y) - f32::from(band.origin.y));
         if !band.live && travelled < DRAG_SLOP {
+            self.band = Some(band);
             return false;
         }
         band.live = true;
-        let anchor = band.anchor;
-        let base = band.base.clone();
-        let rows = self.controller.visible_rows();
+        let rows = &band.rows;
         let Some(view) = self.list_view(rows.len()) else {
+            self.band = Some(band);
             return false;
         };
         let y = f32::from(at.y);
         let head = Self::row_under(&view, y.clamp(view.top, view.bottom), rows.len())
             .unwrap_or(rows.len() - 1);
-        let (lo, hi) = if anchor <= head {
-            (anchor, head)
+        let (lo, hi) = if band.anchor <= head {
+            (band.anchor, head)
         } else {
-            (head, anchor)
+            (head, band.anchor)
         };
-        self.controller.state.checked.clone_from(&base);
+        self.controller.state.checked.clone_from(&band.base);
         for row in &rows[lo..=hi.min(rows.len() - 1)] {
             self.controller.set_checked(row, true);
         }
@@ -3141,6 +3150,7 @@ impl GpuiShell {
         if over != 0.0 {
             self.scroll_to(&view, view.offset + over.clamp(-24.0, 24.0));
         }
+        self.band = Some(band);
         true
     }
 
@@ -3150,8 +3160,7 @@ impl GpuiShell {
             self.wheel = None;
             return;
         }
-        let count = self.controller.visible_rows().len();
-        let Some(view) = self.list_view(count) else {
+        let Some(view) = self.list_view(self.row_count) else {
             return;
         };
         let (x, y) = (f32::from(at.x), f32::from(at.y));
@@ -3179,8 +3188,7 @@ impl GpuiShell {
         if speed == 0.0 {
             return false;
         }
-        let count = self.controller.visible_rows().len();
-        let Some(view) = self.list_view(count) else {
+        let Some(view) = self.list_view(self.row_count) else {
             return false;
         };
         self.scroll_to(&view, view.offset + speed * 0.1);
@@ -4327,6 +4335,9 @@ impl Render for GpuiShell {
         let selected = self.selected_count();
         let rows = self.controller.visible_rows();
         let visible = rows.len();
+        // The one place that knows how long the list is. Everything the pointer
+        // gestures need from it reads this instead of building the list again.
+        self.row_count = visible;
         let can_extract = has_archive && idle;
         let can_extract_selected = can_extract && selected > 0;
         let password_available = can_extract && self.controller.state.format == super::Format::Zip;
@@ -5663,6 +5674,12 @@ struct Band {
     base: Vec<bool>,
     /// Where the pointer is now, which is the other end of the band.
     head: gpui::Point<gpui::Pixels>,
+    /// The list as it was when the band began.
+    ///
+    /// Frozen for the length of the gesture rather than asked for on every
+    /// pointer move: what the band picks cannot change the list it is picking
+    /// from, and nothing else can change it either while a button is down.
+    rows: Vec<super::Row>,
     /// Whether it has been pulled far enough to be a gesture rather than a
     /// click. A click is a drag of no distance, and under this it is left
     /// alone so clicking a row still means clicking a row.
