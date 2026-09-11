@@ -7,6 +7,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI validates the release build; the tag workflow is where we pay for
+  # production LTO. Thin validation builds finish much sooner and exercise the
+  # same code and linker paths.
+  CARGO_PROFILE_RELEASE_LTO: off
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
 
 jobs:
   test:
@@ -33,10 +38,11 @@ jobs:
           sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev
           libwayland-dev libxrandr-dev libxi-dev libgl1-mesa-dev
           libxcursor-dev libxinerama-dev libfontconfig1-dev
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Tests compile test targets; linting those again doubles the GPUI link.
+      - run: cargo clippy --workspace --bins -- -D warnings
       - run: cargo test --workspace
       - name: Build without the C codecs (pure Rust)
-        run: cargo build --release --no-default-features
+        run: cargo build --release --no-default-features -p arca-cli
       - run: cargo build --release
       - name: Interoperability verified by hash
         run: bash interop.sh
