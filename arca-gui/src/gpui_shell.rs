@@ -5918,34 +5918,6 @@ impl Render for GpuiShell {
         if let Some((index, at)) = self.row_menu {
             root = root.child(self.row_menu_view(index, at, cx));
         }
-        if self.dialog.is_some() {
-            root = root.child(
-                div()
-                    .id("native-picker-overlay")
-                    .absolute()
-                    .top(TITLE_BAR_HEIGHT)
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .bg(cx.theme().overlay)
-                    .role(Role::Dialog)
-                    .aria_label(s.waiting_picker)
-                    .occlude()
-                    .on_mouse_down(gpui::MouseButton::Left, |_, _, _| {})
-                    .child(
-                        div()
-                            .m_8()
-                            .p_4()
-                            .bg(cx.theme().popover)
-                            .text_color(cx.theme().popover_foreground)
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .rounded(cx.theme().radius_lg)
-                            .shadow_lg()
-                            .child(s.waiting_picker),
-                    ),
-            );
-        }
         if let Some(dialog) = self.dialogs(cx) {
             root = root.child(dialog);
         }
