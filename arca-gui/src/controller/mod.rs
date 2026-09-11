@@ -653,6 +653,7 @@ impl AppController {
     // hands it to whatever the system opens it with. It runs on its own thread
     // because the entry can be large, and reports through the same progress
     // window as everything else.
+    #[cfg(windows)]
     pub(crate) fn dragged_files(&self) -> Vec<(Entry, String)> {
         let base = &self.state.current_dir;
         self.state

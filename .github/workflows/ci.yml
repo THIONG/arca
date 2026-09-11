@@ -17,6 +17,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
       - name: Reference tools
         run: >-
           sudo apt-get update && sudo apt-get install -y zip unzip p7zip-full
@@ -55,6 +56,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
       - run: cargo test --workspace
       # No continue-on-error: the release has been building this without a net
@@ -100,6 +102,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
       - run: cargo test --workspace
       - name: Installer, there and back
