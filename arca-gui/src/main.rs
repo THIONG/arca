@@ -2285,6 +2285,57 @@ fn branch(
     }
 }
 
+/// Seconds as a clock: `0:07`, `1:38`, `2:05:11`.
+///
+/// Minutes and seconds until there are hours, and no leading zero on the
+/// largest part: a job that says `0:00:07` is a job whose progress window was
+/// designed for a job that takes hours.
+fn clock(seconds: f64) -> String {
+    // A guess of a hundred hours is not a guess; anything past this is capped
+    // rather than shown, and NaN falls to nothing rather than to a panic.
+    let whole = if seconds.is_finite() {
+        seconds.clamp(0.0, 359_999.0) as u64
+    } else {
+        0
+    };
+    let (h, m, s) = (whole / 3600, (whole / 60) % 60, whole % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// What a job is being done to: the name that says which of several windows
+/// this one is.
+fn subject_of(job: &Job) -> String {
+    let named = |p: &Path| {
+        p.file_name()
+            .map(|x| x.to_string_lossy().to_string())
+            .unwrap_or_default()
+    };
+    match job {
+        Job::Extract { archives, .. } => match archives.split_first() {
+            Some((only, [])) => named(only),
+            Some((_, rest)) => format!("{} +{}", named(&archives[0]), rest.len()),
+            None => String::new(),
+        },
+        Job::Compress { out, .. } => named(out),
+        Job::Test { archive, .. }
+        | Job::Password { archive, .. }
+        | Job::Delete { archive, .. }
+        | Job::CopyTo { archive, .. }
+        | Job::Move { archive, .. }
+        | Job::NewFolder { archive, .. }
+        | Job::Rename { archive, .. }
+        | Job::Add { archive, .. } => named(archive),
+        // Here the file is the installer, and its name already has the version.
+        Job::Update { installer, .. } => {
+            installer.rsplit('/').next().unwrap_or_default().to_string()
+        }
+    }
+}
+
 /// Where the announcement is asked for, and where a copy that cannot update
 /// itself is sent instead.
 const RELEASES_API: &str = "https://api.github.com/repos/THIONG/arca/releases/latest";
@@ -2753,9 +2804,17 @@ struct AppState {
     // Whether the two counts are bytes rather than entries. Only the download
     // measures itself that way.
     in_bytes: bool,
-    // Raised to ask whatever is running to stop where it is. Shared with the
-    // thread doing the work, which reads it every time it reports progress.
+    // What the job is being done to, beside the verb in the title.
+    subject: String,
+    // Whether the job is a panel over the list it was started from, rather than
+    // the whole window. A job that came from the Explorer has no list behind it
+    // to go back to.
+    overlay: bool,
+    // Told to give up, and told to hold. Shared with the thread doing the work,
+    // which reads both at the end of every entry -- the one moment it is not in
+    // the middle of something.
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    hold: std::sync::Arc<std::sync::atomic::AtomicBool>,
     // The folders of the archive, rebuilt when a listing arrives rather than
     // every frame: it is fifteen hundred paths split on every slash and the
     // answer only changes when the archive does.
@@ -2868,7 +2927,13 @@ impl AppController {
             AppAction::RequestDelete => self.request_delete(),
             AppAction::ConfirmDelete(confirmed) => self.confirm_delete(confirmed),
             AppAction::AnswerDrop(choice) => self.answer_drop(choice),
-            AppAction::CancelJob => {}
+            // The worker reads this at the end of every entry. Let it go first,
+            // or the news would sit unread until somebody pressed Resume.
+            AppAction::CancelJob => {
+                use std::sync::atomic::Ordering;
+                self.state.stop.store(true, Ordering::Relaxed);
+                self.state.hold.store(false, Ordering::Relaxed);
+            }
         }
     }
 
@@ -3104,7 +3169,10 @@ impl AppController {
                 update_rx: None,
                 asked_about_updates: false,
                 in_bytes: false,
+                subject: String::new(),
+                overlay: false,
                 stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                hold: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 viewing: None,
                 picking_group: None,
                 mask: String::new(),
@@ -3301,6 +3369,39 @@ impl AppController {
         self.state.here = 0;
         self.state.notice = self.summary();
         self.state.error = false;
+    }
+
+    /// A fresh pair of flags for a job about to start, handed back so the
+    /// worker and the window end up holding the same two.
+    ///
+    /// Fresh rather than lowered: a thread that was told to stop may still be
+    /// on its way out, and it must not read the flag the next job is watching.
+    fn fresh_flags(
+        &mut self,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.state.stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.state.hold = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (self.state.stop.clone(), self.state.hold.clone())
+    }
+
+    /// Where a running job is shown: over the list it was started from, or as
+    /// the whole window when it came from the Explorer and there is no list
+    /// behind it to go back to.
+    fn show_job(&mut self, verb: &str, subject: String, from_here: bool) {
+        self.state.title = verb.to_string();
+        self.state.subject = subject;
+        self.state.overlay = matches!(self.state.view, View::Browse) && from_here;
+        if !self.state.overlay {
+            self.state.view = View::Running;
+            self.state.window_title = if self.state.subject.is_empty() {
+                "Arca".to_string()
+            } else {
+                format!("{} — {}", self.state.title, self.state.subject)
+            };
+        }
     }
 
     // Asks, once, whether there is a newer Arca.
@@ -4203,8 +4304,7 @@ impl AppController {
             }
         }
         let s: &'static Strings = self.s();
-        self.state.view = View::Running;
-        self.state.title = match &job {
+        let verb = match &job {
             Job::Extract { .. } => s.extracting.to_string(),
             Job::Test { .. } => s.testing.to_string(),
             Job::Password { .. } => s.changing_password.to_string(),
@@ -4222,6 +4322,10 @@ impl AppController {
         // The download measures itself in bytes; everything else counts
         // entries.
         self.state.in_bytes = matches!(job, Job::Update { .. });
+        // Getting the new version is asked for from this window's menu; the
+        // rest can come from the Explorer, and then there is no list behind it.
+        let from_here = self.state.archive.is_some() || matches!(job, Job::Update { .. });
+        self.show_job(&verb, subject_of(&job), from_here);
         self.state.close_when_done = !matches!(
             job,
             Job::Test { .. }
@@ -4274,10 +4378,21 @@ impl AppController {
 
         let (reply_tx, reply_rx) = channel::<Answer>();
         self.state.replies = Some(reply_tx);
+        let (stop, hold) = self.fresh_flags();
         self.spawn(0, move |tx| {
+            use std::sync::atomic::Ordering;
             let notify = |i: usize, n: usize, name: &str| {
                 let _ = tx.send(Message::Progress(i, n, name.to_string()));
-                true
+                // Held right here while it is paused. This is the end of an
+                // entry, which is the one moment the work is not in the middle
+                // of something; stopping still gets through, so a paused job
+                // can be given up on without being let go first.
+                while hold.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                }
+                // The answer to "carry on?". Read on every step because that is
+                // the only place a long job looks up from what it is doing.
+                !stop.load(Ordering::Relaxed)
             };
             // Getting the new version does not end in a text to read but in a
             // file to run, and running it closes Arca. That is why it leaves by
@@ -6114,58 +6229,177 @@ impl Arca {
             }
         });
     }
-    fn running_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// The bar, the file of the moment, and the clock under it.
+    fn progress_body(&self, ui: &mut egui::Ui) {
         let s = self.controller.s();
-        ui.add_space(12.0);
-        ui.heading(&self.controller.state.title);
-        ui.add_space(10.0);
-
-        let fraction = if self.controller.state.total_count == 0 {
+        let state = &self.controller.state;
+        let fraction = if state.total_count == 0 {
             0.0
         } else {
-            self.controller.state.done_count as f32 / self.controller.state.total_count as f32
+            state.done_count as f32 / state.total_count as f32
         };
+        // What it is being done to. The verb is in the title, so this is only
+        // the name, and it is the line that says which of several windows this
+        // one is.
+        if !state.subject.is_empty() {
+            ui.add(egui::Label::new(egui::RichText::new(&state.subject).strong()).truncate());
+            ui.add_space(6.0);
+        }
         ui.add(
             egui::ProgressBar::new(fraction)
-                .text(format!(
-                    "{} / {}",
-                    self.controller.state.done_count, self.controller.state.total_count
-                ))
+                .text(match (state.total_count, state.in_bytes) {
+                    // No end to show: a percentage of nothing.
+                    (0, _) => format!("{:.0}%", fraction * 100.0),
+                    // A download counts bytes, not files, and nobody reads
+                    // "2481152 of 4627170".
+                    (total, true) => {
+                        format!("{} / {}", human(state.done_count as u64), human(total as u64))
+                    }
+                    (total, false) => format!("{} / {}", state.done_count, total),
+                })
                 .desired_width(ui.available_width()),
         );
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new(&self.controller.state.current_file).weak());
-
-        if let Some(t) = self.controller.state.started {
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(format!("{:.1} s", t.elapsed().as_secs_f64()))
-                    .weak()
-                    .small(),
-            );
-        }
-
-        if !self.controller.state.busy {
-            ui.add_space(12.0);
-            let color = if self.controller.state.error {
-                egui::Color32::from_rgb(220, 90, 90)
-            } else {
-                ui.visuals().text_color()
-            };
-            ui.colored_label(
-                color,
-                if self.controller.state.error {
-                    s.failed
-                } else {
-                    s.done
-                },
-            );
-            ui.add_space(4.0);
-            ui.label(&self.controller.state.notice);
-            ui.add_space(12.0);
-            if ui.button(s.close).clicked() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ui.add_space(5.0);
+        // The file of the moment, and under it the clock. Both small and quiet:
+        // they change several times a second and nobody reads them line by
+        // line, they are there to say it is still moving.
+        ui.add(egui::Label::new(egui::RichText::new(&state.current_file).weak().small()).truncate());
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            let held = state.hold.load(std::sync::atomic::Ordering::Relaxed);
+            if let Some(t) = state.started {
+                let gone = t.elapsed().as_secs_f64();
+                ui.label(
+                    egui::RichText::new(format!("{} {}", s.elapsed_word, clock(gone)))
+                        .weak()
+                        .small(),
+                );
+                // Guessed from how long the part already done took, and only
+                // once enough of it is done for the guess to be worth reading:
+                // at two per cent it would say an hour and then a minute. A
+                // paused job is not going anywhere, so it says nothing.
+                if state.busy && !held && fraction > 0.05 {
+                    let left = gone / fraction as f64 - gone;
+                    ui.label(
+                        egui::RichText::new(format!("· {} {}", s.time_left, clock(left)))
+                            .weak()
+                            .small(),
+                    );
+                }
             }
+            if held {
+                ui.label(
+                    egui::RichText::new(format!("· {}", s.paused_word))
+                        .weak()
+                        .small(),
+                );
+            }
+        });
+    }
+
+    /// What can be pressed while a job runs, and what is left when it stops.
+    /// Answers whether the window should go.
+    fn progress_buttons(&self, ui: &mut egui::Ui) -> bool {
+        use std::sync::atomic::Ordering;
+        let s = self.controller.s();
+        let state = &self.controller.state;
+        let mut close = false;
+        if state.busy {
+            let asked = state.stop.load(Ordering::Relaxed);
+            let held = state.hold.load(Ordering::Relaxed);
+            ui.horizontal(|ui| {
+                // Pausing lets go at the end of an entry, not the end of a
+                // byte, so a file that has started still has to finish.
+                if ui
+                    .add_enabled(
+                        !asked,
+                        egui::Button::new(if held { s.resume_word } else { s.pause_word }),
+                    )
+                    .clicked()
+                {
+                    state.hold.store(!held, Ordering::Relaxed);
+                }
+                // A way out of anything that is going to take a while. The
+                // button goes quiet once it is pressed, because the job is over
+                // as far as the person pressing it is concerned.
+                if ui
+                    .add_enabled(!asked, egui::Button::new(s.cancel))
+                    .clicked()
+                {
+                    state.stop.store(true, Ordering::Relaxed);
+                    // Let it go first, or the news would sit unread until
+                    // somebody pressed Resume.
+                    state.hold.store(false, Ordering::Relaxed);
+                }
+                if asked {
+                    ui.label(egui::RichText::new(s.stopping).weak().small());
+                }
+            });
+        } else {
+            // Only ever reached when something went wrong or was given up on: a
+            // job that finishes takes this window with it.
+            let (word, color) = if state.error {
+                (s.failed, ui.visuals().error_fg_color)
+            } else {
+                (s.done, ui.visuals().text_color())
+            };
+            ui.label(egui::RichText::new(word).color(color).strong());
+            if !state.notice.is_empty() {
+                ui.add_space(2.0);
+                ui.label(&state.notice);
+            }
+            ui.add_space(10.0);
+            if ui.button(s.close).clicked() {
+                close = true;
+            }
+        }
+        close
+    }
+
+    /// The job as a panel over the list it was started from.
+    fn progress_window(&mut self, ctx: &egui::Context) {
+        if !self.controller.state.overlay {
+            return;
+        }
+        // The list behind is dimmed rather than left bright: it is not what is
+        // being asked about, and anything pressed in it would be a second job
+        // on an archive that is being rewritten.
+        let screen = ctx.screen_rect();
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::PanelResizeLine,
+            egui::Id::new("arca-dim"),
+        ))
+        .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(120));
+
+        let mut close = false;
+        egui::Window::new(&self.controller.state.title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.add_space(2.0);
+                self.progress_body(ui);
+                ui.add_space(12.0);
+                close = self.progress_buttons(ui);
+                ui.add_space(2.0);
+            });
+        if close {
+            self.controller.state.overlay = false;
+        }
+    }
+
+    /// The job as the whole window, which is what a job started from the
+    /// Explorer gets: there is no list behind it to go back to.
+    fn running_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // No heading here: the title bar of this window already says the verb
+        // and the name, and saying it twice in a window this small is most of
+        // the window.
+        ui.add_space(8.0);
+        self.progress_body(ui);
+        ui.add_space(14.0);
+        if self.progress_buttons(ui) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -7786,6 +8020,9 @@ impl eframe::App for Arca {
                     // the card left was a box drawn inside a box.
                     self.table(ui);
                 });
+                // Over the list, and last, so it is drawn on top of everything
+                // it is dimming.
+                self.progress_window(&ctx2);
                 self.drop_hint(&ctx2);
             }
         }
@@ -8151,6 +8388,19 @@ c76ecf12e8e05b8f4730fb9933450ea121fe1ce3699ab9b7d20b058f872815f4 *arca-setup-0.6
     // shell extension has a copy of this that has to agree.
     // Which way the sort mark points is a sign, and a sign is the one thing you
     // cannot check by looking at a screenshot of a list with one row in it.
+    #[test]
+    fn the_clock_reads_as_a_clock() {
+        assert_eq!(clock(0.0), "0:00");
+        assert_eq!(clock(7.4), "0:07");
+        assert_eq!(clock(98.0), "1:38");
+        assert_eq!(clock(3600.0), "1:00:00");
+        assert_eq!(clock(7511.0), "2:05:11");
+        // A guess made from almost nothing, and one made from nonsense.
+        assert_eq!(clock(-5.0), "0:00");
+        assert_eq!(clock(f64::NAN), "0:00");
+        assert_eq!(clock(f64::INFINITY), "0:00");
+    }
+
     #[test]
     fn the_sort_mark_points_up_when_the_sort_goes_up() {
         let c = egui::pos2(50.0, 50.0);
