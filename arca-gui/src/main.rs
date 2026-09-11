@@ -2876,6 +2876,68 @@ impl AppController {
             self.state.view = View::Browse;
         }
     }
+    // Puts the archive back the way it was before the last change.
+    //
+    // A swap of two names, because the version before the change was moved
+    // aside rather than thrown away. There is one step and no more: taking it
+    // back leaves nothing to take back, and the sidecar goes with it.
+    //
+    // Lives on the controller rather than in a view because there is nothing
+    // about it that belongs to a toolkit, and both surfaces offer it.
+    fn undo_last(&mut self) {
+        let Some((archive, _)) = self.state.undo.take() else {
+            return;
+        };
+        let keep = undo_path(&archive);
+        if !keep.exists() {
+            return;
+        }
+        let pw = self.state.archive_password.clone();
+        if let Err(e) = fs::remove_file(&archive).and_then(|_| fs::rename(&keep, &archive)) {
+            self.state.notice = e.to_string();
+            self.state.error = true;
+            return;
+        }
+        self.open(archive);
+        self.state.archive_password = pw;
+    }
+
+    // Whatever is being kept for an undo is thrown away.
+    //
+    // Called when the window closes and when the archive is left behind: a file
+    // called `something.zip.arca-undo` sitting next to somebody's archive after
+    // the program has gone is litter, whatever it was for.
+    fn drop_undo(&mut self) {
+        if let Some((archive, _)) = self.state.undo.take() {
+            let _ = fs::remove_file(undo_path(&archive));
+        }
+    }
+
+    // Reads the names in the archive again under another code page.
+    //
+    // Only the person looking at it can know which one an unflagged zip was
+    // written in, so it is a choice and not a guess, and the choice is
+    // remembered.
+    fn reread_names(&mut self, page: arca_zip::pages::Page) {
+        self.state.settings.page = page;
+        self.state.settings.save();
+        for e in &mut self.state.entries {
+            if e.utf8 {
+                continue;
+            }
+            e.name = arca_zip::pages::decode(&e.raw_name, page);
+            e.is_dir = e.name.ends_with('/') || e.name.ends_with('\\');
+        }
+        self.state.folders = tree::folders_of(&self.state.entries);
+        self.clear_picked();
+        self.state.cursor = None;
+        self.state.current_dir.clear();
+        self.state.history = vec![String::new()];
+        self.state.here = 0;
+        self.state.notice = self.summary();
+        self.state.error = false;
+    }
+
     fn extract_here(&mut self) {
         let Some(archive) = self.state.archive.clone() else {
             return;
@@ -3785,23 +3847,7 @@ impl Arca {
     // a path made out of those names, and under a different page it is a path
     // that does not exist.
     fn reread_names(&mut self, ctx: &egui::Context, page: arca_zip::pages::Page) {
-        self.controller.state.settings.page = page;
-        self.controller.state.settings.save();
-        for e in &mut self.controller.state.entries {
-            if e.utf8 {
-                continue;
-            }
-            e.name = arca_zip::pages::decode(&e.raw_name, page);
-            e.is_dir = e.name.ends_with('/') || e.name.ends_with('\\');
-        }
-        self.controller.state.folders = tree::folders_of(&self.controller.state.entries);
-        self.controller.clear_picked();
-        self.controller.state.cursor = None;
-        self.controller.state.current_dir.clear();
-        self.controller.state.history = vec![String::new()];
-        self.controller.state.here = 0;
-        self.controller.state.notice = self.controller.summary();
-        self.controller.state.error = false;
+        self.controller.reread_names(page);
         ctx.request_repaint();
     }
 
@@ -3992,21 +4038,7 @@ impl Arca {
     // aside rather than thrown away. There is one step and no more: taking it
     // back leaves nothing to take back, and the sidecar goes with it.
     fn undo_last(&mut self, _ctx: &egui::Context) {
-        let Some((archive, _)) = self.controller.state.undo.take() else {
-            return;
-        };
-        let keep = undo_path(&archive);
-        if !keep.exists() {
-            return;
-        }
-        let pw = self.controller.state.archive_password.clone();
-        if let Err(e) = fs::remove_file(&archive).and_then(|_| fs::rename(&keep, &archive)) {
-            self.controller.state.notice = e.to_string();
-            self.controller.state.error = true;
-            return;
-        }
-        self.controller.open(archive);
-        self.controller.state.archive_password = pw;
+        self.controller.undo_last();
     }
 
     // Whatever is being kept for an undo is thrown away.
@@ -4015,9 +4047,7 @@ impl Arca {
     // called `something.zip.arca-undo` sitting next to somebody's archive after
     // the program has gone is litter, whatever it was for.
     fn drop_undo(&mut self) {
-        if let Some((archive, _)) = self.controller.state.undo.take() {
-            let _ = fs::remove_file(undo_path(&archive));
-        }
+        self.controller.drop_undo();
     }
 
     // Puts an archive at the top of the recent list.

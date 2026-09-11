@@ -66,6 +66,8 @@ enum DialogResult {
         only_checked: bool,
         destination: Option<PathBuf>,
     },
+    AddFiles(Option<Vec<PathBuf>>),
+    SaveCopy(Option<PathBuf>),
 }
 
 /// The smallest native text input GPUI needs for this surface. It follows the
@@ -76,6 +78,11 @@ enum TextFieldKind {
     Password,
     OutputName,
     AddPassword,
+    /// The one field shared by the dialogs that ask for a piece of text: a new
+    /// folder, a new name, a mask. They are modal and mutually exclusive, so
+    /// one field with the name the open dialog gives it is one field, not
+    /// three that are always empty.
+    Name,
 }
 
 struct FilterInput {
@@ -85,6 +92,10 @@ struct FilterInput {
     /// language too. The shell pushes it in on every frame, because the
     /// settings dialog can change it while the window is up.
     strings: &'static Strings,
+    /// What a screen reader calls this field. Set by the shell each frame,
+    /// because the shared `Name` field is a folder name in one dialog and a
+    /// mask in another.
+    label: &'static str,
     masked: bool,
     focus_handle: FocusHandle,
     enabled: bool,
@@ -141,6 +152,16 @@ impl FilterInput {
         let cursor = range.start + value.len();
         self.selected_range = cursor..cursor;
         self.marked_range = None;
+        self.push_to_owner(cx);
+        cx.notify();
+    }
+
+    /// Hands what was typed back to whoever owns it.
+    ///
+    /// One copy, not one per entry point: a plain keystroke, an IME commit and
+    /// a marked-text edit all end here, and three copies of the same match is
+    /// three places for a new field to be forgotten in.
+    fn push_to_owner(&self, cx: &mut Context<Self>) {
         let content = self.content.clone();
         let kind = self.kind;
         let _ = self.owner.update(cx, |shell, cx| {
@@ -151,10 +172,10 @@ impl FilterInput {
                     .dispatch(AppAction::SetPasswordInput(content)),
                 TextFieldKind::OutputName => shell.controller.state.output_name = content,
                 TextFieldKind::AddPassword => shell.controller.state.add_password = content,
+                TextFieldKind::Name => shell.name_value = content,
             }
             cx.notify();
         });
-        cx.notify();
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -255,19 +276,7 @@ impl EntityInputHandler for FilterInput {
                 range.start + selected.start..range.start + selected.end
             })
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
-        let content = self.content.clone();
-        let kind = self.kind;
-        let _ = self.owner.update(cx, |shell, cx| {
-            match kind {
-                TextFieldKind::Filter => shell.controller.dispatch(AppAction::SetFilter(content)),
-                TextFieldKind::Password => shell
-                    .controller
-                    .dispatch(AppAction::SetPasswordInput(content)),
-                TextFieldKind::OutputName => shell.controller.state.output_name = content,
-                TextFieldKind::AddPassword => shell.controller.state.add_password = content,
-            }
-            cx.notify();
-        });
+        self.push_to_owner(cx);
         cx.notify();
     }
 
@@ -362,10 +371,11 @@ impl Element for FilterElement {
         let input = self.input.read(cx);
         let value = if input.content.is_empty() {
             match input.kind {
-                TextFieldKind::Filter => "Filter files…".to_string(),
-                TextFieldKind::Password => "Password required".to_string(),
+                TextFieldKind::Filter => input.strings.filter_hint.to_string(),
+                TextFieldKind::Password => input.strings.password_hint.to_string(),
                 TextFieldKind::OutputName => "archive.zip".to_string(),
-                TextFieldKind::AddPassword => "Optional password".to_string(),
+                TextFieldKind::AddPassword => input.strings.password_optional.to_string(),
+                TextFieldKind::Name => input.label.to_string(),
             }
         } else if matches!(
             input.kind,
@@ -449,14 +459,10 @@ impl Render for FilterInput {
                 TextFieldKind::Password => "password-input",
                 TextFieldKind::OutputName => "output-name-input",
                 TextFieldKind::AddPassword => "add-password-input",
+                TextFieldKind::Name => "name-input",
             })
             .key_context("FilterInput")
-            .aria_label(match self.kind {
-                TextFieldKind::Filter => self.strings.find_word,
-                TextFieldKind::Password => self.strings.password_word,
-                TextFieldKind::OutputName => self.strings.output_name,
-                TextFieldKind::AddPassword => self.strings.password_optional,
-            })
+            .aria_label(self.label)
             .aria_value(
                 if matches!(
                     self.kind,
@@ -503,6 +509,7 @@ struct GpuiShell {
     password: Entity<FilterInput>,
     output_name: Entity<FilterInput>,
     add_password: Entity<FilterInput>,
+    name_input: Entity<FilterInput>,
     focus_handle: FocusHandle,
     list_focus: FocusHandle,
     list_scroll: UniformListScrollHandle,
@@ -554,6 +561,10 @@ struct GpuiShell {
     row_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
     row_menu_focus: FocusHandle,
     row_menu_item_focus: Vec<FocusHandle>,
+    /// What the shared `Name` field currently holds. The controller has no
+    /// business knowing about a half-typed folder name, so it stays here until
+    /// the dialog is answered.
+    name_value: String,
     drop_paths: Vec<PathBuf>,
 }
 
@@ -566,6 +577,7 @@ enum RowAction {
     ExtractSelection,
     ExtractHere,
     TestSelection,
+    Rename,
     Delete,
     Copy,
     Cut,
@@ -575,11 +587,12 @@ enum RowAction {
 }
 
 impl RowAction {
-    const ALL: [RowAction; 10] = [
+    const ALL: [RowAction; 11] = [
         RowAction::Open,
         RowAction::ExtractSelection,
         RowAction::ExtractHere,
         RowAction::TestSelection,
+        RowAction::Rename,
         RowAction::Delete,
         RowAction::Copy,
         RowAction::Cut,
@@ -596,6 +609,7 @@ impl RowAction {
             RowAction::ExtractSelection => (s.extract_selected, "Ctrl+E"),
             RowAction::ExtractHere => (s.extract_here, "Alt+W"),
             RowAction::TestSelection => (s.test_selection, ""),
+            RowAction::Rename => (s.rename_word, "F2"),
             RowAction::Delete => (s.delete_word, "Supr"),
             RowAction::Copy => (s.copy_word, "Ctrl+C"),
             RowAction::Cut => (s.cut_word, "Ctrl+X"),
@@ -655,6 +669,10 @@ enum ModalKind {
     Delete,
     Drop,
     Add,
+    NewFolder,
+    Rename,
+    Mask,
+    DefaultPassword,
     Settings,
     Shortcuts,
 }
@@ -666,6 +684,7 @@ impl GpuiShell {
         let filter = cx.new(|cx| FilterInput {
             owner: owner.clone(),
             strings,
+            label: strings.find_word,
             focus_handle: cx.focus_handle(),
             enabled: true,
             kind: TextFieldKind::Filter,
@@ -679,6 +698,7 @@ impl GpuiShell {
         let password = cx.new(|cx| FilterInput {
             owner: owner.clone(),
             strings,
+            label: strings.password_word,
             focus_handle: cx.focus_handle(),
             enabled: false,
             kind: TextFieldKind::Password,
@@ -692,6 +712,7 @@ impl GpuiShell {
         let output_name = cx.new(|cx| FilterInput {
             owner: owner.clone(),
             strings,
+            label: strings.output_name,
             focus_handle: cx.focus_handle(),
             enabled: false,
             kind: TextFieldKind::OutputName,
@@ -703,12 +724,27 @@ impl GpuiShell {
             last_bounds: None,
         });
         let add_password = cx.new(|cx| FilterInput {
-            owner,
+            owner: owner.clone(),
             strings,
+            label: strings.password_optional,
             focus_handle: cx.focus_handle(),
             enabled: false,
             kind: TextFieldKind::AddPassword,
             masked: true,
+            content: String::new(),
+            selected_range: 0..0,
+            marked_range: None,
+            last_layout: None,
+            last_bounds: None,
+        });
+        let name_input = cx.new(|cx| FilterInput {
+            owner,
+            strings,
+            label: strings.folder_name,
+            focus_handle: cx.focus_handle(),
+            enabled: false,
+            kind: TextFieldKind::Name,
+            masked: false,
             content: String::new(),
             selected_range: 0..0,
             marked_range: None,
@@ -756,6 +792,7 @@ impl GpuiShell {
             password,
             output_name,
             add_password,
+            name_input,
             focus_handle: cx.focus_handle(),
             list_focus: cx.focus_handle(),
             list_scroll: UniformListScrollHandle::new(),
@@ -774,9 +811,9 @@ impl GpuiShell {
             conflict_trigger_focus: cx.focus_handle(),
             overflow_menu_focus: cx.focus_handle(),
             breadcrumbs_menu_focus: cx.focus_handle(),
-            // Test/select/invert/clear, copy/cut/paste, flat view, shortcuts,
-            // settings, then the columns.
-            overflow_item_focus: (0..(10 + Columns::ALL.len()))
+            // Test/select/invert/clear, copy/cut/paste, the five that change
+            // the archive, flat view, shortcuts, settings, then the columns.
+            overflow_item_focus: (0..(15 + Columns::ALL.len()))
                 .map(|_| cx.focus_handle().tab_stop(true))
                 .collect(),
             breadcrumbs_item_focus: Vec::new(),
@@ -807,6 +844,7 @@ impl GpuiShell {
                 .iter()
                 .map(|_| cx.focus_handle().tab_stop(true))
                 .collect(),
+            name_value: String::new(),
             drop_paths: Vec::new(),
         }
     }
@@ -927,6 +965,13 @@ impl GpuiShell {
                     only_checked,
                     destination: rfd::FileDialog::new().pick_folder(),
                 },
+                DialogKind::AddFiles => DialogResult::AddFiles(rfd::FileDialog::new().pick_files()),
+                DialogKind::SaveCopy { name, directory } => DialogResult::SaveCopy(
+                    rfd::FileDialog::new()
+                        .set_file_name(&name)
+                        .set_directory(&directory)
+                        .save_file(),
+                ),
             };
             let _ = tx.send(result);
         });
@@ -952,6 +997,19 @@ impl GpuiShell {
             } => self
                 .controller
                 .dispatch(AppAction::ExtractTo { only_checked, dest }),
+            DialogResult::AddFiles(Some(paths)) if !paths.is_empty() => {
+                self.controller.dispatch(AppAction::Add(paths))
+            }
+            DialogResult::SaveCopy(Some(dest)) => {
+                if let Some(archive) = self.controller.state.archive.clone() {
+                    // Copying an archive over itself is not a backup, it is a
+                    // truncation.
+                    if dest != archive {
+                        self.controller
+                            .dispatch(AppAction::Run(Job::CopyTo { archive, dest }));
+                    }
+                }
+            }
             _ => {}
         }
         let return_focus = self.dialog_return_focus.clone();
@@ -1171,6 +1229,14 @@ impl GpuiShell {
             Some(ModalKind::Drop)
         } else if matches!(self.controller.state.view, View::Add) {
             Some(ModalKind::Add)
+        } else if self.controller.state.asking_folder {
+            Some(ModalKind::NewFolder)
+        } else if self.controller.state.renaming.is_some() {
+            Some(ModalKind::Rename)
+        } else if self.controller.state.picking_group.is_some() {
+            Some(ModalKind::Mask)
+        } else if self.controller.state.asking_default_password {
+            Some(ModalKind::DefaultPassword)
         } else if self.controller.state.show_settings {
             Some(ModalKind::Settings)
         } else if self.controller.state.show_shortcuts {
@@ -1207,6 +1273,18 @@ impl GpuiShell {
                 self.dialog_cancel_focus.clone(),
             ],
             ModalKind::Add => self.add_focus_targets(cx),
+            ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask => vec![
+                self.name_input.read(cx).focus_handle.clone(),
+                self.dialog_primary_focus.clone(),
+                self.dialog_cancel_focus.clone(),
+            ],
+            ModalKind::DefaultPassword => vec![
+                self.password.read(cx).focus_handle.clone(),
+                self.password_toggle_focus.clone(),
+                self.dialog_primary_focus.clone(),
+                self.dialog_secondary_focus.clone(),
+                self.dialog_cancel_focus.clone(),
+            ],
             ModalKind::Settings => self.settings_focus.clone(),
             ModalKind::Shortcuts => vec![self.dialog_cancel_focus.clone()],
         }
@@ -1278,6 +1356,10 @@ impl GpuiShell {
                 self.dialog_primary_focus.clone()
             }
             Some(ModalKind::Add) => self.output_name.read(cx).focus_handle.clone(),
+            Some(ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask) => {
+                self.name_input.read(cx).focus_handle.clone()
+            }
+            Some(ModalKind::DefaultPassword) => self.password.read(cx).focus_handle.clone(),
             Some(ModalKind::Settings) => self.settings_focus[0].clone(),
             Some(ModalKind::Shortcuts) => self.dialog_cancel_focus.clone(),
             None => self.dialog_return_focus.clone(),
@@ -1314,6 +1396,11 @@ impl GpuiShell {
                     .controller
                     .dispatch(AppAction::AnswerDrop(DropChoice::Cancel)),
                 ModalKind::Add => self.controller.state.view = View::Browse,
+                ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask => self.close_name(),
+                ModalKind::DefaultPassword => {
+                    self.controller.state.asking_default_password = false;
+                    self.controller.state.password_input.clear();
+                }
                 ModalKind::Settings => self.controller.state.show_settings = false,
                 ModalKind::Shortcuts => self.controller.state.show_shortcuts = false,
             }
@@ -1390,6 +1477,25 @@ impl GpuiShell {
                     self.start_add(cx);
                 }
             }
+            ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask => {
+                if focused(&self.dialog_cancel_focus) {
+                    self.close_name();
+                } else {
+                    self.confirm_name(kind, cx);
+                }
+            }
+            ModalKind::DefaultPassword => {
+                if focused(&self.password_toggle_focus) {
+                    self.controller.state.show_password = !self.controller.state.show_password;
+                } else if focused(&self.dialog_secondary_focus) {
+                    self.forget_default_password();
+                } else if focused(&self.dialog_cancel_focus) {
+                    self.controller.state.asking_default_password = false;
+                    self.controller.state.password_input.clear();
+                } else {
+                    self.keep_default_password();
+                }
+            }
             ModalKind::Shortcuts => self.controller.state.show_shortcuts = false,
             ModalKind::Settings => {
                 if let Some(control) = SettingsControl::ALL
@@ -1447,6 +1553,246 @@ impl GpuiShell {
     ) {
         self.controller.dispatch(AppAction::SetTheme(theme));
         gpui_theme::apply(theme, Some(window), cx);
+    }
+
+    /// The entries of the overflow menu that change the archive itself.
+    fn overflow_action(&mut self, action: OverflowAction, cx: &mut Context<Self>) {
+        match action {
+            OverflowAction::AddFiles => self.begin_dialog(DialogKind::AddFiles, cx),
+            // Asked for in a box rather than made as "New folder" and renamed
+            // after: making it rewrites the whole archive, and doing that twice
+            // for one folder would be silly.
+            OverflowAction::NewFolder => {
+                self.name_value.clear();
+                self.controller.state.asking_folder = true;
+            }
+            OverflowAction::Undo => self.controller.undo_last(),
+            OverflowAction::SaveCopy => {
+                let Some(archive) = self.controller.state.archive.clone() else {
+                    return;
+                };
+                let name = archive
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let directory = archive
+                    .parent()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                self.begin_dialog(DialogKind::SaveCopy { name, directory }, cx);
+            }
+            OverflowAction::DefaultPassword => {
+                self.controller.state.password_input.clear();
+                self.controller.state.asking_default_password = true;
+            }
+        }
+    }
+
+    /// Shuts whichever text dialog is open and forgets what was typed in it.
+    fn close_name(&mut self) {
+        self.controller.state.asking_folder = false;
+        self.controller.state.renaming = None;
+        self.controller.state.picking_group = None;
+        self.name_value.clear();
+    }
+
+    /// Acts on what the shared text field holds, according to which dialog
+    /// asked for it.
+    fn confirm_name(&mut self, kind: ModalKind, cx: &mut Context<Self>) {
+        let s = self.controller.s();
+        let name = self.name_value.trim().to_string();
+        match kind {
+            ModalKind::NewFolder => {
+                let Some(archive) = self.controller.state.archive.clone() else {
+                    self.close_name();
+                    return;
+                };
+                // The same rules a rename lives by: a name is a name and not a
+                // path, and nothing here is called that already.
+                if name.is_empty() || name.contains('/') || name.contains('\\') {
+                    self.controller.state.notice = s.bad_name.to_string();
+                    self.controller.state.error = true;
+                    self.close_name();
+                    return;
+                }
+                if self
+                    .controller
+                    .visible_rows()
+                    .iter()
+                    .any(|row| row.label.eq_ignore_ascii_case(&name))
+                {
+                    self.controller.state.notice = fill(s.name_taken, &[("name", &name)]);
+                    self.controller.state.error = true;
+                    self.close_name();
+                    return;
+                }
+                let full = format!("{}{name}/", self.controller.state.current_dir);
+                self.close_name();
+                self.controller.dispatch(AppAction::Run(Job::NewFolder {
+                    archive,
+                    name: full,
+                    password: self.controller.state.archive_password.clone(),
+                }));
+            }
+            ModalKind::Rename => {
+                let Some((path, _)) = self.controller.state.renaming.clone() else {
+                    self.close_name();
+                    return;
+                };
+                let rows = self.controller.visible_rows();
+                self.close_name();
+                self.controller.rename_to(&rows, &path, name.trim());
+            }
+            ModalKind::Mask => {
+                // WinRAR's keypad plus and minus: a mask picks or drops every
+                // name in this folder that matches it, in one go.
+                let adding = self.controller.state.picking_group.unwrap_or(true);
+                let rows = self.controller.visible_rows();
+                self.close_name();
+                if name.is_empty() {
+                    return;
+                }
+                for row in &rows {
+                    if super::matches_mask(&name, &row.label) {
+                        self.controller.dispatch(AppAction::SetChecked {
+                            row: row.clone(),
+                            value: adding,
+                        });
+                    }
+                }
+            }
+            _ => self.close_name(),
+        }
+        cx.notify();
+    }
+
+    /// The password to try on anything that asks for one, so a folder full of
+    /// archives locked with the same word is opened once and not fifteen
+    /// times. In memory and nowhere else: a password in plain text beside the
+    /// theme and the column widths is how an encrypted archive stops being
+    /// encrypted.
+    fn keep_default_password(&mut self) {
+        let given = std::mem::take(&mut self.controller.state.password_input);
+        self.controller.state.default_password = (!given.is_empty()).then_some(given);
+        self.controller.state.asking_default_password = false;
+    }
+
+    fn forget_default_password(&mut self) {
+        let s = self.controller.s();
+        self.controller.state.default_password = None;
+        self.controller.state.asking_default_password = false;
+        self.controller.state.password_input.clear();
+        self.controller.state.notice = s.password_forgotten.to_string();
+        self.controller.state.error = false;
+    }
+
+    /// The dialogs that are one text field and two buttons: a new folder, a
+    /// new name, a mask.
+    fn name_dialog(&mut self, kind: ModalKind, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
+        let s = self.controller.s();
+        let (title, hint, confirm) = match kind {
+            ModalKind::NewFolder => (s.new_folder, s.folder_name, s.new_folder),
+            ModalKind::Rename => (s.rename_word, s.rename_word, s.rename_word),
+            _ => {
+                let adding = self.controller.state.picking_group.unwrap_or(true);
+                (
+                    if adding {
+                        s.select_group
+                    } else {
+                        s.deselect_group
+                    },
+                    s.mask_hint,
+                    s.start,
+                )
+            }
+        };
+        let ok = Self::dialog_button("name-ok", confirm, &self.dialog_primary_focus, true, cx)
+            .on_click(cx.listener(move |this, _, _, cx| this.confirm_name(kind, cx)));
+        let cancel = Self::dialog_button("name-cancel", s.cancel, &self.dialog_cancel_focus, false, cx)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.close_name();
+                cx.notify();
+            }));
+        let body = div()
+            .id("name-dialog-body")
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.name_input.clone())
+            .child(div().flex().gap_2().child(ok).child(cancel));
+        self.dialog_overlay(kind, title, hint, body, cx)
+    }
+
+    fn default_password_dialog(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
+        let s = self.controller.s();
+        let show = !self.controller.state.show_password;
+        let toggle = Self::dialog_button(
+            "default-password-visibility",
+            if show { s.show_password } else { s.hide_word },
+            &self.password_toggle_focus,
+            false,
+            cx,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.controller
+                .dispatch(AppAction::TogglePasswordVisibility);
+            cx.notify();
+        }));
+        let keep = Self::dialog_button(
+            "default-password-keep",
+            s.start,
+            &self.dialog_primary_focus,
+            true,
+            cx,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.keep_default_password();
+            cx.notify();
+        }));
+        let forget = Self::dialog_button(
+            "default-password-forget",
+            s.remove_password,
+            &self.dialog_secondary_focus,
+            false,
+            cx,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.forget_default_password();
+            cx.notify();
+        }));
+        let cancel = Self::dialog_button(
+            "default-password-cancel",
+            s.cancel,
+            &self.dialog_cancel_focus,
+            false,
+            cx,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.controller.state.asking_default_password = false;
+            this.controller.state.password_input.clear();
+            cx.notify();
+        }));
+        let body = div()
+            .id("default-password-dialog-body")
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.password.clone())
+            .child(toggle)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(s.password_kept),
+            )
+            .child(div().flex().gap_2().child(keep).child(forget).child(cancel));
+        self.dialog_overlay(
+            ModalKind::DefaultPassword,
+            s.default_password,
+            s.password_hint,
+            body,
+            cx,
+        )
     }
 
     /// Language, theme, and the defaults a new archive is made with.
@@ -2175,6 +2521,10 @@ impl GpuiShell {
                     ),
                 )
             }
+            kind @ (ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask) => {
+                Some(self.name_dialog(kind, cx))
+            }
+            ModalKind::DefaultPassword => Some(self.default_password_dialog(cx)),
             ModalKind::Settings => Some(self.settings_dialog(cx)),
             ModalKind::Shortcuts => Some(self.shortcuts_dialog(cx)),
             ModalKind::Add => unreachable!("add dialog is rendered above"),
@@ -2219,6 +2569,16 @@ impl GpuiShell {
                     }));
                 }
             }
+            // Only a zip can be written to in place, so anywhere else this is
+            // left out rather than offered and refused.
+            RowAction::Rename => {
+                if let Some(row) = row {
+                    if self.controller.state.format == super::Format::Zip {
+                        self.name_value = row.label.clone();
+                        self.controller.state.renaming = Some((row.path, row.label));
+                    }
+                }
+            }
             RowAction::Delete => {
                 self.dialog_return_focus = self.delete_trigger_focus.clone();
                 self.controller.dispatch(AppAction::RequestDelete);
@@ -2250,9 +2610,10 @@ impl GpuiShell {
             cx.notify();
             return;
         }
+        let writable = self.controller.state.format == super::Format::Zip;
         let items: Vec<FocusHandle> = RowAction::ALL
             .iter()
-            .filter(|action| action.offered())
+            .filter(|action| action.offered() && (**action != RowAction::Rename || writable))
             .map(|action| self.row_menu_item_focus[*action as usize].clone())
             .collect();
         Self::menu_key_down(event, &items, window, cx);
@@ -2289,7 +2650,11 @@ impl GpuiShell {
             .tab_group()
             .focus_visible(focus_ring(cx))
             .on_key_down(cx.listener(Self::row_menu_key_down));
-        for action in RowAction::ALL.into_iter().filter(|a| a.offered()) {
+        let writable = self.controller.state.format == super::Format::Zip;
+        for action in RowAction::ALL
+            .into_iter()
+            .filter(|a| a.offered() && (*a != RowAction::Rename || writable))
+        {
             let (label, keys) = action.label(s);
             let item_focus = self.row_menu_item_focus[action as usize].clone();
             let item = Self::menu_item(
@@ -2399,7 +2764,34 @@ impl GpuiShell {
             Shortcut::Shortcuts => {
                 self.controller.state.show_shortcuts = !self.controller.state.show_shortcuts;
             }
-            Shortcut::ExtractAll | Shortcut::ExtractHere => return,
+            // One step back from the last change to the archive, which is the
+            // step anybody wants: the one they just took by mistake.
+            Shortcut::Undo if self.controller.state.undo.is_some() => self.controller.undo_last(),
+            Shortcut::DefaultPassword => {
+                self.controller.state.password_input.clear();
+                self.controller.state.asking_default_password = true;
+            }
+            Shortcut::Rename if archive.is_some() => {
+                let cursor = self.controller.state.cursor;
+                let rows = self.controller.visible_rows();
+                match cursor.and_then(|index| rows.get(index)) {
+                    Some(row) if self.controller.state.format == super::Format::Zip => {
+                        self.name_value = row.label.clone();
+                        self.controller.state.renaming =
+                            Some((row.path.clone(), row.label.clone()));
+                    }
+                    _ => return,
+                }
+            }
+            Shortcut::PickGroup(adding) if archive.is_some() => {
+                self.name_value.clear();
+                self.controller.state.picking_group = Some(adding);
+            }
+            Shortcut::ExtractAll
+            | Shortcut::ExtractHere
+            | Shortcut::Undo
+            | Shortcut::Rename
+            | Shortcut::PickGroup(_) => return,
         }
         cx.stop_propagation();
         cx.notify();
@@ -2408,7 +2800,7 @@ impl GpuiShell {
     /// The keys, and what each one does, in the two columns they are read in.
     fn shortcuts_dialog(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
         let s = self.controller.s();
-        let left: [(&str, &str); 18] = [
+        let left = [
             ("Ctrl+O", s.open),
             ("Ctrl+N", s.compress),
             ("Ctrl+E", s.extract_all),
@@ -2417,18 +2809,21 @@ impl GpuiShell {
             ("F5", s.refresh_word),
             ("Ctrl+F", s.find_word),
             ("", ""),
+            ("Ctrl+Z", s.undo_word),
+            ("Ctrl+P", s.default_password),
             ("Ctrl+A", s.select_all),
             ("Ctrl+I", s.invert_selection),
             ("Esc", s.clear_selection),
             ("Space", s.toggle_word),
+            ("Num +  -", s.select_group),
+            ("F2", s.rename_word),
             ("Supr", s.delete_word),
             ("F1", s.shortcuts_title),
-            ("", ""),
+        ];
+        let right = [
             ("Ctrl+C", s.copy_word),
             ("Ctrl+X", s.cut_word),
             ("Ctrl+V", s.paste_word),
-        ];
-        let right: [(&str, &str); 8] = [
             ("Ctrl+Shift+C", s.copy_names),
             ("", ""),
             ("Enter", s.open_word),
@@ -3292,11 +3687,16 @@ impl GpuiShell {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum DialogKind {
     Open,
     Compress,
     Extract { only_checked: bool },
+    /// Files to put inside the archive that is already open.
+    AddFiles,
+    /// A copy of the open archive under another name, which is the thing to do
+    /// before a change nobody is sure about.
+    SaveCopy { name: String, directory: PathBuf },
 }
 
 impl Focusable for GpuiShell {
@@ -3318,14 +3718,37 @@ impl Render for GpuiShell {
         let password_masked = !self.controller.state.show_password;
         self.password.update(cx, |input, _| {
             input.strings = s;
-            input.enabled = matches!(modal, Some(ModalKind::Password));
+            input.label = s.password_word;
+            input.enabled = matches!(
+                modal,
+                Some(ModalKind::Password | ModalKind::DefaultPassword)
+            );
             input.masked = password_masked;
             if input.content != password_value {
                 input.sync_from_state(&password_value);
             }
         });
+        // The shared text field takes the name of whichever dialog is asking.
+        let name_label = match modal {
+            Some(ModalKind::Rename) => s.rename_word,
+            Some(ModalKind::Mask) => s.mask_hint,
+            _ => s.folder_name,
+        };
+        let name_value = self.name_value.clone();
+        self.name_input.update(cx, |input, _| {
+            input.strings = s;
+            input.label = name_label;
+            input.enabled = matches!(
+                modal,
+                Some(ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask)
+            );
+            if input.content != name_value {
+                input.sync_from_state(&name_value);
+            }
+        });
         self.output_name.update(cx, |input, _| {
             input.strings = s;
+            input.label = s.output_name;
             input.enabled = matches!(modal, Some(ModalKind::Add));
             if input.content != self.controller.state.output_name {
                 input.sync_from_state(&self.controller.state.output_name);
@@ -3333,6 +3756,7 @@ impl Render for GpuiShell {
         });
         self.add_password.update(cx, |input, _| {
             input.strings = s;
+            input.label = s.password_optional;
             input.enabled = matches!(modal, Some(ModalKind::Add))
                 && self.controller.state.format == super::Format::Zip;
             input.masked = password_masked;
@@ -3343,6 +3767,7 @@ impl Render for GpuiShell {
         let state_filter = self.controller.state.filter.clone();
         self.filter.update(cx, |input, _| {
             input.strings = s;
+            input.label = s.find_word;
             input.enabled = idle;
         });
         if let Some(value) = filter_value_to_sync(&self.filter.read(cx).content, &state_filter) {
@@ -4154,8 +4579,47 @@ impl Render for GpuiShell {
                 cx.notify();
             })));
 
+            let writable = has && self.controller.state.format == super::Format::Zip;
+            let can_undo = has && self.controller.state.undo.is_some();
+            for (slot, id, label, enabled, action) in [
+                (
+                    7usize,
+                    "add-files",
+                    s.add_to_archive,
+                    writable,
+                    OverflowAction::AddFiles,
+                ),
+                (
+                    8,
+                    "new-folder",
+                    s.new_folder,
+                    writable,
+                    OverflowAction::NewFolder,
+                ),
+                (9, "undo", s.undo_word, can_undo, OverflowAction::Undo),
+                (10, "save-copy", s.save_copy, has, OverflowAction::SaveCopy),
+                (
+                    11,
+                    "default-password",
+                    s.default_password,
+                    menu_enabled,
+                    OverflowAction::DefaultPassword,
+                ),
+            ] {
+                let item_focus = self.overflow_item_focus[slot].clone().tab_stop(enabled);
+                let item = Self::menu_item(id, label, label.to_string(), enabled, cx)
+                    .track_focus(&item_focus);
+                menu = menu.child(item.on_click(cx.listener(move |this, _, _, cx| {
+                    if this.menu_enabled() {
+                        this.overflow_action(action, cx);
+                    }
+                    this.overflow_open = false;
+                    cx.notify();
+                })));
+            }
+
             let flat = self.controller.state.settings.flat;
-            let flat_focus = self.overflow_item_focus[7].clone().tab_stop(has);
+            let flat_focus = self.overflow_item_focus[12].clone().tab_stop(has);
             let flat_item = Self::menu_item(
                 "flat-view",
                 if flat {
@@ -4187,7 +4651,7 @@ impl Render for GpuiShell {
                 cx.notify();
             })));
 
-            let shortcuts_focus = self.overflow_item_focus[8].clone().tab_stop(menu_enabled);
+            let shortcuts_focus = self.overflow_item_focus[13].clone().tab_stop(menu_enabled);
             let shortcuts_item = Self::menu_item(
                 "shortcuts",
                 format!("{}\tF1", s.shortcuts_title),
@@ -4205,7 +4669,7 @@ impl Render for GpuiShell {
                 cx.notify();
             })));
 
-            let settings_focus = self.overflow_item_focus[9].clone().tab_stop(menu_enabled);
+            let settings_focus = self.overflow_item_focus[14].clone().tab_stop(menu_enabled);
             let settings_item = Self::menu_item(
                 "settings",
                 s.settings,
@@ -4228,7 +4692,7 @@ impl Render for GpuiShell {
                 let label = Columns::label(column, s);
                 let shown = self.controller.state.settings.columns.on(column);
                 let action = if shown { s.hide_word } else { s.show_word };
-                let item_focus = self.overflow_item_focus[position + 10]
+                let item_focus = self.overflow_item_focus[position + 15]
                     .clone()
                     .tab_stop(columns_available);
                 let item = Self::menu_item(
@@ -4284,6 +4748,17 @@ impl Render for GpuiShell {
     }
 }
 
+/// The overflow entries that write to the archive, as a value rather than a
+/// closure: the menu is built while the shell is still borrowed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OverflowAction {
+    AddFiles,
+    NewFolder,
+    Undo,
+    SaveCopy,
+    DefaultPassword,
+}
+
 /// What a key press means to the window, as opposed to the list.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shortcut {
@@ -4297,6 +4772,11 @@ enum Shortcut {
     ClearSelection,
     CopyNames,
     Shortcuts,
+    Undo,
+    DefaultPassword,
+    Rename,
+    /// A mask that picks names, or one that drops them.
+    PickGroup(bool),
 }
 
 /// Reading a key press, with no state and no side effects, so the table of
@@ -4321,6 +4801,8 @@ fn shortcut_for(
             "e" => Some(Shortcut::ExtractAll),
             "t" => Some(Shortcut::Test),
             "i" => Some(Shortcut::Invert),
+            "z" => Some(Shortcut::Undo),
+            "p" => Some(Shortcut::DefaultPassword),
             _ => None,
         };
     }
@@ -4332,8 +4814,15 @@ fn shortcut_for(
     }
     match key {
         "f1" => Some(Shortcut::Shortcuts),
+        "f2" => Some(Shortcut::Rename),
         "f5" => Some(Shortcut::Refresh),
         "escape" => Some(Shortcut::ClearSelection),
+        // The keypad plus and minus, where WinRAR has kept picking a group by
+        // name since before there were menus to put it in. Its third one, the
+        // keypad star for inverting, cannot be told from any other asterisk by
+        // a toolkit, so that one stays on Ctrl+I alone.
+        "+" | "plus" | "add" => Some(Shortcut::PickGroup(true)),
+        "-" | "minus" | "subtract" => Some(Shortcut::PickGroup(false)),
         _ => None,
     }
 }
@@ -4633,6 +5122,21 @@ mod tests {
         // Ctrl+Shift+C is the names as text, not the files.
         assert_eq!(shortcut_for(true, true, false, "o", false), None);
         assert_eq!(shortcut_for(false, false, false, "q", false), None);
+        // The keypad's plus picks a group and its minus drops one; both are
+        // bare keys, so both stand aside for a text field.
+        assert_eq!(
+            shortcut_for(false, false, false, "+", false),
+            Some(Shortcut::PickGroup(true))
+        );
+        assert_eq!(
+            shortcut_for(false, false, false, "minus", false),
+            Some(Shortcut::PickGroup(false))
+        );
+        assert_eq!(shortcut_for(false, false, false, "+", true), None);
+        assert_eq!(
+            shortcut_for(true, false, false, "z", false),
+            Some(Shortcut::Undo)
+        );
     }
 
     #[test]
