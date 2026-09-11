@@ -539,7 +539,46 @@ struct GpuiShell {
     add_password_toggle_focus: FocusHandle,
     add_start_focus: FocusHandle,
     add_cancel_focus: FocusHandle,
+    /// The eleven controls of the settings dialog, in the order they are drawn.
+    /// One vector rather than eleven fields because every one of them is the
+    /// same thing -- a row in a list of preferences -- and `SettingsControl`
+    /// already says which is which.
+    settings_focus: Vec<FocusHandle>,
     drop_paths: Vec<PathBuf>,
+}
+
+/// A control in the settings dialog, in draw order. The index into
+/// `settings_focus` is `control as usize`, so the keyboard and the mouse reach
+/// the same code instead of two copies of it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsControl {
+    LangSystem,
+    LangEn,
+    LangEs,
+    ThemeSystem,
+    ThemeLight,
+    ThemeDark,
+    Format,
+    Codec,
+    Level,
+    Subfolder,
+    Close,
+}
+
+impl SettingsControl {
+    const ALL: [SettingsControl; 11] = [
+        SettingsControl::LangSystem,
+        SettingsControl::LangEn,
+        SettingsControl::LangEs,
+        SettingsControl::ThemeSystem,
+        SettingsControl::ThemeLight,
+        SettingsControl::ThemeDark,
+        SettingsControl::Format,
+        SettingsControl::Codec,
+        SettingsControl::Level,
+        SettingsControl::Subfolder,
+        SettingsControl::Close,
+    ];
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -549,6 +588,7 @@ enum ModalKind {
     Delete,
     Drop,
     Add,
+    Settings,
 }
 
 impl GpuiShell {
@@ -666,8 +706,9 @@ impl GpuiShell {
             conflict_trigger_focus: cx.focus_handle(),
             overflow_menu_focus: cx.focus_handle(),
             breadcrumbs_menu_focus: cx.focus_handle(),
-            // Test/select/invert/clear, copy/cut/paste, then the columns.
-            overflow_item_focus: (0..(7 + Columns::ALL.len()))
+            // Test/select/invert/clear, copy/cut/paste, settings, then the
+            // columns.
+            overflow_item_focus: (0..(8 + Columns::ALL.len()))
                 .map(|_| cx.focus_handle().tab_stop(true))
                 .collect(),
             breadcrumbs_item_focus: Vec::new(),
@@ -687,6 +728,10 @@ impl GpuiShell {
             add_password_toggle_focus: cx.focus_handle().tab_stop(true),
             add_start_focus: cx.focus_handle().tab_stop(true),
             add_cancel_focus: cx.focus_handle().tab_stop(true),
+            settings_focus: SettingsControl::ALL
+                .iter()
+                .map(|_| cx.focus_handle().tab_stop(true))
+                .collect(),
             drop_paths: Vec::new(),
         }
     }
@@ -1051,6 +1096,8 @@ impl GpuiShell {
             Some(ModalKind::Drop)
         } else if matches!(self.controller.state.view, View::Add) {
             Some(ModalKind::Add)
+        } else if self.controller.state.show_settings {
+            Some(ModalKind::Settings)
         } else {
             None
         }
@@ -1083,6 +1130,7 @@ impl GpuiShell {
                 self.dialog_cancel_focus.clone(),
             ],
             ModalKind::Add => self.add_focus_targets(cx),
+            ModalKind::Settings => self.settings_focus.clone(),
         }
     }
 
@@ -1152,6 +1200,7 @@ impl GpuiShell {
                 self.dialog_primary_focus.clone()
             }
             Some(ModalKind::Add) => self.output_name.read(cx).focus_handle.clone(),
+            Some(ModalKind::Settings) => self.settings_focus[0].clone(),
             None => self.dialog_return_focus.clone(),
         };
         window.on_next_frame(move |window, cx| window.focus(&target, cx));
@@ -1186,6 +1235,7 @@ impl GpuiShell {
                     .controller
                     .dispatch(AppAction::AnswerDrop(DropChoice::Cancel)),
                 ModalKind::Add => self.controller.state.view = View::Browse,
+                ModalKind::Settings => self.controller.state.show_settings = false,
             }
             cx.stop_propagation();
             cx.notify();
@@ -1260,7 +1310,227 @@ impl GpuiShell {
                     self.start_add(cx);
                 }
             }
+            ModalKind::Settings => {
+                if let Some(control) = SettingsControl::ALL
+                    .iter()
+                    .copied()
+                    .find(|control| focused(&self.settings_focus[*control as usize]))
+                {
+                    self.settings_activate(control, window, cx);
+                }
+            }
         }
+    }
+
+    /// One place where a settings control does its work, so the click handler
+    /// and Enter cannot drift apart.
+    fn settings_activate(
+        &mut self,
+        control: SettingsControl,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match control {
+            SettingsControl::LangSystem => {
+                self.controller.dispatch(AppAction::SetLanguage(None));
+            }
+            SettingsControl::LangEn => {
+                self.controller
+                    .dispatch(AppAction::SetLanguage(Some(super::Lang::En)));
+            }
+            SettingsControl::LangEs => {
+                self.controller
+                    .dispatch(AppAction::SetLanguage(Some(super::Lang::Es)));
+            }
+            SettingsControl::ThemeSystem => self.set_theme(super::ThemePreference::System, window, cx),
+            SettingsControl::ThemeLight => self.set_theme(super::ThemePreference::Light, window, cx),
+            SettingsControl::ThemeDark => self.set_theme(super::ThemePreference::Dark, window, cx),
+            SettingsControl::Format => self.cycle_format(),
+            SettingsControl::Codec => self.cycle_codec(),
+            SettingsControl::Level => self.cycle_level(),
+            SettingsControl::Subfolder => {
+                self.controller.state.into_subfolder = !self.controller.state.into_subfolder;
+            }
+            SettingsControl::Close => self.controller.state.show_settings = false,
+        }
+    }
+
+    /// The preference is stored by the controller and painted by GPUI, and both
+    /// have to happen: saving without repainting leaves the window in the old
+    /// theme until it is restarted.
+    fn set_theme(
+        &mut self,
+        theme: super::ThemePreference,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.controller.dispatch(AppAction::SetTheme(theme));
+        gpui_theme::apply(theme, Some(window), cx);
+    }
+
+    /// Language, theme, and the defaults a new archive is made with.
+    ///
+    /// Every choice is a row of buttons with the current one filled in, not a
+    /// dropdown: there are three of each at most, and a list that short costs
+    /// more to open than to read.
+    fn settings_dialog(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
+        let s = self.controller.s();
+        let lang = self.controller.state.settings.lang;
+        let theme = self.controller.state.settings.theme;
+        let is_zip = self.controller.state.format == super::Format::Zip;
+        let choice = |this: &Self,
+                      control: SettingsControl,
+                      label: &'static str,
+                      active: bool,
+                      enabled: bool,
+                      cx: &mut Context<Self>| {
+            let mut button = Self::dialog_button(
+                ("settings", control as usize),
+                label,
+                &this.settings_focus[control as usize],
+                active,
+                cx,
+            )
+            .aria_selected(active);
+            if enabled {
+                button = button.on_click(cx.listener(move |this, _, window, cx| {
+                    this.settings_activate(control, window, cx);
+                    cx.notify();
+                }));
+            }
+            button
+        };
+        let row = |label: &'static str, children: Vec<Stateful<gpui::Div>>| {
+            div()
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .gap_2()
+                .child(div().w(px(110.)).flex_none().child(label))
+                .children(children)
+        };
+        let languages = row(
+            s.language,
+            vec![
+                choice(
+                    self,
+                    SettingsControl::LangSystem,
+                    s.theme_system,
+                    lang.is_none(),
+                    true,
+                    cx,
+                ),
+                choice(
+                    self,
+                    SettingsControl::LangEn,
+                    super::Lang::En.label(),
+                    lang == Some(super::Lang::En),
+                    true,
+                    cx,
+                ),
+                choice(
+                    self,
+                    SettingsControl::LangEs,
+                    super::Lang::Es.label(),
+                    lang == Some(super::Lang::Es),
+                    true,
+                    cx,
+                ),
+            ],
+        );
+        let themes = row(
+            s.theme,
+            vec![
+                choice(
+                    self,
+                    SettingsControl::ThemeSystem,
+                    s.theme_system,
+                    theme == super::ThemePreference::System,
+                    true,
+                    cx,
+                ),
+                choice(
+                    self,
+                    SettingsControl::ThemeLight,
+                    s.theme_light,
+                    theme == super::ThemePreference::Light,
+                    true,
+                    cx,
+                ),
+                choice(
+                    self,
+                    SettingsControl::ThemeDark,
+                    s.theme_dark,
+                    theme == super::ThemePreference::Dark,
+                    true,
+                    cx,
+                ),
+            ],
+        );
+        let defaults = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(s.defaults_title),
+            )
+            .child(row(
+                s.format,
+                vec![choice(
+                    self,
+                    SettingsControl::Format,
+                    self.controller.state.format.label(),
+                    false,
+                    true,
+                    cx,
+                )],
+            ))
+            .child(row(
+                s.compressor,
+                vec![choice(
+                    self,
+                    SettingsControl::Codec,
+                    self.controller.codec_name(self.controller.state.codec),
+                    false,
+                    is_zip,
+                    cx,
+                )],
+            ))
+            .child(row(
+                s.level,
+                vec![choice(
+                    self,
+                    SettingsControl::Level,
+                    self.controller.level_name(self.controller.state.level),
+                    false,
+                    true,
+                    cx,
+                )],
+            ));
+        let subfolder = choice(
+            self,
+            SettingsControl::Subfolder,
+            s.into_subfolder,
+            self.controller.state.into_subfolder,
+            true,
+            cx,
+        );
+        let close = choice(self, SettingsControl::Close, s.close, true, true, cx);
+        let body = div()
+            .id("settings-dialog-body")
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(languages)
+            .child(themes)
+            .child(Separator::horizontal())
+            .child(defaults)
+            .child(subfolder)
+            .child(div().flex().gap_2().child(close));
+        self.dialog_overlay(ModalKind::Settings, s.settings, s.defaults_title, body, cx)
     }
 
     fn dialog_button(
@@ -1824,6 +2094,7 @@ impl GpuiShell {
                     ),
                 )
             }
+            ModalKind::Settings => Some(self.settings_dialog(cx)),
             ModalKind::Add => unreachable!("add dialog is rendered above"),
         }
     }
@@ -3352,13 +3623,30 @@ impl Render for GpuiShell {
                 cx.notify();
             })));
 
+            let settings_focus = self.overflow_item_focus[7].clone().tab_stop(menu_enabled);
+            let settings_item = Self::menu_item(
+                "settings",
+                s.settings,
+                s.settings.to_string(),
+                menu_enabled,
+                cx,
+            )
+            .track_focus(&settings_focus);
+            menu = menu.child(settings_item.on_click(cx.listener(|this, _, _, cx| {
+                if this.menu_enabled() {
+                    this.controller.state.show_settings = true;
+                }
+                this.overflow_open = false;
+                cx.notify();
+            })));
+
             let columns_available = menu_enabled;
             for (position, (column, _)) in Columns::ALL.iter().enumerate() {
                 let column = *column;
                 let label = Columns::label(column, s);
                 let shown = self.controller.state.settings.columns.on(column);
                 let action = if shown { s.hide_word } else { s.show_word };
-                let item_focus = self.overflow_item_focus[position + 7]
+                let item_focus = self.overflow_item_focus[position + 8]
                     .clone()
                     .tab_stop(columns_available);
                 let item = Self::menu_item(
@@ -3647,6 +3935,16 @@ mod tests {
         let paths = vec![PathBuf::from("queued.zip")];
         assert_eq!(drop_paths_for_enter(&paths, true), paths);
         assert!(drop_paths_for_enter(&paths, false).is_empty());
+    }
+
+    #[test]
+    fn every_settings_control_has_its_own_slot_in_draw_order() {
+        // The dialog indexes `settings_focus` by `control as usize`, so a
+        // control added out of order would silently take another one's focus
+        // handle and Enter would activate the wrong preference.
+        for (index, control) in SettingsControl::ALL.iter().enumerate() {
+            assert_eq!(*control as usize, index);
+        }
     }
 
     #[test]
