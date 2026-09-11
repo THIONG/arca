@@ -546,6 +546,11 @@ struct GpuiShell {
     settings_focus: Vec<FocusHandle>,
     /// Which row the right button was pressed on, and where the pointer was,
     /// so the menu opens under it instead of in a fixed corner.
+    /// Which column edge is in hand: its slot in `Settings::widths`, where the
+    /// pointer was when it was grabbed, and how wide the column was then.
+    /// Kept as the state at the grab rather than as a running delta, so a
+    /// dropped mouse-move event cannot make the column drift.
+    resizing: Option<(usize, f32, f32)>,
     row_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
     row_menu_focus: FocusHandle,
     row_menu_item_focus: Vec<FocusHandle>,
@@ -795,6 +800,7 @@ impl GpuiShell {
                 .iter()
                 .map(|_| cx.focus_handle().tab_stop(true))
                 .collect(),
+            resizing: None,
             row_menu: None,
             row_menu_focus: cx.focus_handle(),
             row_menu_item_focus: RowAction::ALL
@@ -2657,19 +2663,43 @@ impl GpuiShell {
             .collect()
     }
 
-    fn column_width(column: SortColumn) -> f32 {
-        match column {
-            SortColumn::Name => 0.0,
-            SortColumn::Size | SortColumn::Packed => 100.0,
-            SortColumn::Method => 130.0,
-            SortColumn::Saved => 82.0,
-            SortColumn::Modified => 150.0,
-            SortColumn::Created | SortColumn::Accessed => 150.0,
-            SortColumn::Attributes => 105.0,
-            SortColumn::Crc => 105.0,
-            SortColumn::Type => 120.0,
-            SortColumn::Path => 180.0,
-        }
+    /// Where a column's width lives in `Settings::widths`: the name first,
+    /// then the ones that can be turned off, in the order of `Columns::ALL`.
+    /// A column keeps its width while it is off, so turning one back on does
+    /// not lose how it was set.
+    fn column_slot(column: SortColumn) -> usize {
+        Columns::ALL
+            .iter()
+            .position(|(candidate, _)| *candidate == column)
+            .map_or(0, |index| index + 1)
+    }
+
+    fn column_width(&self, column: SortColumn) -> f32 {
+        let slot = Self::column_slot(column);
+        self.controller
+            .state
+            .settings
+            .widths
+            .get(slot)
+            .copied()
+            .unwrap_or_else(|| Settings::default_widths()[slot])
+    }
+
+    /// What a column would have to be to hold what is in it.
+    ///
+    /// ponytail: counted in characters against a nominal advance rather than
+    /// shaped through the text system, which is not reachable from a mouse
+    /// handler. Fit the real shaped width if a proportional face ever makes
+    /// this visibly wrong.
+    fn natural_width(&self, column: SortColumn, rows: &[super::Row]) -> f32 {
+        let head = Columns::label(column, self.controller.s()).chars().count();
+        let widest = rows
+            .iter()
+            .map(|row| self.column_text(row, column).chars().count())
+            .max()
+            .unwrap_or(0);
+        let slot = Self::column_slot(column);
+        (widest.max(head) as f32 * 7.2 + 24.0).clamp(Settings::least(slot), 640.0)
     }
 
     fn column_header(
@@ -2715,7 +2745,7 @@ impl GpuiShell {
         if column == SortColumn::Name {
             cell = cell.flex_1();
         } else {
-            cell = cell.w(px(Self::column_width(column))).flex_none();
+            cell = cell.w(px(self.column_width(column))).flex_none();
         }
         if enabled {
             cell = cell.on_click(cx.listener(move |this, _, _, cx| {
@@ -2726,6 +2756,49 @@ impl GpuiShell {
             }));
         }
         cell
+    }
+
+    /// The grab strip down the right edge of a header cell.
+    ///
+    /// Absolute inside the cell rather than an element of its own in the flex
+    /// row: a divider with a width would push every header a few pixels off
+    /// the column it names.
+    fn column_edge(&self, column: SortColumn, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
+        let slot = Self::column_slot(column);
+        let width = self.column_width(column);
+        div()
+            .id(("column-edge", column as usize))
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right(px(-3.))
+            .w(px(6.))
+            .cursor(gpui::CursorStyle::ResizeLeftRight)
+            .hover(|style| style.bg(cx.theme().ring))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    if event.click_count >= 2 {
+                        // Fitting the column to what is in it, which is what the
+                        // same gesture does in WinRAR and in the Explorer.
+                        let rows = this.controller.visible_rows();
+                        let fitted = this.natural_width(column, &rows);
+                        this.set_column_width(slot, fitted);
+                        this.controller.state.settings.save();
+                    } else {
+                        this.resizing = Some((slot, f32::from(event.position.x), width));
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+    }
+
+    fn set_column_width(&mut self, slot: usize, width: f32) {
+        if self.controller.state.settings.widths.len() <= slot {
+            self.controller.state.settings.widths = Settings::default_widths();
+        }
+        self.controller.state.settings.widths[slot] = width.max(Settings::least(slot));
     }
 
     fn kind_mark(kind: Kind) -> &'static str {
@@ -2743,13 +2816,14 @@ impl GpuiShell {
     fn text_cell(
         text: impl Into<gpui::SharedString>,
         column: SortColumn,
+        width: f32,
         index: usize,
         column_index: usize,
         accessible: bool,
     ) -> Stateful<gpui::Div> {
         let mut cell = div()
             .id(("file-cell", index * 10 + column as usize))
-            .w(px(Self::column_width(column)))
+            .w(px(width))
             .flex_none()
             .px_2()
             .items_center()
@@ -2895,6 +2969,7 @@ impl GpuiShell {
             item = item.child(Self::text_cell(
                 self.column_text(row, column),
                 column,
+                self.column_width(column),
                 index,
                 offset + 2,
                 accessible,
@@ -3151,7 +3226,11 @@ impl GpuiShell {
                 if *column == SortColumn::Name {
                     cell = cell.flex_1();
                 } else {
-                    cell = cell.w(px(Self::column_width(*column))).flex_none();
+                    cell = cell.w(px(self.column_width(*column))).flex_none();
+                    // The rule that pulls the column wider, sitting in the gap
+                    // between two cells rather than taking a place in the row,
+                    // so the header and the rows below it stay lined up.
+                    cell = cell.relative().child(self.column_edge(*column, cx));
                 }
                 if enabled {
                     cell = cell
@@ -3639,10 +3718,10 @@ impl Render for GpuiShell {
             canvas(
                 |_, _, _| (),
                 move |_, _, window, _| {
-                    let view = view.clone();
+                    let dropped = view.clone();
                     window.on_mouse_event(move |event: &gpui::FileDropEvent, _, window, app| {
                         let current_focus = window.focused(app);
-                        view.update(app, |shell, cx| match event {
+                        dropped.update(app, |shell, cx| match event {
                             gpui::FileDropEvent::Entered { paths, .. } => {
                                 shell.drop_paths =
                                     drop_paths_for_enter(paths.paths(), shell.background_idle());
@@ -3665,6 +3744,33 @@ impl Render for GpuiShell {
                                 shell.drop_paths.clear();
                             }
                             gpui::FileDropEvent::Pending { .. } => {}
+                        });
+                    });
+
+                    // A column edge in hand has to keep following the pointer
+                    // after it has left the six pixels it was grabbed by, so
+                    // the move and the release are watched on the window and
+                    // not on the strip.
+                    let dragging = view.clone();
+                    window.on_mouse_event(move |event: &gpui::MouseMoveEvent, _, _, app| {
+                        dragging.update(app, |shell, cx| {
+                            let Some((slot, from, width)) = shell.resizing else {
+                                return;
+                            };
+                            shell.set_column_width(slot, width + f32::from(event.position.x) - from);
+                            cx.notify();
+                        });
+                    });
+                    let released = view.clone();
+                    window.on_mouse_event(move |_: &gpui::MouseUpEvent, _, _, app| {
+                        released.update(app, |shell, cx| {
+                            if shell.resizing.take().is_some() {
+                                // Written when the hand lets go rather than on
+                                // the way, so pulling an edge across the window
+                                // is one visit to the disk and not one a frame.
+                                shell.controller.state.settings.save();
+                                cx.notify();
+                            }
                         });
                     });
                 },
@@ -4435,6 +4541,21 @@ mod tests {
         let paths = vec![PathBuf::from("queued.zip")];
         assert_eq!(drop_paths_for_enter(&paths, true), paths);
         assert!(drop_paths_for_enter(&paths, false).is_empty());
+    }
+
+    #[test]
+    fn every_column_reads_its_width_from_its_own_slot() {
+        // The widths vector is the one written to gui.conf: the name first,
+        // then `Columns::ALL` in order. A slot off by one would hand a column
+        // the width of its neighbour and the file would still load.
+        assert_eq!(GpuiShell::column_slot(SortColumn::Name), 0);
+        for (index, (column, _)) in Columns::ALL.iter().enumerate() {
+            assert_eq!(GpuiShell::column_slot(*column), index + 1);
+        }
+        let widths = Settings::default_widths();
+        assert_eq!(widths.len(), Columns::ALL.len() + 1);
+        // A column cannot be pulled below what it needs to stay readable.
+        assert!(Settings::least(0) > Settings::least(1));
     }
 
     #[test]
