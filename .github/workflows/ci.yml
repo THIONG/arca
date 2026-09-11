@@ -68,7 +68,9 @@ jobs:
         with:
           cache-on-failure: true
       - run: cargo build --release
-      - run: cargo test --workspace
+      # The Linux job runs arca-gui's tests once; repeating the GPUI test link
+      # on Windows adds roughly twenty minutes without new coverage.
+      - run: cargo test --workspace --exclude arca-gui
       # No continue-on-error: the release has been building this without a net
       # since v0.3.0, so letting it slide here only hid a breakage until
       # publishing time. It lives outside the workspace, hence the directory.
@@ -116,7 +118,9 @@ jobs:
         with:
           cache-on-failure: true
       - run: cargo build --release
-      - run: cargo test --workspace
+      # The Linux job runs arca-gui's tests once; this job validates the
+      # platform build without linking the large GPUI test binary again.
+      - run: cargo test --workspace --exclude arca-gui
       - name: Installer, there and back
         run: |
           ./install.sh
