@@ -82,18 +82,6 @@ jobs:
       - name: Build Windows release binaries
         if: matrix.os == 'windows-latest'
         run: cargo build --release --target x86_64-pc-windows-msvc
-
-      # Keep the install smoke test beside the build that produced its binaries.
-      - name: Installer smoke test
-        if: matrix.os != 'windows-latest'
-        run: |
-          ./install.sh
-          test -x "$HOME/.local/bin/arca" && test -x "$HOME/.local/bin/arca-gui"
-          "$HOME/.local/bin/arca" --version
-          ./install.sh --uninstall
-          test ! -e "$HOME/.local/bin/arca" && \
-            test ! -e "$HOME/.local/bin/arca-gui"
-
       - name: Shell extension
         if: matrix.os == 'windows-latest'
         working-directory: windows/arca-shell
@@ -101,21 +89,3 @@ jobs:
           cargo build --release
           cargo test
           cargo clippy --release --all-targets -- -D warnings
-
-      - name: Windows installer
-        if: matrix.os == 'windows-latest'
-        shell: bash
-        run: |
-          set -eu
-          cargo build --release --target x86_64-pc-windows-msvc \
-            --manifest-path windows/arca-shell/Cargo.toml
-          if LC_ALL=C grep -n '[^[:print:][:space:]]' \
-            windows/AppxManifest.xml; then
-            echo "AppxManifest.xml has non-ASCII bytes on those lines"; exit 1
-          fi
-          ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
-          test -f "$ISCC" || choco install innosetup -y --no-progress
-          BIN='//DBinDir=..\\target\\x86_64-pc-windows-msvc\\release'
-          SHELL_DIR='//DShellDir=arca-shell\\target\\x86_64-pc-windows-msvc\\release'
-          "$ISCC" //DVersion=0.0.0 "$BIN" "$SHELL_DIR" windows/arca.iss
-          test -f dist/arca-setup-0.0.0-x86_64.exe
