@@ -774,9 +774,9 @@ impl GpuiShell {
             conflict_trigger_focus: cx.focus_handle(),
             overflow_menu_focus: cx.focus_handle(),
             breadcrumbs_menu_focus: cx.focus_handle(),
-            // Test/select/invert/clear, copy/cut/paste, shortcuts, settings,
-            // then the columns.
-            overflow_item_focus: (0..(9 + Columns::ALL.len()))
+            // Test/select/invert/clear, copy/cut/paste, flat view, shortcuts,
+            // settings, then the columns.
+            overflow_item_focus: (0..(10 + Columns::ALL.len()))
                 .map(|_| cx.focus_handle().tab_stop(true))
                 .collect(),
             breadcrumbs_item_focus: Vec::new(),
@@ -4154,7 +4154,40 @@ impl Render for GpuiShell {
                 cx.notify();
             })));
 
-            let shortcuts_focus = self.overflow_item_focus[7].clone().tab_stop(menu_enabled);
+            let flat = self.controller.state.settings.flat;
+            let flat_focus = self.overflow_item_focus[7].clone().tab_stop(has);
+            let flat_item = Self::menu_item(
+                "flat-view",
+                if flat {
+                    format!("{} ✓", s.flat_view)
+                } else {
+                    s.flat_view.to_string()
+                },
+                s.flat_view.to_string(),
+                has,
+                cx,
+            )
+            .aria_selected(flat)
+            .track_focus(&flat_focus);
+            menu = menu.child(flat_item.on_click(cx.listener(|this, _, _, cx| {
+                if this.menu_enabled() && this.controller.state.archive.is_some() {
+                    let settings = &mut this.controller.state.settings;
+                    settings.flat = !settings.flat;
+                    // A flat list is a list of names with no folder over them,
+                    // so the folder each one came from has to go somewhere. It
+                    // is left on afterwards: turning the view off and on again
+                    // should not keep undoing a column since arranged by hand.
+                    if settings.flat && !settings.columns.on(SortColumn::Path) {
+                        settings.columns.set(SortColumn::Path, true);
+                    }
+                    settings.save();
+                    this.controller.dispatch(AppAction::ClearSelection);
+                }
+                this.overflow_open = false;
+                cx.notify();
+            })));
+
+            let shortcuts_focus = self.overflow_item_focus[8].clone().tab_stop(menu_enabled);
             let shortcuts_item = Self::menu_item(
                 "shortcuts",
                 format!("{}\tF1", s.shortcuts_title),
@@ -4172,7 +4205,7 @@ impl Render for GpuiShell {
                 cx.notify();
             })));
 
-            let settings_focus = self.overflow_item_focus[8].clone().tab_stop(menu_enabled);
+            let settings_focus = self.overflow_item_focus[9].clone().tab_stop(menu_enabled);
             let settings_item = Self::menu_item(
                 "settings",
                 s.settings,
@@ -4195,7 +4228,7 @@ impl Render for GpuiShell {
                 let label = Columns::label(column, s);
                 let shown = self.controller.state.settings.columns.on(column);
                 let action = if shown { s.hide_word } else { s.show_word };
-                let item_focus = self.overflow_item_focus[position + 9]
+                let item_focus = self.overflow_item_focus[position + 10]
                     .clone()
                     .tab_stop(columns_available);
                 let item = Self::menu_item(
