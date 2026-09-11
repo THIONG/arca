@@ -1,0 +1,22 @@
+[package]
+name = "arca-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "La unica parte de Arca que toca la red: una peticion HTTPS por el sistema"
+
+# Como arca-drag: todo lo de dentro es Windows y en cualquier otra plataforma el
+# crate compila vacio, que es mas simple que excluirlo del workspace.
+#
+# WinHTTP en vez de una biblioteca HTTP de terceros a proposito. Preguntar un
+# numero de version no justifica meter una pila TLS entera en un programa que
+# hasta ahora solo llevaba descompresores: son megabytes de codigo ajeno, con
+# sus propias raices de confianza que mantener al dia. El sistema ya tiene una,
+# ya la actualiza Windows Update, y ya la usa todo lo demas de esta maquina.
+[target."cfg(windows)".dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinHttp",
+] }

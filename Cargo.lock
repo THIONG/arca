@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "arca-cli"
-version = "0.5.1"
+version = "0.6.6"
 dependencies = [
  "arca-core",
  "arca-tar",
@@ -410,14 +410,14 @@ dependencies = [
 
 [[package]]
 name = "arca-core"
-version = "0.5.1"
+version = "0.6.6"
 dependencies = [
  "crc32fast",
 ]
 
 [[package]]
 name = "arca-drag"
-version = "0.5.1"
+version = "0.6.6"
 dependencies = [
  "windows 0.58.0",
  "windows-core 0.58.0",
@@ -425,11 +425,12 @@ dependencies = [
 
 [[package]]
 name = "arca-gui"
-version = "0.5.1"
+version = "0.6.6"
 dependencies = [
  "arca-core",
  "arca-drag",
  "arca-icons",
+ "arca-net",
  "arca-tar",
  "arca-zip",
  "clipboard-win",
@@ -443,27 +444,35 @@ dependencies = [
  "image",
  "rayon",
  "rfd",
+ "sha2 0.10.9",
  "sys-locale",
  "winresource",
 ]
 
 [[package]]
 name = "arca-icons"
-version = "0.5.1"
+version = "0.6.6"
+dependencies = [
+ "windows 0.58.0",
+]
+
+[[package]]
+name = "arca-net"
+version = "0.6.6"
 dependencies = [
  "windows 0.58.0",
 ]
 
 [[package]]
 name = "arca-tar"
-version = "0.5.1"
+version = "0.6.6"
 dependencies = [
  "arca-core",
 ]
 
 [[package]]
 name = "arca-zip"
-version = "0.5.1"
+version = "0.6.6"
 dependencies = [
  "aes",
  "arca-core",
@@ -472,7 +481,9 @@ dependencies = [
  "flate2",
  "getrandom 0.2.17",
  "hmac",
+ "libdeflater",
  "pbkdf2",
+ "rayon",
  "sha1",
  "zstd",
 ]
@@ -1460,7 +1471,7 @@ checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
 dependencies = [
  "serde",
  "termcolor",
- "unicode-width 0.1.14",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -3067,7 +3078,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.20",
- "windows 0.58.0",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -4013,7 +4024,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4532,6 +4543,24 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libdeflate-sys"
+version = "1.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6949d73714ba8c32d2757405b89c94e427f64f078a4041debe07e1b8e9e850e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "libdeflater"
+version = "1.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b72b274104f747cb65358c918e38c6cd4a69937937a36c8ad3cfd516c9c471e"
+dependencies = [
+ "libdeflate-sys",
+]
 
 [[package]]
 name = "libfuzzer-sys"

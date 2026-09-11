@@ -1,12 +1,21 @@
 [workspace]
 resolver = "2"
-members = ["arca-core", "arca-zip", "arca-tar", "arca-cli", "arca-gui", "arca-icons", "arca-drag"]
+members = [
+    "arca-core",
+    "arca-zip",
+    "arca-tar",
+    "arca-cli",
+    "arca-gui",
+    "arca-icons",
+    "arca-drag",
+    "arca-net",
+]
 # Solo compila en Windows: se queda fuera del workspace para que
 # `cargo build` siga funcionando en Linux y macOS.
 exclude = ["windows/arca-shell"]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.6"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"

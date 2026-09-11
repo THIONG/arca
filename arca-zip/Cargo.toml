@@ -19,13 +19,28 @@ getrandom = "0.2"
 arca-core.workspace = true
 flate2.workspace = true
 crc32fast.workspace = true
-# Zstandard: bindings a libzstd. Es el unico codigo C del crate y entra solo
-# con la bandera codecs-native (seccion 03 del diseno).
+# Comprimir cada entrada en un nucleo distinto. Es lo que hace que un zip valga
+# la pena frente a los formatos de un solo flujo, y hasta ahora solo lo tenia la
+# linea de ordenes.
+rayon.workspace = true
+# Zstandard: bindings a libzstd. Entra solo con la bandera codecs-native
+# (seccion 03 del diseno).
 zstd = { workspace = true, optional = true }
+
+# El mismo deflate de siempre, mejor implementado: el fichero que sale lo abre
+# cualquiera igual, solo que se hace mas deprisa y sale algo mas pequeno.
+# Medido sobre 327 MB de datos reales, contra el zlib-rs que ya usamos:
+# nivel 6, 3,90 s y 266,8 MB frente a 6,78 s y 269,3 MB. Las dos cosas.
+#
+# Es C, asi que entra con la misma bandera que zstd. Y no sabe trabajar a
+# chorro: necesita el bloque entero en memoria. Da igual, porque el unico sitio
+# donde se usa ya lo tiene -- los ficheros que no caben van por el otro camino,
+# el de flate2, que si es a chorro.
+libdeflater = { version = "1", optional = true }
 
 [features]
 default = ["codecs-native"]
-codecs-native = ["dep:zstd"]
+codecs-native = ["dep:zstd", "dep:libdeflater"]
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -1,0 +1,10 @@
+; Los dos puntos de entrada de un servidor COM en proceso, y nada mas.
+;
+; PRIVATE los mantiene fuera de la biblioteca de importacion que el enlazador
+; genera junto al DLL: nadie enlaza contra ellos, los busca COM por nombre
+; cuando carga la extension. Sin esta marca el enlazador avisa (LNK4104) de que
+; estos nombres concretos -- los conoce -- estan saliendo donde no hacen falta.
+LIBRARY
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE

@@ -115,6 +115,22 @@ impl Level {
         }
     }
 
+    /// El nivel equivalente en libdeflate, que tiene doce en vez de nueve.
+    ///
+    /// No son los mismos numeros que zlib aunque lo parezcan: medido sobre 327
+    /// MB de datos reales, el 6 de libdeflate iguala en tamano al 9 de zlib y
+    /// tarda un tercio. El 12 no tiene equivalente ahi -- es mas pequeno que
+    /// cualquier cosa que zlib sepa hacer -- y por eso es el maximo: quien pide
+    /// el maximo esta pidiendo tamano y sabe que va a esperar.
+    pub fn to_libdeflate(self) -> i32 {
+        match self {
+            Level::Store => 0,
+            Level::Fast => 1,
+            Level::Normal => 6,
+            Level::Best => 12,
+        }
+    }
+
     pub fn to_zstd(self) -> i32 {
         match self {
             Level::Store => 1,

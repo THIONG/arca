@@ -80,6 +80,9 @@ gpui-component = { version = "0.6", optional = true }
 # the tree as a gpui-component dependency; naming it here is what lets
 # `application()` be handed the asset source.
 gpui-kit-assets = { version = "0.6", optional = true }
+# SHA-256 para comprobar lo que se baja antes de ejecutarlo. RustCrypto, safe
+# Rust puro, la misma familia que el sha1 del cifrado de arca-zip.
+sha2 = "0.10"
 
 # CF_HDROP on the system clipboard, so Ctrl+C here pastes files in the
 # Explorer. A thin wrapper over the four clipboard calls Win32 has; taking the
@@ -112,3 +115,9 @@ winresource = "0.1"
 # porque es COM y unsafe, que aqui no se admite.
 [target."cfg(windows)".dependencies.arca-drag]
 path = "../arca-drag"
+
+# Preguntar si hay una version nueva. En todas las plataformas: fuera de
+# Windows el crate compila vacio y contesta que no, que es lo mismo que
+# contesta una maquina sin red.
+[dependencies.arca-net]
+path = "../arca-net"
