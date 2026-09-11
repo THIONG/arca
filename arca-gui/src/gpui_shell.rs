@@ -589,6 +589,7 @@ enum ModalKind {
     Drop,
     Add,
     Settings,
+    Shortcuts,
 }
 
 impl GpuiShell {
@@ -706,9 +707,9 @@ impl GpuiShell {
             conflict_trigger_focus: cx.focus_handle(),
             overflow_menu_focus: cx.focus_handle(),
             breadcrumbs_menu_focus: cx.focus_handle(),
-            // Test/select/invert/clear, copy/cut/paste, settings, then the
-            // columns.
-            overflow_item_focus: (0..(8 + Columns::ALL.len()))
+            // Test/select/invert/clear, copy/cut/paste, shortcuts, settings,
+            // then the columns.
+            overflow_item_focus: (0..(9 + Columns::ALL.len()))
                 .map(|_| cx.focus_handle().tab_stop(true))
                 .collect(),
             breadcrumbs_item_focus: Vec::new(),
@@ -1098,6 +1099,8 @@ impl GpuiShell {
             Some(ModalKind::Add)
         } else if self.controller.state.show_settings {
             Some(ModalKind::Settings)
+        } else if self.controller.state.show_shortcuts {
+            Some(ModalKind::Shortcuts)
         } else {
             None
         }
@@ -1131,6 +1134,7 @@ impl GpuiShell {
             ],
             ModalKind::Add => self.add_focus_targets(cx),
             ModalKind::Settings => self.settings_focus.clone(),
+            ModalKind::Shortcuts => vec![self.dialog_cancel_focus.clone()],
         }
     }
 
@@ -1201,6 +1205,7 @@ impl GpuiShell {
             }
             Some(ModalKind::Add) => self.output_name.read(cx).focus_handle.clone(),
             Some(ModalKind::Settings) => self.settings_focus[0].clone(),
+            Some(ModalKind::Shortcuts) => self.dialog_cancel_focus.clone(),
             None => self.dialog_return_focus.clone(),
         };
         window.on_next_frame(move |window, cx| window.focus(&target, cx));
@@ -1236,6 +1241,7 @@ impl GpuiShell {
                     .dispatch(AppAction::AnswerDrop(DropChoice::Cancel)),
                 ModalKind::Add => self.controller.state.view = View::Browse,
                 ModalKind::Settings => self.controller.state.show_settings = false,
+                ModalKind::Shortcuts => self.controller.state.show_shortcuts = false,
             }
             cx.stop_propagation();
             cx.notify();
@@ -1310,6 +1316,7 @@ impl GpuiShell {
                     self.start_add(cx);
                 }
             }
+            ModalKind::Shortcuts => self.controller.state.show_shortcuts = false,
             ModalKind::Settings => {
                 if let Some(control) = SettingsControl::ALL
                     .iter()
@@ -2095,8 +2102,188 @@ impl GpuiShell {
                 )
             }
             ModalKind::Settings => Some(self.settings_dialog(cx)),
+            ModalKind::Shortcuts => Some(self.shortcuts_dialog(cx)),
             ModalKind::Add => unreachable!("add dialog is rendered above"),
         }
+    }
+
+    /// Whether the keyboard is inside a text field.
+    ///
+    /// A bare key means something different there -- F5 in a filter box is a
+    /// key, not a command -- so the shortcuts that carry no modifier stand
+    /// aside while one has the focus.
+    fn typing(&self, window: &Window, cx: &App) -> bool {
+        [&self.filter, &self.password, &self.output_name, &self.add_password]
+            .iter()
+            .any(|input| input.read(cx).focus_handle.is_focused(window))
+    }
+
+    /// The shortcuts that belong to the window rather than to the list.
+    ///
+    /// One handler rather than a dozen `actions!` entries and twice as many
+    /// key bindings: every one of these is the same shape -- a key, a guard,
+    /// and an action already written -- and a table of them reads in one go.
+    fn global_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.background_blocked() {
+            return;
+        }
+        let typing = self.typing(window, cx);
+        let Some(shortcut) = shortcut_for(
+            event.keystroke.modifiers.secondary(),
+            event.keystroke.modifiers.shift,
+            event.keystroke.modifiers.alt,
+            &event.keystroke.key.to_ascii_lowercase(),
+            typing,
+        ) else {
+            return;
+        };
+        let archive = self.controller.state.archive.clone();
+        let idle = self.background_idle();
+        // The shortcuts window is the one that answers while an archive is
+        // being read, because it is the one that says what to press.
+        if !idle && shortcut != Shortcut::Shortcuts {
+            return;
+        }
+        match shortcut {
+            Shortcut::Open => self.begin_dialog(DialogKind::Open, cx),
+            Shortcut::Compress => self.begin_dialog(DialogKind::Compress, cx),
+            Shortcut::ExtractAll if archive.is_some() => self.begin_dialog(
+                DialogKind::Extract {
+                    only_checked: false,
+                },
+                cx,
+            ),
+            // Everything out, beside the archive, without asking where: the
+            // folder the archive is in is where an extraction goes nine times
+            // out of ten, and the whole point is that it is one keystroke.
+            Shortcut::ExtractHere if archive.is_some() => self.controller.extract_here(),
+            // Verifying an archive was reachable from the shell menu and the
+            // command line and from nowhere inside the window.
+            Shortcut::Test => {
+                if let Some(archive) = archive {
+                    self.controller.dispatch(AppAction::Run(Job::Test {
+                        archive,
+                        only: None,
+                    }));
+                }
+            }
+            Shortcut::Refresh => {
+                if let Some(path) = archive {
+                    // Rereading must not ask again for the password of an
+                    // archive that has already been unlocked.
+                    let keep = self.controller.state.archive_password.clone();
+                    self.controller.dispatch(AppAction::Open(path));
+                    self.controller.state.archive_password = keep;
+                }
+            }
+            Shortcut::Invert => self.controller.dispatch(AppAction::InvertVisible),
+            Shortcut::ClearSelection => self.controller.dispatch(AppAction::ClearSelection),
+            // The names as text, which is all a desktop without a file
+            // clipboard can be given, and useful on one that has it too.
+            Shortcut::CopyNames => {
+                let names = self.controller.selected_names();
+                if !names.is_empty() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(names.join("\r\n")));
+                }
+            }
+            Shortcut::Shortcuts => {
+                self.controller.state.show_shortcuts = !self.controller.state.show_shortcuts;
+            }
+            Shortcut::ExtractAll | Shortcut::ExtractHere => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// The keys, and what each one does, in the two columns they are read in.
+    fn shortcuts_dialog(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
+        let s = self.controller.s();
+        let left: [(&str, &str); 18] = [
+            ("Ctrl+O", s.open),
+            ("Ctrl+N", s.compress),
+            ("Ctrl+E", s.extract_all),
+            ("Alt+W", s.extract_here),
+            ("Ctrl+T", s.test_word),
+            ("F5", s.refresh_word),
+            ("Ctrl+F", s.find_word),
+            ("", ""),
+            ("Ctrl+A", s.select_all),
+            ("Ctrl+I", s.invert_selection),
+            ("Esc", s.clear_selection),
+            ("Space", s.toggle_word),
+            ("Supr", s.delete_word),
+            ("F1", s.shortcuts_title),
+            ("", ""),
+            ("Ctrl+C", s.copy_word),
+            ("Ctrl+X", s.cut_word),
+            ("Ctrl+V", s.paste_word),
+        ];
+        let right: [(&str, &str); 8] = [
+            ("Ctrl+Shift+C", s.copy_names),
+            ("", ""),
+            ("Enter", s.open_word),
+            ("Backspace", s.up),
+            ("\u{2191} \u{2193}", s.move_word),
+            ("Home  End", s.move_word),
+            ("PageUp  PageDown", s.move_word),
+            ("Tab", s.jump_word),
+        ];
+        let column = |rows: &[(&str, &str)]| {
+            rows.iter()
+                .filter(|(key, _)| !key.is_empty())
+                .fold(div().flex().flex_col().gap_1(), |column, (key, what)| {
+                    column.child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .text_sm()
+                            .child(
+                                div()
+                                    .w(px(130.))
+                                    .flex_none()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(key.to_string()),
+                            )
+                            .child(what.to_string()),
+                    )
+                })
+        };
+        let close = Self::dialog_button(
+            "shortcuts-close",
+            s.close,
+            &self.dialog_cancel_focus,
+            true,
+            cx,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.controller.state.show_shortcuts = false;
+            cx.notify();
+        }));
+        let body = div()
+            .id("shortcuts-dialog-body")
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .gap_8()
+                    .child(column(&left))
+                    .child(column(&right)),
+            )
+            .child(close);
+        self.dialog_overlay(
+            ModalKind::Shortcuts,
+            s.shortcuts_title,
+            s.shortcuts_title,
+            body,
+            cx,
+        )
     }
 
     fn background_idle(&self) -> bool {
@@ -2880,6 +3067,7 @@ impl Render for GpuiShell {
         }
 
         let open = Self::button("open", s.open, format!("{} (Ctrl+O)", s.open), idle, cx)
+            .aria_keyshortcuts("Control+O")
             .track_focus(&self.open_trigger_focus);
         toolbar = toolbar.child(open.on_click(cx.listener(|this, _, window, cx| {
             if this.background_idle() {
@@ -3466,6 +3654,7 @@ impl Render for GpuiShell {
             .on_action(cx.listener(Self::copy_files_action))
             .on_action(cx.listener(Self::cut_files_action))
             .on_action(cx.listener(Self::paste_files_action))
+            .on_key_down(cx.listener(Self::global_key_down))
             .size_full()
             .relative()
             .flex()
@@ -3623,7 +3812,25 @@ impl Render for GpuiShell {
                 cx.notify();
             })));
 
-            let settings_focus = self.overflow_item_focus[7].clone().tab_stop(menu_enabled);
+            let shortcuts_focus = self.overflow_item_focus[7].clone().tab_stop(menu_enabled);
+            let shortcuts_item = Self::menu_item(
+                "shortcuts",
+                format!("{}\tF1", s.shortcuts_title),
+                s.shortcuts_title.to_string(),
+                menu_enabled,
+                cx,
+            )
+            .aria_keyshortcuts("F1")
+            .track_focus(&shortcuts_focus);
+            menu = menu.child(shortcuts_item.on_click(cx.listener(|this, _, _, cx| {
+                if this.menu_enabled() {
+                    this.controller.state.show_shortcuts = true;
+                }
+                this.overflow_open = false;
+                cx.notify();
+            })));
+
+            let settings_focus = self.overflow_item_focus[8].clone().tab_stop(menu_enabled);
             let settings_item = Self::menu_item(
                 "settings",
                 s.settings,
@@ -3646,7 +3853,7 @@ impl Render for GpuiShell {
                 let label = Columns::label(column, s);
                 let shown = self.controller.state.settings.columns.on(column);
                 let action = if shown { s.hide_word } else { s.show_word };
-                let item_focus = self.overflow_item_focus[position + 8]
+                let item_focus = self.overflow_item_focus[position + 9]
                     .clone()
                     .tab_stop(columns_available);
                 let item = Self::menu_item(
@@ -3696,6 +3903,60 @@ impl Render for GpuiShell {
             root = root.child(dialog);
         }
         root
+    }
+}
+
+/// What a key press means to the window, as opposed to the list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shortcut {
+    Open,
+    Compress,
+    ExtractAll,
+    ExtractHere,
+    Test,
+    Refresh,
+    Invert,
+    ClearSelection,
+    CopyNames,
+    Shortcuts,
+}
+
+/// Reading a key press, with no state and no side effects, so the table of
+/// shortcuts can be checked without a window.
+///
+/// `typing` only silences the keys that carry no modifier: F5 inside a filter
+/// box is a key, but Ctrl+O is never text.
+fn shortcut_for(
+    secondary: bool,
+    shift: bool,
+    alt: bool,
+    key: &str,
+    typing: bool,
+) -> Option<Shortcut> {
+    if secondary && shift {
+        return (key == "c").then_some(Shortcut::CopyNames);
+    }
+    if secondary {
+        return match key {
+            "o" => Some(Shortcut::Open),
+            "n" => Some(Shortcut::Compress),
+            "e" => Some(Shortcut::ExtractAll),
+            "t" => Some(Shortcut::Test),
+            "i" => Some(Shortcut::Invert),
+            _ => None,
+        };
+    }
+    if alt {
+        return (key == "w").then_some(Shortcut::ExtractHere);
+    }
+    if typing {
+        return None;
+    }
+    match key {
+        "f1" => Some(Shortcut::Shortcuts),
+        "f5" => Some(Shortcut::Refresh),
+        "escape" => Some(Shortcut::ClearSelection),
+        _ => None,
     }
 }
 
@@ -3935,6 +4196,33 @@ mod tests {
         let paths = vec![PathBuf::from("queued.zip")];
         assert_eq!(drop_paths_for_enter(&paths, true), paths);
         assert!(drop_paths_for_enter(&paths, false).is_empty());
+    }
+
+    #[test]
+    fn a_modifier_shortcut_still_works_while_a_text_field_has_the_keyboard() {
+        // Ctrl+O is never text, so it must not wait behind the filter box; F5
+        // is a key a text field could want, so it must.
+        assert_eq!(
+            shortcut_for(true, false, false, "o", true),
+            Some(Shortcut::Open)
+        );
+        assert_eq!(
+            shortcut_for(true, true, false, "c", true),
+            Some(Shortcut::CopyNames)
+        );
+        assert_eq!(
+            shortcut_for(false, false, true, "w", true),
+            Some(Shortcut::ExtractHere)
+        );
+        assert_eq!(shortcut_for(false, false, false, "f5", true), None);
+        assert_eq!(shortcut_for(false, false, false, "escape", true), None);
+        assert_eq!(
+            shortcut_for(false, false, false, "f5", false),
+            Some(Shortcut::Refresh)
+        );
+        // Ctrl+Shift+C is the names as text, not the files.
+        assert_eq!(shortcut_for(true, true, false, "o", false), None);
+        assert_eq!(shortcut_for(false, false, false, "q", false), None);
     }
 
     #[test]
