@@ -39,6 +39,20 @@ zstd = { version = "0.13", features = ["zstdmt"] }
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
 
+# `cargo run` compila sin optimizar, y eso con GPUI no es "un poco mas lento":
+# su motor de layout, el modelador de texto y el rasterizador rehacen su trabajo
+# en cada fotograma, y a opt-level 0 eso se ve como tirones al arrastrar y al
+# marcar. Nada de esto es codigo de Arca ni se depura nunca, asi que las
+# dependencias van optimizadas tambien en depuracion.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Y el codigo de Arca a 1, que es lo que necesitan el ordenado de la lista y el
+# recorrido de las entradas para no notarse. A este nivel el depurador sigue
+# parando donde se le dice.
+[profile.dev]
+opt-level = 1
+
 # Perfil agresivo: requisito R1 (arranque) y R3/R4 (rendimiento)
 [profile.release]
 opt-level = 3
