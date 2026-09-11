@@ -678,7 +678,6 @@ impl AppController {
     // and asks for one file at a time while it is dropping, so a drag that is
     // thought better of costs nothing, and a drag of six gigabytes starts as
     // fast as a drag of one file.
-    #[cfg(windows)]
     pub(crate) fn go_to(&mut self, path: String) {
         if self.state.history.get(self.state.here) == Some(&path) {
             return;
