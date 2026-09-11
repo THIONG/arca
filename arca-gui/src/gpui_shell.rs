@@ -53,6 +53,11 @@ const MINIMUM_SIZE: (f32, f32) = (720.0, 320.0);
 const RECENT_SLOT: usize = 12;
 const RECENT_MAX: usize = 10;
 
+/// The offer of a newer Arca, which is only drawn when there is one. Parked
+/// past the columns rather than at the front, so that adding it does not move
+/// every other slot along.
+const RELEASE_SLOT: usize = RECENT_SLOT + RECENT_MAX + 4 + Columns::ALL.len();
+
 actions!(
     arca_gpui,
     [
@@ -790,6 +795,7 @@ impl GpuiShell {
                 if view
                     .update_in(async_cx, |shell, window, cx| {
                         shell.poll_dialog(window, cx);
+                        shell.controller.ask_about_updates();
                         let conflict_was_open = shell.controller.state.conflict.is_some();
                         let close_window = shell.controller.receive();
                         if close_window {
@@ -836,7 +842,7 @@ impl GpuiShell {
             // Test/select/invert/clear, copy/cut/paste, the five that change
             // the archive, the recent list and its broom, flat view,
             // shortcuts, settings, then the columns.
-            overflow_item_focus: (0..(RECENT_SLOT + RECENT_MAX + 4 + Columns::ALL.len()))
+            overflow_item_focus: (0..(RELEASE_SLOT + 1))
                 .map(|_| cx.focus_handle().tab_stop(true))
                 .collect(),
             breadcrumbs_item_focus: Vec::new(),
@@ -1116,10 +1122,13 @@ impl GpuiShell {
                         .cloned(),
                 );
                 items.extend(
-                    self.overflow_item_focus[RECENT_SLOT + RECENT_MAX..]
+                    self.overflow_item_focus[RECENT_SLOT + RECENT_MAX..RELEASE_SLOT]
                         .iter()
                         .cloned(),
                 );
+                if self.controller.state.update.is_some() {
+                    items.push(self.overflow_item_focus[RELEASE_SLOT].clone());
+                }
             }
             Self::menu_key_down(event, &items, window, cx);
         }
@@ -1625,6 +1634,7 @@ impl GpuiShell {
     /// The entries of the overflow menu that change the archive itself.
     fn overflow_action(&mut self, action: OverflowAction, cx: &mut Context<Self>) {
         match action {
+            OverflowAction::Release => self.controller.start_update(),
             OverflowAction::AddFiles => self.begin_dialog(DialogKind::AddFiles, cx),
             // Asked for in a box rather than made as "New folder" and renamed
             // after: making it rewrites the whole archive, and doing that twice
@@ -4880,6 +4890,30 @@ impl Render for GpuiShell {
                 cx.notify();
             })));
 
+            // Only when there is one, and at the top, where something that was
+            // not there yesterday belongs.
+            if let Some(release) = self.controller.state.update.clone() {
+                let release_focus = self.overflow_item_focus[RELEASE_SLOT]
+                    .clone()
+                    .tab_stop(menu_enabled);
+                let label = fill(s.update_ready, &[("version", &release.tag)]);
+                let item = Self::menu_item(
+                    "release",
+                    label.clone(),
+                    label,
+                    menu_enabled,
+                    cx,
+                )
+                .track_focus(&release_focus);
+                menu = menu.child(item.on_click(cx.listener(|this, _, _, cx| {
+                    if this.menu_enabled() {
+                        this.overflow_action(OverflowAction::Release, cx);
+                    }
+                    this.overflow_open = false;
+                    cx.notify();
+                })));
+            }
+
             let writable = has && self.controller.state.format == super::Format::Zip;
             let can_undo = has && self.controller.state.undo.is_some();
             for (slot, id, label, enabled, action) in [
@@ -5117,6 +5151,7 @@ impl Render for GpuiShell {
 /// closure: the menu is built while the shell is still borrowed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum OverflowAction {
+    Release,
     AddFiles,
     NewFolder,
     Undo,

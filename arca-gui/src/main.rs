@@ -245,6 +245,8 @@ struct Settings {
     lang: Option<Lang>,
     theme: ThemePreference,
     columns: Columns,
+    // Whether to ask, once at startup, if there is a newer Arca.
+    updates: bool,
     // Every file in the archive at once, instead of one folder at a time.
     flat: bool,
     // The folders of the archive down the left hand side.
@@ -289,6 +291,7 @@ impl Default for Settings {
             lang: None,
             theme: ThemePreference::System,
             columns: Columns::default(),
+            updates: true,
             flat: false,
             tree: false,
             page: arca_zip::pages::Page::default(),
@@ -301,11 +304,21 @@ impl Default for Settings {
 
 impl Settings {
     fn load() -> Self {
-        let mut s = Settings::default();
-        let Some(p) = config_file() else { return s };
-        let Ok(text) = fs::read_to_string(p) else {
-            return s;
+        let Some(p) = config_file() else {
+            return Settings::default();
         };
+        let Ok(text) = fs::read_to_string(p) else {
+            return Settings::default();
+        };
+        Settings::parse(&text)
+    }
+
+    /// The settings file read back out of text.
+    ///
+    /// Apart from `load` so that what `text` writes can be read back and
+    /// compared without going near a disk.
+    fn parse(text: &str) -> Settings {
+        let mut s = Settings::default();
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else {
                 continue;
@@ -318,6 +331,7 @@ impl Settings {
                 ("theme", _) => s.theme = ThemePreference::System,
                 ("flat", v) => s.flat = v == "yes",
                 ("tree", v) => s.tree = v == "yes",
+                ("updates", v) => s.updates = v != "no",
                 ("page", v) => {
                     if let Some(p) = arca_zip::pages::Page::from_code(v) {
                         s.page = p;
@@ -379,33 +393,50 @@ impl Settings {
         if let Some(dir) = p.parent() {
             let _ = fs::create_dir_all(dir);
         }
+        let _ = fs::write(p, self.text());
+    }
+
+    /// The settings file as text.
+    ///
+    /// Apart from `save` so that what is written can be read back and compared
+    /// without going near a disk. That is not tidiness: six settings were being
+    /// read at startup and never written, because the line that builds this had
+    /// quietly stopped mentioning them -- `flat`, `tree`, `page`, `window` and
+    /// `recent` were all built into a string that was then thrown away. A round
+    /// trip that never touches a file is the only way that stays fixed.
+    fn text(&self) -> String {
         let lang = self.lang.map(|l| l.code()).unwrap_or("system");
         let theme = match self.theme {
             ThemePreference::Light => "light",
             ThemePreference::Dark => "dark",
             ThemePreference::System => "system",
         };
+        let yes = |b: bool| if b { "yes" } else { "no" };
         let columns: Vec<&str> = Columns::ALL
             .iter()
             .filter(|(which, _)| self.columns.on(*which))
             .map(|(_, name)| *name)
             .collect();
         let widths: Vec<String> = self.widths.iter().map(|w| format!("{w:.1}")).collect();
-        let mut tail = String::new();
+
+        let mut out = String::new();
+        out.push_str(&format!("lang = {lang}\n"));
+        out.push_str(&format!("theme = {theme}\n"));
+        out.push_str(&format!("flat = {}\n", yes(self.flat)));
+        out.push_str(&format!("tree = {}\n", yes(self.tree)));
+        out.push_str(&format!("updates = {}\n", yes(self.updates)));
+        out.push_str(&format!("page = {}\n", self.page.code()));
+        out.push_str(&format!("columns = {}\n", columns.join(",")));
+        out.push_str(&format!("widths = {}\n", widths.join(",")));
         if let Some([x, y, w, h]) = self.window {
-            tail.push_str(&format!("window = {x:.0},{y:.0},{w:.0},{h:.0}\n"));
+            out.push_str(&format!("window = {x:.0},{y:.0},{w:.0},{h:.0}\n"));
         }
+        // One line each: a path can hold anything a filename can and there is
+        // no separator left that it could not.
         for path in &self.recent {
-            tail.push_str(&format!("recent = {path}\n"));
+            out.push_str(&format!("recent = {path}\n"));
         }
-        let _ = fs::write(
-            p,
-            format!(
-                "lang = {lang}\ntheme = {theme}\ncolumns = {}\nwidths = {}\n",
-                columns.join(","),
-                widths.join(",")
-            ),
-        );
+        out
     }
 
     fn effective_lang(&self) -> Lang {
@@ -1077,6 +1108,13 @@ enum Job {
         archive: PathBuf,
         dest: PathBuf,
     },
+    // Getting the new version. Not a job that ends in a text to show: it ends
+    // in an installer to run, and running it closes Arca.
+    Update {
+        tag: String,
+        installer: String,
+        sums: String,
+    },
     // Dragging entries onto a folder of the same archive.
     Move {
         archive: PathBuf,
@@ -1197,6 +1235,80 @@ fn fill(template: &str, pairs: &[(&str, &str)]) -> String {
         s = s.replace(&format!("{{{key}}}"), value);
     }
     s
+}
+
+/// Gets the installer and checks it against the sums published beside it.
+///
+/// That protects against a download cut short or corrupted on the way. It does
+/// not protect against a poisoned release, because the sum comes from the same
+/// place as the file: for that these binaries would have to be signed, and they
+/// are not yet.
+fn download_update(
+    installer: &str,
+    sums: &str,
+    s: &'static Strings,
+    notify: &(dyn Fn(usize, usize, &str) -> bool + Sync),
+) -> std::result::Result<PathBuf, String> {
+    use sha2::{Digest, Sha256};
+
+    let agent = format!("Arca/{}", env!("CARGO_PKG_VERSION"));
+    let name = installer
+        .rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| s.update_failed.to_string())?;
+
+    // The sums first, which are four lines: if those cannot be fetched there is
+    // no sense in pulling five megabytes down to not be able to check them.
+    let listing = arca_net::get(sums, &agent).ok_or_else(|| s.update_failed.to_string())?;
+    let want = sum_for(&listing, name).ok_or_else(|| s.update_failed.to_string())?;
+
+    let body = arca_net::fetch(installer, &agent, INSTALLER_LIMIT, &|so_far, total| {
+        notify(so_far, total.unwrap_or(0), name)
+    })
+    .ok_or_else(|| s.update_failed.to_string())?;
+
+    let got: [u8; 32] = Sha256::digest(&body).into();
+    if got != want {
+        return Err(s.update_tampered.to_string());
+    }
+
+    let path = std::env::temp_dir().join(name);
+    fs::write(&path, &body).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+/// Runs the installer and stands aside.
+///
+/// `/update=1` is ours, not Inno's, and tells the installer two things: not to
+/// restart the Explorer to replace the shell menu DLL -- it is left in place
+/// for the next boot and the old one still works -- and to open Arca again when
+/// it finishes.
+///
+/// Arca is deliberately not closed here: Inno sees that the program it is about
+/// to replace is open and closes it itself.
+#[cfg(windows)]
+fn install_update(path: &Path) -> std::result::Result<(), String> {
+    std::process::Command::new(path)
+        .args([
+            "/VERYSILENT",
+            "/NOCANCEL",
+            "/NORESTART",
+            // Not the Restart Manager: the installer reopens Arca itself with
+            // /update=1, and both doing it would give two windows.
+            "/NORESTARTAPPLICATIONS",
+            "/update=1",
+        ])
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(windows))]
+fn install_update(_path: &Path) -> std::result::Result<(), String> {
+    // There is no installer to fetch outside Windows, so this is never reached:
+    // `arca_net` does not answer and there is never a new version to offer.
+    Err("no installer on this system".into())
 }
 
 fn run_job_blocking(
@@ -1529,6 +1641,10 @@ fn run_job_blocking(
             fs::rename(&temp, &archive).map_err(|e| e.to_string())?;
             Ok(fill(s.added, &[("n", &n.to_string())]))
         }
+        // Not reached: getting the new version is handled earlier, on the
+        // thread that starts the job, because it ends in a file to run and not
+        // in a text to show.
+        Job::Update { .. } => Err(s.update_failed.to_string()),
         Job::Move {
             archive,
             moves,
@@ -1722,6 +1838,9 @@ impl Columns {
 
 enum Message {
     Listing(PathBuf, Vec<Entry>),
+    // The installer is down and checked. It ends in a file to run rather than
+    // in a text to read, which is why it is not a `Done`.
+    Downloaded(PathBuf),
     Conflict(String),
     Progress(usize, usize, String),
     Done(String),
@@ -1808,6 +1927,7 @@ pub enum DropChoice {
 #[derive(Clone)]
 enum More {
     Test,
+    Release,
     Undo,
     NewFolder,
     Page(arca_zip::pages::Page),
@@ -2165,6 +2285,158 @@ fn branch(
     }
 }
 
+/// Where the announcement is asked for, and where a copy that cannot update
+/// itself is sent instead.
+const RELEASES_API: &str = "https://api.github.com/repos/THIONG/arca/releases/latest";
+const RELEASES_PAGE: &str = "https://github.com/THIONG/arca/releases/latest";
+
+/// As much installer as is ever going to arrive. A reply longer than this is
+/// not our release and is not going to be written to disk, let alone run.
+const INSTALLER_LIMIT: usize = 64 * 1024 * 1024;
+
+#[derive(Clone)]
+struct Release {
+    tag: String,
+    installer: Option<String>,
+    sums: Option<String>,
+}
+
+/// Reads the announcement.
+///
+/// Hand written rather than a JSON library, because this asks three questions
+/// of one reply and the answers are short strings. A parser for the whole
+/// language would be a dependency, and a large one, for that.
+///
+/// The addresses are picked by what they end in rather than by walking the list
+/// of assets: the shape of that list is GitHub's to change, but a file called
+/// `SHA256SUMS.txt` is called that because we named it.
+fn release_of(reply: &str) -> Option<Release> {
+    let tag = tag_of(reply)?;
+    let mut installer = None;
+    let mut sums = None;
+    for piece in reply.split("\"browser_download_url\"").skip(1) {
+        let Some(open) = piece.find('"').and_then(|c| piece.get(c + 1..)) else {
+            continue;
+        };
+        let Some(close) = open.find('"') else {
+            continue;
+        };
+        let url = &open[..close];
+        // Only ours, and only over the wire we trust. A reply that names some
+        // other place is not one to go and fetch an executable from.
+        if !url.starts_with("https://github.com/THIONG/arca/releases/download/") {
+            continue;
+        }
+        if url.ends_with("/SHA256SUMS.txt") {
+            sums = Some(url.to_string());
+        } else if url.ends_with("-x86_64.exe") && url.contains("/arca-setup-") {
+            installer = Some(url.to_string());
+        }
+    }
+    Some(Release {
+        tag,
+        installer,
+        sums,
+    })
+}
+
+/// The line for `name` in a `sha256sum` listing, as raw bytes.
+///
+/// Two spellings, because that is what the tool writes: two spaces for a file
+/// it read as text and a space and a star for one it read as binary. The
+/// Windows halves of our own releases come out with the star.
+fn sum_for(listing: &str, name: &str) -> Option<[u8; 32]> {
+    for line in listing.lines() {
+        let (hash, rest) = line.split_once(' ')?;
+        let named = rest.trim_start_matches([' ', '*']);
+        if named != name || hash.len() != 64 {
+            continue;
+        }
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(hash.get(i * 2..i * 2 + 2)?, 16).ok()?;
+        }
+        return Some(out);
+    }
+    None
+}
+
+/// Whether this copy of Arca was put here by the installer.
+///
+/// Inno Setup leaves its uninstaller in the folder it installed to, so that
+/// file being next to the program is the program saying how it got there. A
+/// copy unpacked from the .zip has no uninstaller and nothing to update: for
+/// that one the only honest offer is the page.
+fn installed_by_setup() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("unins000.exe")))
+        .is_some_and(|u| u.exists())
+}
+
+/// Pulls the release's name out of what the announcement page answered.
+///
+/// What it must not do is find the wrong `tag_name`. There is only one at the
+/// top level of that reply, so the first is the right one; anything unexpected
+/// gives nothing, and nothing means the window says nothing.
+fn tag_of(reply: &str) -> Option<String> {
+    let at = reply.find("\"tag_name\"")? + "\"tag_name\"".len();
+    let rest = reply.get(at..)?;
+    let colon = rest.find(':')?;
+    let after = rest.get(colon + 1..)?;
+    let open = after.find('"')?;
+    let value = after.get(open + 1..)?;
+    let close = value.find('"')?;
+    let tag = value.get(..close)?.trim();
+    // A name of nothing, or one long enough to be somebody being funny, is not
+    // a version.
+    (!tag.is_empty() && tag.len() <= 32).then(|| tag.to_string())
+}
+
+/// Whether `latest` is a later version than `running`.
+///
+/// Numbers separated by dots, a leading `v` forgiven, and compared a part at a
+/// time rather than as text: as text, `0.10.0` comes before `0.9.0` and the
+/// window would either nag for ever or never say anything at all.
+///
+/// A version with something after the numbers -- `0.6.0-rc1` -- counts as
+/// earlier than the plain one, which is what those names mean everywhere. And
+/// anything that is not a version at all answers no: silence is the right
+/// behaviour for an announcement nobody can read.
+fn newer(running: &str, latest: &str) -> bool {
+    fn parts(v: &str) -> Option<(Vec<u32>, bool)> {
+        let v = v.trim().trim_start_matches(['v', 'V']);
+        if v.is_empty() {
+            return None;
+        }
+        let (numbers, tail) = match v.find(['-', '+']) {
+            Some(cut) => (&v[..cut], true),
+            None => (v, false),
+        };
+        let mut out = Vec::new();
+        for piece in numbers.split('.') {
+            out.push(piece.parse::<u32>().ok()?);
+        }
+        (!out.is_empty()).then_some((out, tail))
+    }
+
+    let (Some((mine, mine_tail)), Some((theirs, theirs_tail))) = (parts(running), parts(latest))
+    else {
+        return false;
+    };
+    // Missing parts count as zero, so 0.6 and 0.6.0 are the same version.
+    let deep = mine.len().max(theirs.len());
+    for i in 0..deep {
+        let a = mine.get(i).copied().unwrap_or(0);
+        let b = theirs.get(i).copied().unwrap_or(0);
+        if a != b {
+            return b > a;
+        }
+    }
+    // The same numbers: the one without a suffix is the finished one.
+    mine_tail && !theirs_tail
+}
+
 /// A name in the one spelling the window works in.
 ///
 /// A zip written on Windows can hold backslashes, and comparing those against
@@ -2472,6 +2744,15 @@ struct AppState {
     // another folder of this archive, outside it is a drag into whatever is
     // out there.
     carrying: Option<Vec<String>>,
+    // The newer Arca, once the announcement has answered. Its own channel
+    // rather than a job, because something nobody asked for must not make the
+    // window look busy.
+    update: Option<Release>,
+    update_rx: Option<std::sync::mpsc::Receiver<Release>>,
+    asked_about_updates: bool,
+    // Whether the two counts are bytes rather than entries. Only the download
+    // measures itself that way.
+    in_bytes: bool,
     // Raised to ask whatever is running to stop where it is. Shared with the
     // thread doing the work, which reads it every time it reports progress.
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2819,6 +3100,10 @@ impl AppController {
                 folder_input: String::new(),
                 undo: None,
                 carrying: None,
+                update: None,
+                update_rx: None,
+                asked_about_updates: false,
+                in_bytes: false,
                 stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 viewing: None,
                 picking_group: None,
@@ -3016,6 +3301,58 @@ impl AppController {
         self.state.here = 0;
         self.state.notice = self.summary();
         self.state.error = false;
+    }
+
+    // Asks, once, whether there is a newer Arca.
+    //
+    // On a thread and without a word: something nobody asked for must not make
+    // the window look busy. If the answer never comes -- no network, no reply,
+    // a machine that says no -- nothing happens and nothing is said. There is
+    // nothing here worth a complaint.
+    fn ask_about_updates(&mut self) {
+        if self.state.asked_about_updates || !self.state.settings.updates {
+            return;
+        }
+        self.state.asked_about_updates = true;
+        let (tx, rx) = channel::<Release>();
+        self.state.update_rx = Some(rx);
+        let running = env!("CARGO_PKG_VERSION").to_string();
+        std::thread::spawn(move || {
+            // GitHub turns away anything that does not name itself, and naming
+            // the program and its version is what a user agent is for. Nothing
+            // else is sent: no machine, no user, no archive.
+            let agent = format!("Arca/{running}");
+            let Some(reply) = arca_net::get(RELEASES_API, &agent) else {
+                return;
+            };
+            if let Some(release) = release_of(&reply) {
+                if newer(&running, &release.tag) {
+                    let _ = tx.send(release);
+                }
+            }
+        });
+    }
+
+    // Takes the new version, if this copy is one that can replace itself.
+    //
+    // A copy put here by the installer updates itself. One unpacked from the
+    // .zip is loose files in a folder somebody chose, and there is nothing to
+    // update: for that one the only honest offer is the page.
+    fn start_update(&mut self) {
+        match self.state.update.clone() {
+            Some(Release {
+                tag,
+                installer: Some(installer),
+                sums: Some(sums),
+            }) if installed_by_setup() => self.run_job(Job::Update {
+                tag,
+                installer,
+                sums,
+            }),
+            _ => {
+                let _ = launch_with_system(Path::new(RELEASES_PAGE));
+            }
+        }
     }
 
     // Moves what was being carried into `target`, which is a folder's path or
@@ -3426,8 +3763,19 @@ impl AppController {
     // changing folder changes the list under the cursor, so it is clamped here
     // rather than tracked separately.
     fn receive(&mut self) -> bool {
+        // The answer about a newer version, if it ever came. Its own channel,
+        // because it is not a job and must not make the window look busy.
+        if let Some(rx) = &self.state.update_rx {
+            if let Ok(release) = rx.try_recv() {
+                self.state.update = Some(release);
+                self.state.update_rx = None;
+            }
+        }
         let mut close = false;
         let mut finished_ok = false;
+        // Set when the installer is down and checked, and answered as "close
+        // the window": running it is Inno replacing the program that is open.
+        let mut installing = false;
         if let Some(rx) = &self.state.channel {
             while let Ok(m) = rx.try_recv() {
                 match m {
@@ -3486,6 +3834,29 @@ impl AppController {
                         self.state.busy = false;
                         close = true;
                     }
+                    // The installer is down and checked. It is run silently and
+                    // Arca stands aside: Inno Setup closes the program it is
+                    // about to replace and opens it again when it finishes,
+                    // which is how something that is running gets updated.
+                    Message::Downloaded(path) => {
+                        self.state.busy = false;
+                        close = true;
+                        let version = self
+                            .state
+                            .update
+                            .as_ref()
+                            .map(|r| r.tag.clone())
+                            .unwrap_or_default();
+                        self.state.notice =
+                            fill(self.s().update_installing, &[("version", &version)]);
+                        match install_update(&path) {
+                            Ok(()) => installing = true,
+                            Err(e) => {
+                                self.state.notice = e;
+                                self.state.error = true;
+                            }
+                        }
+                    }
                     Message::CutReady => {
                         self.state.cut_pending = self.state.cut_armed.take();
                     }
@@ -3511,7 +3882,8 @@ impl AppController {
                 self.state.view = View::Browse;
             }
         }
-        finished_ok && self.state.close_when_done && matches!(self.state.view, View::Running)
+        installing
+            || (finished_ok && self.state.close_when_done && matches!(self.state.view, View::Running))
     }
     fn paste_from_clipboard(&mut self) {
         let Some(archive) = self.state.archive.clone() else {
@@ -3843,7 +4215,13 @@ impl AppController {
             Job::Move { .. } => s.moving_word.to_string(),
             Job::Compress { .. } => s.compressing.to_string(),
             Job::Add { .. } => s.adding.to_string(),
+            // The only verb with a hole in it: which version is coming down is
+            // known to the job, not to the list of words.
+            Job::Update { tag, .. } => fill(s.update_downloading, &[("version", tag)]),
         };
+        // The download measures itself in bytes; everything else counts
+        // entries.
+        self.state.in_bytes = matches!(job, Job::Update { .. });
         self.state.close_when_done = !matches!(
             job,
             Job::Test { .. }
@@ -3901,6 +4279,20 @@ impl AppController {
                 let _ = tx.send(Message::Progress(i, n, name.to_string()));
                 true
             };
+            // Getting the new version does not end in a text to read but in a
+            // file to run, and running it closes Arca. That is why it leaves by
+            // its own message and not by Done: who decides to install is the
+            // window, not this thread.
+            if let Job::Update {
+                installer, sums, ..
+            } = &job
+            {
+                let _ = tx.send(match download_update(installer, sums, s, &notify) {
+                    Ok(path) => Message::Downloaded(path),
+                    Err(text) => Message::Failed(text),
+                });
+                return;
+            }
             let ask = conflict_asker(tx, &reply_rx);
             let outcome = run_job_blocking(job, s, &notify, &ask);
             let _ = tx.send(match outcome {
@@ -5078,6 +5470,16 @@ impl Arca {
             // becoming a row of unexplained pictures.
             let mut wants = None;
             let more = tool_button(ui, glyphs::Glyph::More, s.more_word, idle, "");
+            // A dot on the button when there is a newer Arca. The word for it
+            // is inside the menu, and a notice inside a menu is a notice nobody
+            // reads: something has to say from the outside that there is
+            // anything in there worth opening. Small and in the corner, because
+            // it is news and not a problem.
+            if self.controller.state.update.is_some() {
+                let at = more.rect.right_top() + egui::vec2(-5.0, 5.0);
+                ui.painter()
+                    .circle_filled(at, 3.5, theme::cursor(ui.visuals()).color);
+            }
             let more_id = egui::Id::new("arca-more-menu");
             if more.clicked() {
                 ui.memory_mut(|m| m.toggle_popup(more_id));
@@ -5089,6 +5491,17 @@ impl Arca {
                 egui::PopupCloseBehavior::CloseOnClick,
                 |ui| {
                     ui.set_min_width(215.0);
+                    // Only when there is one, and at the top, where something
+                    // that was not there yesterday belongs.
+                    if let Some(release) = self.controller.state.update.clone() {
+                        if ui
+                            .button(fill(s.update_ready, &[("version", &release.tag)]))
+                            .clicked()
+                        {
+                            wants = Some(More::Release);
+                        }
+                        ui.separator();
+                    }
                     if ui
                         .add_enabled(has, egui::Button::new(format!("{}\tCtrl+T", s.test_word)))
                         .clicked()
@@ -5279,6 +5692,7 @@ impl Arca {
                     self.controller.state.settings.save();
                 }
                 Some(More::None_) => self.controller.clear_picked(),
+                Some(More::Release) => self.controller.start_update(),
                 Some(More::Settings) => self.controller.state.show_settings = true,
                 Some(More::Shortcuts) => self.controller.state.show_shortcuts = true,
                 None => {}
@@ -5615,6 +6029,13 @@ impl Arca {
                 self.format_row(ui);
                 ui.add_space(6.0);
                 ui.checkbox(&mut self.controller.state.into_subfolder, s.into_subfolder);
+                ui.add_space(4.0);
+                if ui
+                    .checkbox(&mut self.controller.state.settings.updates, s.check_updates)
+                    .changed()
+                {
+                    self.controller.state.settings.save();
+                }
                 ui.add_space(8.0);
             });
         self.controller.state.show_settings = open;
@@ -7188,6 +7609,7 @@ impl eframe::App for Arca {
                     Some([rect.min.x, rect.min.y, rect.width(), rect.height()]);
             }
         }
+        self.controller.ask_about_updates();
         if self.controller.receive() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -7477,6 +7899,146 @@ mod tests {
         // No zeros, but nothing readable either.
         let noise: Vec<u8> = (1..=200u8).map(|b| b % 0x1F + 1).collect();
         assert!(!looks_like_text(&noise));
+    }
+
+    #[test]
+    fn a_later_version_is_the_one_with_the_larger_numbers() {
+        assert!(newer("0.5.1", "0.6.0"));
+        assert!(newer("0.9.0", "0.10.0"), "ten comes after nine");
+        assert!(newer("0.5.1", "v0.5.2"), "a leading v is forgiven");
+        assert!(!newer("0.6.0", "0.5.9"), "older is not newer");
+        assert!(!newer("0.6.0", "0.6.0"), "the same is not newer");
+        assert!(!newer("0.10.0", "0.9.0"), "and the other way round too");
+        // Missing parts are zero, so these are the same version.
+        assert!(!newer("0.6", "0.6.0"));
+        assert!(!newer("0.6.0", "0.6"));
+        // A release candidate is earlier than the release it is a candidate for.
+        assert!(newer("0.6.0-rc1", "0.6.0"));
+        assert!(!newer("0.6.0", "0.6.0-rc1"));
+    }
+
+    // Anything unreadable has to answer no. A window that cannot tell what the
+    // announcement said should say nothing, not guess.
+    #[test]
+    fn nonsense_never_announces_an_update() {
+        assert!(!newer("0.5.1", ""));
+        assert!(!newer("0.5.1", "manana"));
+        assert!(!newer("0.5.1", "0.5.uno"));
+        assert!(!newer("", "9.9.9"));
+        assert!(
+            !newer("0.5.1", "99999999999999999999"),
+            "past what a number holds"
+        );
+    }
+
+    #[test]
+    fn the_release_name_comes_out_of_the_reply() {
+        let reply = r#"{"url":"https://x/1","tag_name":"v0.6.0","name":"Arca 0.6.0"}"#;
+        assert_eq!(tag_of(reply).as_deref(), Some("v0.6.0"));
+        // Spacing is the writer's business, not ours.
+        assert_eq!(
+            tag_of(r#"{ "tag_name" : "0.7.0" }"#).as_deref(),
+            Some("0.7.0")
+        );
+        // And everything that is not an answer is not an answer.
+        assert_eq!(tag_of("{}"), None);
+        assert_eq!(tag_of(""), None);
+        assert_eq!(tag_of(r#"{"tag_name":""}"#), None, "a name of nothing");
+        assert_eq!(tag_of(r#"{"tag_name":"x"}"#).as_deref(), Some("x"));
+        let long = format!(r#"{{"tag_name":"{}"}}"#, "v".repeat(64));
+        assert_eq!(tag_of(&long), None, "somebody being funny");
+    }
+
+    #[test]
+    fn la_respuesta_de_la_release_da_version_instalador_y_sumas() {
+        let reply = r#"{"url":"https://api.github.com/x","tag_name":"v0.6.2","assets":[
+            {"name":"SHA256SUMS.txt","browser_download_url":"https://github.com/THIONG/arca/releases/download/v0.6.2/SHA256SUMS.txt"},
+            {"name":"arca-setup-0.6.2-x86_64.exe","browser_download_url":"https://github.com/THIONG/arca/releases/download/v0.6.2/arca-setup-0.6.2-x86_64.exe"},
+            {"name":"arca-v0.6.2-linux-x86_64.tar.gz","browser_download_url":"https://github.com/THIONG/arca/releases/download/v0.6.2/arca-v0.6.2-linux-x86_64.tar.gz"}]}"#;
+        let r = release_of(reply).expect("una release");
+        assert_eq!(r.tag, "v0.6.2");
+        assert_eq!(
+            r.installer.as_deref(),
+            Some("https://github.com/THIONG/arca/releases/download/v0.6.2/arca-setup-0.6.2-x86_64.exe")
+        );
+        assert!(r.sums.is_some());
+    }
+
+    #[test]
+    fn una_direccion_que_no_sea_la_nuestra_no_se_acepta() {
+        let reply = r#"{"tag_name":"v9.9.9","assets":[
+            {"browser_download_url":"https://evil.example/arca-setup-9.9.9-x86_64.exe"},
+            {"browser_download_url":"http://github.com/THIONG/arca/releases/download/v9/arca-setup-9-x86_64.exe"},
+            {"browser_download_url":"https://github.com/otro/arca/releases/download/v9/arca-setup-9-x86_64.exe"},
+            {"browser_download_url":"https://github.com/THIONG/arca/releases/download/v9/SHA256SUMS.txt"}]}"#;
+        let r = release_of(reply).expect("una release");
+        assert_eq!(r.tag, "v9.9.9");
+        assert!(
+            r.installer.is_none(),
+            "ni otro dominio, ni sin cifrar, ni otro repositorio"
+        );
+        assert!(r.sums.is_some(), "la nuestra si");
+    }
+
+    // `sha256sum` escribe dos espacios para lo que leyo como texto y espacio y
+    // asterisco para lo que leyo como binario. Las mitades de Windows de
+    // nuestras propias releases salen con el asterisco.
+    #[test]
+    fn la_suma_se_encuentra_con_las_dos_escrituras() {
+        let listing = "\
+8c0a3844b53278b6fb1557c2cdc28f5c6b0a2eaf29e6214a734798d81473b5f3  arca-v0.6.1-linux-x86_64.tar.gz
+c76ecf12e8e05b8f4730fb9933450ea121fe1ce3699ab9b7d20b058f872815f4 *arca-setup-0.6.1-x86_64.exe
+";
+        let binario = sum_for(listing, "arca-setup-0.6.1-x86_64.exe").expect("la del exe");
+        assert_eq!(binario[0], 0xc7);
+        assert_eq!(binario[31], 0xf4);
+        let texto = sum_for(listing, "arca-v0.6.1-linux-x86_64.tar.gz").expect("la del tar");
+        assert_eq!(texto[0], 0x8c);
+        assert!(sum_for(listing, "arca-setup-0.6.2-x86_64.exe").is_none());
+    }
+
+    // Five settings were read at startup and never written, because the line
+    // that built the file had quietly stopped mentioning them. A round trip
+    // that never touches a disk is the only way that stays fixed.
+    #[test]
+    fn every_setting_survives_being_written_and_read_again() {
+        let mut before = Settings {
+            lang: Some(Lang::Es),
+            theme: ThemePreference::Light,
+            flat: true,
+            tree: true,
+            updates: false,
+            page: arca_zip::pages::Page::Cp1252,
+            ..Default::default()
+        };
+        before.columns.set(SortColumn::Crc, true);
+        before.columns.set(SortColumn::Size, false);
+        before.widths[0] = 271.0;
+        before.widths[3] = 88.0;
+        before.window = Some([12.0, 34.0, 1000.0, 700.0]);
+        before.recent = vec!["C:\\uno.zip".into(), "D:\\dos, con coma.zip".into()];
+
+        let after = Settings::parse(&before.text());
+
+        assert_eq!(after.lang, before.lang);
+        assert_eq!(after.theme, before.theme);
+        assert_eq!(after.flat, before.flat);
+        assert_eq!(after.tree, before.tree);
+        assert_eq!(after.updates, before.updates);
+        assert_eq!(after.page, before.page);
+        assert_eq!(after.widths, before.widths);
+        assert_eq!(after.window, before.window);
+        assert_eq!(
+            after.recent, before.recent,
+            "y una coma en un nombre no parte nada"
+        );
+        for (which, name) in Columns::ALL {
+            assert_eq!(
+                after.columns.on(which),
+                before.columns.on(which),
+                "la columna {name}"
+            );
+        }
     }
 
     #[test]
