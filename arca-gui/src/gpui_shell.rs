@@ -544,7 +544,69 @@ struct GpuiShell {
     /// same thing -- a row in a list of preferences -- and `SettingsControl`
     /// already says which is which.
     settings_focus: Vec<FocusHandle>,
+    /// Which row the right button was pressed on, and where the pointer was,
+    /// so the menu opens under it instead of in a fixed corner.
+    row_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
+    row_menu_focus: FocusHandle,
+    row_menu_item_focus: Vec<FocusHandle>,
     drop_paths: Vec<PathBuf>,
+}
+
+/// What the menu on a row offers. Everything here already exists as a
+/// controller call or a dialog; the menu is only a second way in, for the
+/// times the hand is already down on the list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowAction {
+    Open,
+    ExtractSelection,
+    ExtractHere,
+    TestSelection,
+    Delete,
+    Copy,
+    Cut,
+    Paste,
+    CopyNames,
+    SelectAll,
+}
+
+impl RowAction {
+    const ALL: [RowAction; 10] = [
+        RowAction::Open,
+        RowAction::ExtractSelection,
+        RowAction::ExtractHere,
+        RowAction::TestSelection,
+        RowAction::Delete,
+        RowAction::Copy,
+        RowAction::Cut,
+        RowAction::Paste,
+        RowAction::CopyNames,
+        RowAction::SelectAll,
+    ];
+
+    /// What it is called, and the keys that do the same thing. A menu that does
+    /// not name the shortcut is a menu nobody graduates from.
+    fn label(self, s: &'static Strings) -> (&'static str, &'static str) {
+        match self {
+            RowAction::Open => (s.open_word, "Enter"),
+            RowAction::ExtractSelection => (s.extract_selected, "Ctrl+E"),
+            RowAction::ExtractHere => (s.extract_here, "Alt+W"),
+            RowAction::TestSelection => (s.test_selection, ""),
+            RowAction::Delete => (s.delete_word, "Supr"),
+            RowAction::Copy => (s.copy_word, "Ctrl+C"),
+            RowAction::Cut => (s.cut_word, "Ctrl+X"),
+            RowAction::Paste => (s.paste_word, "Ctrl+V"),
+            RowAction::CopyNames => (s.copy_names, "Ctrl+Shift+C"),
+            RowAction::SelectAll => (s.select_all, "Ctrl+A"),
+        }
+    }
+
+    /// Copy, cut and paste are left out rather than greyed out where the shell
+    /// has nowhere to put them: a menu entry that can never do anything is
+    /// worse than no entry.
+    fn offered(self) -> bool {
+        !matches!(self, RowAction::Copy | RowAction::Cut | RowAction::Paste)
+            || clipboard::AVAILABLE
+    }
 }
 
 /// A control in the settings dialog, in draw order. The index into
@@ -730,6 +792,12 @@ impl GpuiShell {
             add_start_focus: cx.focus_handle().tab_stop(true),
             add_cancel_focus: cx.focus_handle().tab_stop(true),
             settings_focus: SettingsControl::ALL
+                .iter()
+                .map(|_| cx.focus_handle().tab_stop(true))
+                .collect(),
+            row_menu: None,
+            row_menu_focus: cx.focus_handle(),
+            row_menu_item_focus: RowAction::ALL
                 .iter()
                 .map(|_| cx.focus_handle().tab_stop(true))
                 .collect(),
@@ -2107,6 +2175,137 @@ impl GpuiShell {
         }
     }
 
+    /// Runs what the row menu was asked for and shuts it.
+    fn row_action(
+        &mut self,
+        action: RowAction,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.row_menu = None;
+        if !self.background_idle() {
+            return;
+        }
+        let rows = self.controller.visible_rows();
+        let row = rows.get(index).cloned();
+        match action {
+            RowAction::Open => {
+                if let Some(row) = row {
+                    if row.is_dir {
+                        self.controller.dispatch(AppAction::Navigate(row.path));
+                        self.route_changed(cx);
+                    } else if let Some(entry) = row.entry {
+                        self.controller.dispatch(AppAction::OpenFile(entry));
+                    }
+                }
+            }
+            RowAction::ExtractSelection => {
+                self.begin_dialog(DialogKind::Extract { only_checked: true }, cx)
+            }
+            RowAction::ExtractHere => self.controller.extract_here(),
+            RowAction::TestSelection => {
+                let names = self.controller.selected_names();
+                if let Some(archive) = self.controller.state.archive.clone() {
+                    self.controller.dispatch(AppAction::Run(Job::Test {
+                        archive,
+                        only: (!names.is_empty()).then(|| names.into_iter().collect()),
+                    }));
+                }
+            }
+            RowAction::Delete => {
+                self.dialog_return_focus = self.delete_trigger_focus.clone();
+                self.controller.dispatch(AppAction::RequestDelete);
+            }
+            RowAction::Copy => self.dispatch_clipboard(false, window, cx),
+            RowAction::Cut => self.dispatch_clipboard(true, window, cx),
+            RowAction::Paste => self.dispatch_paste(window, cx),
+            RowAction::CopyNames => {
+                let names = self.controller.selected_names();
+                if !names.is_empty() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(names.join("\r\n")));
+                }
+            }
+            RowAction::SelectAll => self.controller.dispatch(AppAction::SelectAllVisible),
+        }
+        cx.notify();
+    }
+
+    fn row_menu_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.key == "escape" {
+            self.row_menu = None;
+            self.list_focus.focus(window, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        let items: Vec<FocusHandle> = RowAction::ALL
+            .iter()
+            .filter(|action| action.offered())
+            .map(|action| self.row_menu_item_focus[*action as usize].clone())
+            .collect();
+        Self::menu_key_down(event, &items, window, cx);
+    }
+
+    /// The menu the right button opens on a row, floating where the pointer is.
+    fn row_menu_view(
+        &mut self,
+        index: usize,
+        at: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<gpui::Div> {
+        let s = self.controller.s();
+        let mut menu = div()
+            .id("row-menu")
+            .role(Role::Menu)
+            .aria_label(s.archive_contents)
+            .absolute()
+            .left(at.x)
+            .top(at.y)
+            .w(px(240.))
+            .flex()
+            .flex_col()
+            .gap_px()
+            .p_1()
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius_lg)
+            .shadow_lg()
+            .occlude()
+            .track_focus(&self.row_menu_focus)
+            .tab_group()
+            .focus_visible(focus_ring(cx))
+            .on_key_down(cx.listener(Self::row_menu_key_down));
+        for action in RowAction::ALL.into_iter().filter(|a| a.offered()) {
+            let (label, keys) = action.label(s);
+            let item_focus = self.row_menu_item_focus[action as usize].clone();
+            let item = Self::menu_item(
+                ("row-menu-item", action as usize),
+                if keys.is_empty() {
+                    label.to_string()
+                } else {
+                    format!("{label}\t{keys}")
+                },
+                label.to_string(),
+                true,
+                cx,
+            )
+            .track_focus(&item_focus)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.row_action(action, index, window, cx);
+            }));
+            menu = menu.child(item);
+        }
+        menu
+    }
+
     /// Whether the keyboard is inside a text field.
     ///
     /// A bare key means something different there -- F5 in a filter box is a
@@ -2292,6 +2491,7 @@ impl GpuiShell {
             && self.dialog.is_none()
             && !self.overflow_open
             && !self.breadcrumbs_open
+            && self.row_menu.is_none()
     }
 
     fn menu_enabled(&self) -> bool {
@@ -2704,6 +2904,32 @@ impl GpuiShell {
             item = item.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.select_row(index, event, window, cx);
             }));
+
+            // Right clicking something that is not picked picks it, which is
+            // what every file list does; right clicking inside a selection
+            // leaves the selection alone.
+            item = item.on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    if !this.background_idle() {
+                        return;
+                    }
+                    if !selected {
+                        if let Some(row) = this.controller.visible_rows().get(index) {
+                            this.controller.dispatch(AppAction::SetChecked {
+                                row: row.clone(),
+                                value: true,
+                            });
+                        }
+                    }
+                    this.controller.state.cursor = Some(index);
+                    this.row_menu = Some((index, event.position));
+                    let menu_focus = this.row_menu_item_focus[0].clone();
+                    window.on_next_frame(move |window, cx| window.focus(&menu_focus, cx));
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
 
             // GPUI owns the threshold and gesture lifetime. Once the pointer
             // leaves the row, the Windows bridge takes over and runs the
@@ -3390,6 +3616,16 @@ impl Render for GpuiShell {
         let mut root = div()
             .id("arca-gpui-background")
             .on_action(cx.listener(Self::focus_filter))
+            // Pressing anywhere that is not the menu shuts the menu. The menus
+            // themselves are `occlude`d, so their own clicks never arrive here.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.row_menu.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .size_full()
             .flex()
             .flex_col()
@@ -3874,6 +4110,9 @@ impl Render for GpuiShell {
             }
             root = root.child(menu);
         }
+        if let Some((index, at)) = self.row_menu {
+            root = root.child(self.row_menu_view(index, at, cx));
+        }
         if self.dialog.is_some() {
             root = root.child(
                 div()
@@ -4196,6 +4435,23 @@ mod tests {
         let paths = vec![PathBuf::from("queued.zip")];
         assert_eq!(drop_paths_for_enter(&paths, true), paths);
         assert!(drop_paths_for_enter(&paths, false).is_empty());
+    }
+
+    #[test]
+    fn the_row_menu_only_offers_the_clipboard_where_there_is_one() {
+        // A menu entry that can never do anything is worse than no entry, so
+        // copy, cut and paste are left out rather than greyed out.
+        let offered: Vec<bool> = RowAction::ALL.iter().map(|a| a.offered()).collect();
+        for action in [RowAction::Copy, RowAction::Cut, RowAction::Paste] {
+            assert_eq!(offered[action as usize], clipboard::AVAILABLE);
+        }
+        assert!(offered[RowAction::Open as usize]);
+        assert!(offered[RowAction::Delete as usize]);
+        // Same index contract as the settings dialog: the focus vector is
+        // indexed by `action as usize`.
+        for (index, action) in RowAction::ALL.iter().enumerate() {
+            assert_eq!(*action as usize, index);
+        }
     }
 
     #[test]
