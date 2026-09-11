@@ -1,8 +1,7 @@
 /target
 **/target
-# Keep reproducible dependency graphs for the workspace and the GPUI spike.
+# Keep reproducible dependency graphs for the workspace.
 !Cargo.lock
-!spikes/gpui/Cargo.lock
 windows/salida/
 *.zip
 *.tar
