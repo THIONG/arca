@@ -1,5 +1,4 @@
 use arca_core::Entry;
-use eframe::egui;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -11,20 +10,6 @@ pub enum Kind {
     Audio,
     Video,
     Other,
-}
-
-impl Kind {
-    fn color(self) -> egui::Color32 {
-        match self {
-            Kind::Dir => egui::Color32::from_rgb(232, 184, 92),
-            Kind::Image => egui::Color32::from_rgb(122, 192, 132),
-            Kind::Text => egui::Color32::from_rgb(142, 172, 214),
-            Kind::Archive => egui::Color32::from_rgb(190, 142, 214),
-            Kind::Audio => egui::Color32::from_rgb(214, 142, 160),
-            Kind::Video => egui::Color32::from_rgb(214, 160, 112),
-            Kind::Other => egui::Color32::from_rgb(150, 152, 158),
-        }
-    }
 }
 
 pub fn kind_of(name: &str, is_dir: bool) -> Kind {
@@ -44,45 +29,6 @@ pub fn kind_of(name: &str, is_dir: bool) -> Kind {
         "mp4" | "mkv" | "avi" | "mov" | "webm" | "wmv" => Kind::Video,
         _ => Kind::Other,
     }
-}
-
-/// The hand drawn icon, in the space the layout gives it.
-pub fn draw_icon(ui: &mut egui::Ui, kind: Kind) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
-    draw_icon_at(ui, rect, kind);
-}
-
-/// The same, in a rectangle the caller has already decided on: the tree places
-/// its own rows and has nowhere to allocate from.
-pub fn draw_icon_at(ui: &mut egui::Ui, rect: egui::Rect, kind: Kind) {
-    let p = ui.painter();
-    let c = kind.color();
-    let faded = egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 110);
-
-    if kind == Kind::Dir {
-        let tab =
-            egui::Rect::from_min_size(rect.left_top() + egui::vec2(1.0, 2.5), egui::vec2(6.0, 2.5));
-        p.rect_filled(tab, 1.0, c);
-        let body = egui::Rect::from_min_max(
-            rect.left_top() + egui::vec2(1.0, 4.5),
-            rect.right_bottom() - egui::vec2(1.0, 2.0),
-        );
-        p.rect_filled(body, 2.0, c);
-        return;
-    }
-
-    let body = egui::Rect::from_min_max(
-        rect.left_top() + egui::vec2(2.5, 1.5),
-        rect.right_bottom() - egui::vec2(2.5, 1.5),
-    );
-    p.rect_filled(body, 1.5, faded);
-    p.rect_stroke(body, 1.5, egui::Stroke::new(1.0_f32, c));
-    let fold = vec![
-        egui::pos2(body.right() - 4.5, body.top()),
-        egui::pos2(body.right(), body.top() + 4.5),
-        egui::pos2(body.right() - 4.5, body.top() + 4.5),
-    ];
-    p.add(egui::Shape::convex_polygon(fold, c, egui::Stroke::NONE));
 }
 
 #[derive(Clone)]
@@ -348,12 +294,6 @@ pub struct Folder {
     pub kids: BTreeMap<String, Folder>,
 }
 
-impl Folder {
-    pub fn is_empty(&self) -> bool {
-        self.kids.is_empty()
-    }
-}
-
 pub fn folders_of(entries: &[Entry]) -> Folder {
     let mut root = Folder::default();
     for e in entries {
@@ -422,7 +362,7 @@ mod folder_tests {
             "loose files bring no folder with them"
         );
         assert_eq!(root.kids["a"].kids.keys().collect::<Vec<_>>(), ["b"]);
-        assert!(root.kids["a"].kids["b"].is_empty());
-        assert!(root.kids["empty"].is_empty());
+        assert!(root.kids["a"].kids["b"].kids.is_empty());
+        assert!(root.kids["empty"].kids.is_empty());
     }
 }

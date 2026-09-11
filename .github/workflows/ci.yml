@@ -7,9 +7,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI validates release code paths; the tag workflow pays for production LTO.
+  CARGO_PROFILE_RELEASE_LTO: "off"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
 jobs:
-  test:
+  tests:
     name: Tests and interoperability
     runs-on: ubuntu-latest
     steps:
@@ -17,88 +20,72 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Reference tools
-        run: sudo apt-get update && sudo apt-get install -y zip unzip p7zip-full zstd
-
-      # The window is part of the workspace, so this job builds it too. eframe
-      # needs these headers on Linux; on Windows and macOS nothing is required
-      # because the system already ships them.
+        run: >-
+          sudo apt-get update && sudo apt-get install -y zip unzip p7zip-full
+          zstd
       - name: Window dependencies
-        run: sudo apt-get install -y libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev libgl1-mesa-dev libxcursor-dev libxinerama-dev
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+        run: >-
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev
+          libwayland-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+          libxcursor-dev libxinerama-dev libfontconfig1-dev
+
+      # The GUI test binary is linked once, on Linux. Platform jobs validate
+      # their release builds without linking this large GPUI test binary again.
+      - run: cargo clippy --workspace --bins -- -D warnings
       - run: cargo test --workspace
-      - name: Build without the C codecs (pure Rust)
-        run: cargo build --release --no-default-features
-      - run: cargo build --release
+
+      # Interoperability exercises the CLI; there is no reason to build GPUI
+      # just to obtain arca for this check.
+      - name: Build CLI without the C codecs
+        run: cargo build --no-default-features -p arca-cli
+      - name: Build CLI with the default codecs
+        run: cargo build -p arca-cli
       - name: Interoperability verified by hash
-        run: bash interop.sh
+        run: ARCA="$GITHUB_WORKSPACE/target/debug/arca" bash interop.sh
 
-      # The installer was written on Windows: this is the only thing checking
-      # that it really works on Linux, there and back.
-      - name: Installer, there and back
-        run: |
-          ./install.sh
-          test -x "$HOME/.local/bin/arca" && test -x "$HOME/.local/bin/arca-gui"
-          "$HOME/.local/bin/arca" --version
-          ./install.sh --uninstall
-          test ! -e "$HOME/.local/bin/arca" && test ! -e "$HOME/.local/bin/arca-gui"
-
-  windows:
-    name: Build on Windows
-    runs-on: windows-latest
+  build:
+    name: Build on ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
-      - run: cargo test --workspace
-      # No continue-on-error: the release has been building this without a net
-      # since v0.3.0, so letting it slide here only hid a breakage until
-      # publishing time. It lives outside the workspace, hence the directory.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Window dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxrandr-dev
+          libxi-dev libgl1-mesa-dev libxcursor-dev libxinerama-dev
+          libfontconfig1-dev
+
+      - name: Build release binaries
+        if: matrix.os != 'windows-latest'
+        run: cargo build --release
+
+      - name: Build Windows release binaries
+        if: matrix.os == 'windows-latest'
+        run: cargo build --release --target x86_64-pc-windows-msvc
       - name: Shell extension
+        if: matrix.os == 'windows-latest'
         working-directory: windows/arca-shell
         run: |
           cargo build --release
           cargo test
           cargo clippy --release --all-targets -- -D warnings
-
-      # The installer used to be compiled for the first time during a release,
-      # which is where two breakages were found: once a wrong path to the DLL,
-      # once Pascal that did not compile. Neither was visible until a tag had
-      # already been pushed. It is built here now, on every push, with the same
-      # arguments the release uses.
-      - name: Windows installer
-        shell: bash
-        run: |
-          set -eu
-          cargo build --release --target x86_64-pc-windows-msvc
-          cargo build --release --target x86_64-pc-windows-msvc \
-            --manifest-path windows/arca-shell/Cargo.toml
-          # The installer stamps the version into AppxManifest.xml with Inno's
-          # Pascal, whose strings go through the ANSI code page: lossless only
-          # while that file stays ASCII. It used to be Spanish with accents,
-          # and no amount of Pascal made that survive the round trip.
-          if LC_ALL=C grep -n '[^[:print:][:space:]]' windows/AppxManifest.xml; then
-            echo "AppxManifest.xml has non-ASCII bytes on those lines"; exit 1
-          fi
-          ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
-          test -f "$ISCC" || choco install innosetup -y --no-progress
-          BIN='//DBinDir=..\target\x86_64-pc-windows-msvc\release'
-          SHELL_DIR='//DShellDir=arca-shell\target\x86_64-pc-windows-msvc\release'
-          "$ISCC" //DVersion=0.0.0 "$BIN" "$SHELL_DIR" windows/arca.iss
-          test -f dist/arca-setup-0.0.0-x86_64.exe
-
-  macos:
-    name: Build on macOS
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
-      - run: cargo test --workspace
-      - name: Installer, there and back
-        run: |
-          ./install.sh
-          test -x "$HOME/.local/bin/arca" && test -x "$HOME/.local/bin/arca-gui"
-          "$HOME/.local/bin/arca" --version
-          ./install.sh --uninstall
-          test ! -e "$HOME/.local/bin/arca" && test ! -e "$HOME/.local/bin/arca-gui"

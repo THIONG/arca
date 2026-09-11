@@ -37,7 +37,7 @@ Elección de códec por algoritmo:
 | `arca-zip` | ZIP con Zip64; store, deflate y Zstandard | **prohibido** |
 | `arca-tar` | TAR ustar con checksum | **prohibido** |
 | `arca-cli` | Binario `arca` | permitido, sin usar |
-| `arca-gui` | Interfaz grafica con egui, en Rust puro | **prohibido** |
+| `arca-gui` | Interfaz grafica con GPUI Kit | **permitido** |
 | `windows/arca-shell` | Extensión del menú contextual (COM) | necesario |
 
 `windows/arca-shell` está **excluido del workspace** para que `cargo build` siga

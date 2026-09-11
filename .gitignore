@@ -1,6 +1,7 @@
 /target
 **/target
-Cargo.lock
+# Keep reproducible dependency graphs for the workspace.
+!Cargo.lock
 windows/salida/
 *.zip
 *.tar
