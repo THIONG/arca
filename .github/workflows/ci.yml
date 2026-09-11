@@ -30,9 +30,9 @@ jobs:
       # because the system already ships them.
       - name: Window dependencies
         run: >-
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxrandr-dev
-          libxi-dev libgl1-mesa-dev libxcursor-dev libxinerama-dev
-          libfontconfig1-dev
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev
+          libwayland-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+          libxcursor-dev libxinerama-dev libfontconfig1-dev
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - name: Build without the C codecs (pure Rust)
