@@ -31,7 +31,7 @@ use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_component::status_bar::StatusBar;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Icon, IconName};
-use gpui_component::{Disableable, TitleBar, TITLE_BAR_HEIGHT};
+use gpui_component::{Disableable, Root, TitleBar, TITLE_BAR_HEIGHT};
 use gpui_platform::application;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -5517,7 +5517,12 @@ impl Render for GpuiShell {
         if let Some(dialog) = self.dialogs(cx) {
             root = root.child(dialog);
         }
-        root
+        // `Root` owns the dialog, sheet and notification stacks, but it does
+        // not mount them itself: the window's own view has to, or a dialog the
+        // kit considers open never reaches the screen.
+        root.children(Root::render_sheet_layer(window, cx))
+            .children(Root::render_dialog_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx))
     }
 }
 
@@ -5799,15 +5804,22 @@ pub(crate) fn run() {
                         window_min_size: Some(size(px(MINIMUM_SIZE.0), px(MINIMUM_SIZE.1))),
                         ..TitleBar::window_options()
                     },
-                    |window, cx| cx.new(|cx| GpuiShell::new(window, cx, startup)),
+                    |window, cx| {
+                        // The kit's `Root` has to be the window's first view:
+                        // dialogs, sheets and notifications are looked up
+                        // through it, and every kit component that opens one
+                        // panics without it.
+                        let shell = cx.new(|cx| GpuiShell::new(window, cx, startup));
+                        let shell_focus = shell.read(cx).focus_handle.clone();
+                        window.focus(&shell_focus, cx);
+                        window.set_window_title("Arca");
+                        cx.new(|cx| Root::new(shell, window, cx))
+                    },
                 )
                 .expect("open GPUI shell window");
             window
-                .update(cx, |shell, window, cx| {
-                    let shell_focus = shell.focus_handle.clone();
-                    window.focus(&shell_focus, cx);
+                .update(cx, |_, _, cx| {
                     cx.activate(true);
-                    window.set_window_title("Arca");
                 })
                 .expect("activate GPUI shell window");
         });
