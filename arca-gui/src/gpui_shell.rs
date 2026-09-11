@@ -25,6 +25,7 @@ use gpui::{
 use gpui_component::separator::Separator;
 use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_component::status_bar::StatusBar;
+use gpui_component::{TitleBar, TITLE_BAR_HEIGHT};
 use gpui_component::{ActiveTheme, Icon, IconName};
 use gpui_platform::application;
 use std::ops::Range;
@@ -2310,7 +2311,13 @@ impl GpuiShell {
         div()
             .id(("gpui-dialog", kind as usize))
             .absolute()
-            .inset_0()
+            // Everything below the title bar. The three window buttons are not
+            // the background: a dialog that covered them would be a dialog you
+            // could not close the window behind.
+            .top(TITLE_BAR_HEIGHT)
+            .left_0()
+            .right_0()
+            .bottom_0()
             .bg(cx.theme().overlay)
             .role(Role::Dialog)
             .aria_label(title.clone())
@@ -4662,6 +4669,23 @@ impl Render for GpuiShell {
         // is a role-less background subtree; every actionable descendant also
         // drops its role, tab stop, and listener while the sibling overlay
         // owns focus and input.
+        // The name of what is open, where a title bar puts it. Nothing in here
+        // can be pressed on purpose: the bar owns the drag, and a control
+        // inside it would move the window when the hand wobbled on the way to
+        // pressing it.
+        let title_bar = TitleBar::new().child(
+            div()
+                .id("window-title")
+                .role(Role::Heading)
+                .flex()
+                .items_center()
+                .h_full()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .truncate()
+                .child(self.controller.state.window_title.clone()),
+        );
+
         let mut root = div()
             .id("arca-gpui-background")
             .on_action(cx.listener(Self::focus_filter))
@@ -4680,6 +4704,7 @@ impl Render for GpuiShell {
             .flex_col()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .child(title_bar)
             .child(toolbar_bar)
             .child(nav_bar);
 
@@ -5112,7 +5137,9 @@ impl Render for GpuiShell {
                 .role(Role::Menu)
                 .aria_label(s.more_word)
                 .absolute()
-                .top(px(38.))
+                // Under the button that opened it. Measured from the top of the
+                // window, so the title bar counts.
+                .top(TITLE_BAR_HEIGHT + px(38.))
                 .right(px(232.))
                 .w(px(210.))
                 .max_h(px(420.))
@@ -5569,7 +5596,10 @@ impl Render for GpuiShell {
                 div()
                     .id("native-picker-overlay")
                     .absolute()
-                    .inset_0()
+                    .top(TITLE_BAR_HEIGHT)
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
                     .bg(cx.theme().overlay)
                     .role(Role::Dialog)
                     .aria_label(s.waiting_picker)
@@ -5848,14 +5878,15 @@ pub(crate) fn run() {
             let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
             let window = cx
                 .open_window(
+                    // The bar across the top is Arca's, not the system's: the
+                    // kit's options make the native caption transparent and
+                    // hand the dragging, the double click and the three window
+                    // buttons to `TitleBar`, which is drawn from the same
+                    // tokens as everything below it.
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(bounds)),
                         window_min_size: Some(size(px(MINIMUM_SIZE.0), px(MINIMUM_SIZE.1))),
-                        titlebar: Some(gpui::TitlebarOptions {
-                            title: Some("Arca".into()),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
+                        ..TitleBar::window_options()
                     },
                     |window, cx| cx.new(|cx| GpuiShell::new(window, cx, startup)),
                 )
