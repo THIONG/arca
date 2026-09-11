@@ -3930,8 +3930,16 @@ impl AppController {
                         finished_ok = true;
                     }
                     Message::Failed(text) => {
-                        self.state.notice = text;
-                        self.state.error = true;
+                        // Stopping is not failing. Nothing is wrong with the
+                        // archive and there is nothing to report in red: the
+                        // rewrite gave up before it swapped anything.
+                        let quit = text == arca_core::Error::Cancelled.to_string();
+                        self.state.notice = if quit {
+                            self.s().stopped.to_string()
+                        } else {
+                            text
+                        };
+                        self.state.error = !quit;
                         self.state.busy = false;
                         close = true;
                     }
