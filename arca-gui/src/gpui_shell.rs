@@ -648,6 +648,13 @@ impl RowAction {
         }
     }
 
+    /// Whether a rule goes above this one. Looking at an entry, changing it,
+    /// moving it through the clipboard and working on the selection are four
+    /// different things, and twelve entries in one run is a wall.
+    fn starts_group(self) -> bool {
+        matches!(self, RowAction::Rename | RowAction::Copy | RowAction::CopyNames)
+    }
+
     /// Copy, cut and paste are left out rather than greyed out where the shell
     /// has nowhere to put them: a menu entry that can never do anything is
     /// worse than no entry.
@@ -1264,18 +1271,39 @@ impl GpuiShell {
         button
     }
 
+    /// A row of the menu: what it does on the left, the keys that do the same
+    /// on the right.
+    ///
+    /// Two children rather than one string with a tab in it. egui turned a `\t`
+    /// into a right-aligned column; GPUI lays out text and a tab is nothing at
+    /// all there, so the keys came out stuck to the word -- "OpenEnter",
+    /// "ViewF3". The keys are quieter than the name, because they are a way in
+    /// and not a second thing to read.
     fn menu_item(
         id: impl Into<ElementId>,
         label: impl Into<gpui::SharedString>,
+        keys: &str,
         accessible_name: String,
         enabled: bool,
         cx: &App,
     ) -> Stateful<gpui::Div> {
         // A menu item is a full-width row, not a button that happens to be in a
         // menu: it takes the whole popover so the hover tint reaches both edges.
-        let mut item = Self::button(id, label, accessible_name, enabled, cx)
+        // The label goes in as a child of its own so it can take the room the
+        // keys do not.
+        let mut item = Self::button(id, "", accessible_name, enabled, cx)
             .w_full()
-            .justify_start();
+            .gap_4()
+            .justify_start()
+            .child(div().flex_1().truncate().child(label.into()));
+        if !keys.is_empty() {
+            item = item.child(
+                div()
+                    .flex_none()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(keys.to_string()),
+            );
+        }
         if enabled {
             item = item.role(Role::MenuItem);
         }
@@ -2936,20 +2964,24 @@ impl GpuiShell {
             .visible_rows()
             .get(index)
             .is_some_and(|row| row.entry.is_some());
+        let mut drawn = false;
         for action in RowAction::ALL.into_iter().filter(|a| {
             a.offered()
                 && (*a != RowAction::Rename || writable)
                 && (*a != RowAction::View || is_file)
         }) {
+            // Never as the first thing in the menu: a rule with nothing above
+            // it is a line, not a grouping.
+            if action.starts_group() && drawn {
+                menu = menu.child(div().py_1().child(Separator::horizontal()));
+            }
+            drawn = true;
             let (label, keys) = action.label(s);
             let item_focus = self.row_menu_item_focus[action as usize].clone();
             let item = Self::menu_item(
                 ("row-menu-item", action as usize),
-                if keys.is_empty() {
-                    label.to_string()
-                } else {
-                    format!("{label}\t{keys}")
-                },
+                label,
+                keys,
                 label.to_string(),
                 true,
                 cx,
@@ -4546,6 +4578,7 @@ impl Render for GpuiShell {
                     Self::menu_item(
                         ("hidden-crumb", index),
                         name,
+                        "",
                         fill(s.open_folder, &[("name", name)]),
                         true,
                         cx,
@@ -5099,8 +5132,15 @@ impl Render for GpuiShell {
                 .focus_visible(focus_ring(cx))
                 .on_key_down(cx.listener(Self::overflow_key_down));
             let test_focus = self.overflow_item_focus[0].clone().tab_stop(has);
-            let test = Self::menu_item("test", s.test_word, s.test_word.to_string(), has, cx)
-                .track_focus(&test_focus);
+            let test = Self::menu_item(
+                "test",
+                s.test_word,
+                "Ctrl+T",
+                s.test_word.to_string(),
+                has,
+                cx,
+            )
+            .track_focus(&test_focus);
             menu = menu.child(test.on_click(cx.listener(|this, _, _, cx| {
                 if this.menu_enabled() {
                     if let Some(archive) = this.controller.state.archive.clone() {
@@ -5117,6 +5157,7 @@ impl Render for GpuiShell {
             let select = Self::menu_item(
                 "select-all",
                 s.select_all,
+                "Ctrl+A",
                 s.select_all.to_string(),
                 has,
                 cx,
@@ -5133,6 +5174,7 @@ impl Render for GpuiShell {
             let invert = Self::menu_item(
                 "invert",
                 s.invert_selection,
+                "Ctrl+I",
                 s.invert_selection.to_string(),
                 has,
                 cx,
@@ -5149,6 +5191,7 @@ impl Render for GpuiShell {
             let clear = Self::menu_item(
                 "clear",
                 s.clear_selection,
+                "Esc",
                 s.clear_selection.to_string(),
                 has,
                 cx,
@@ -5165,7 +5208,8 @@ impl Render for GpuiShell {
             let copy_focus = self.overflow_item_focus[4].clone().tab_stop(copy_enabled);
             let copy = Self::menu_item(
                 "copy-files",
-                format!("{}\tCtrl/Cmd+C", s.copy_word),
+                s.copy_word,
+                "Ctrl+C",
                 s.copy_word.to_string(),
                 copy_enabled,
                 cx,
@@ -5183,7 +5227,8 @@ impl Render for GpuiShell {
             let cut_focus = self.overflow_item_focus[5].clone().tab_stop(copy_enabled);
             let cut = Self::menu_item(
                 "cut-files",
-                format!("{}\tCtrl/Cmd+X", s.cut_word),
+                s.cut_word,
+                "Ctrl+X",
                 s.cut_word.to_string(),
                 copy_enabled,
                 cx,
@@ -5202,7 +5247,8 @@ impl Render for GpuiShell {
             let paste_focus = self.overflow_item_focus[6].clone().tab_stop(paste_enabled);
             let paste = Self::menu_item(
                 "paste-files",
-                format!("{}\tCtrl/Cmd+V", s.paste_word),
+                s.paste_word,
+                "Ctrl+V",
                 s.paste_word.to_string(),
                 paste_enabled,
                 cx,
@@ -5224,13 +5270,7 @@ impl Render for GpuiShell {
                     .clone()
                     .tab_stop(menu_enabled);
                 let label = fill(s.update_ready, &[("version", &release.tag)]);
-                let item = Self::menu_item(
-                    "release",
-                    label.clone(),
-                    label,
-                    menu_enabled,
-                    cx,
-                )
+                let item = Self::menu_item("release", label.clone(), "", label, menu_enabled, cx)
                 .track_focus(&release_focus);
                 menu = menu.child(item.on_click(cx.listener(|this, _, _, cx| {
                     if this.menu_enabled() {
@@ -5243,11 +5283,12 @@ impl Render for GpuiShell {
 
             let writable = has && self.controller.state.format == super::Format::Zip;
             let can_undo = has && self.controller.state.undo.is_some();
-            for (slot, id, label, enabled, action) in [
+            for (slot, id, label, keys, enabled, action) in [
                 (
                     7usize,
                     "add-files",
                     s.add_to_archive,
+                    "",
                     writable,
                     OverflowAction::AddFiles,
                 ),
@@ -5255,21 +5296,37 @@ impl Render for GpuiShell {
                     8,
                     "new-folder",
                     s.new_folder,
+                    "",
                     writable,
                     OverflowAction::NewFolder,
                 ),
-                (9, "undo", s.undo_word, can_undo, OverflowAction::Undo),
-                (10, "save-copy", s.save_copy, has, OverflowAction::SaveCopy),
+                (
+                    9,
+                    "undo",
+                    s.undo_word,
+                    "Ctrl+Z",
+                    can_undo,
+                    OverflowAction::Undo,
+                ),
+                (
+                    10,
+                    "save-copy",
+                    s.save_copy,
+                    "",
+                    has,
+                    OverflowAction::SaveCopy,
+                ),
                 (
                     11,
                     "default-password",
                     s.default_password,
+                    "Ctrl+P",
                     menu_enabled,
                     OverflowAction::DefaultPassword,
                 ),
             ] {
                 let item_focus = self.overflow_item_focus[slot].clone().tab_stop(enabled);
-                let item = Self::menu_item(id, label, label.to_string(), enabled, cx)
+                let item = Self::menu_item(id, label, keys, label.to_string(), enabled, cx)
                     .track_focus(&item_focus);
                 menu = menu.child(item.on_click(cx.listener(move |this, _, _, cx| {
                     if this.menu_enabled() {
@@ -5303,6 +5360,7 @@ impl Render for GpuiShell {
                 let item = Self::menu_item(
                     ("recent", position),
                     leaf,
+                    "",
                     format!("{} {path}", s.recent_word),
                     menu_enabled,
                     cx,
@@ -5323,6 +5381,7 @@ impl Render for GpuiShell {
             let clear_history = Self::menu_item(
                 "clear-history",
                 s.clear_history,
+                "",
                 s.clear_history.to_string(),
                 clear_history_enabled,
                 cx,
@@ -5348,6 +5407,7 @@ impl Render for GpuiShell {
                 } else {
                     s.flat_view.to_string()
                 },
+                "",
                 s.flat_view.to_string(),
                 has,
                 cx,
@@ -5377,7 +5437,8 @@ impl Render for GpuiShell {
                 .tab_stop(menu_enabled);
             let shortcuts_item = Self::menu_item(
                 "shortcuts",
-                format!("{}\tF1", s.shortcuts_title),
+                s.shortcuts_title,
+                "F1",
                 s.shortcuts_title.to_string(),
                 menu_enabled,
                 cx,
@@ -5398,6 +5459,7 @@ impl Render for GpuiShell {
             let settings_item = Self::menu_item(
                 "settings",
                 s.settings,
+                "",
                 s.settings.to_string(),
                 menu_enabled,
                 cx,
@@ -5424,6 +5486,7 @@ impl Render for GpuiShell {
                 let item = Self::menu_item(
                     ("column", position),
                     format!("{action} {label}"),
+                    "",
                     format!("{action} {label}"),
                     columns_available,
                     cx,
