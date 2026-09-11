@@ -14,7 +14,9 @@ use crate::{
     i18n::{strings, Strings},
     tree,
 };
-use arca_core::{Codec, Entry, Level};
+#[cfg(windows)]
+use arca_core::Entry;
+use arca_core::{Codec, Level};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
