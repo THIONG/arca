@@ -7,8 +7,8 @@
 //! file pickers stay on worker threads.
 
 use super::{
-    human, parent_of, saved_of, when, Answer, AppAction, AppController, Columns, DropChoice, Job,
-    Pending, Settings, SortColumn, Startup, View,
+    fill, human, parent_of, saved_of, when, Answer, AppAction, AppController, Columns, DropChoice,
+    Job, Pending, Settings, SortColumn, Startup, Strings, View,
 };
 use crate::{
     clipboard, gpui_theme,
@@ -81,6 +81,10 @@ enum TextFieldKind {
 struct FilterInput {
     owner: WeakEntity<GpuiShell>,
     kind: TextFieldKind,
+    /// The field reads its own name out to a screen reader, so it needs the
+    /// language too. The shell pushes it in on every frame, because the
+    /// settings dialog can change it while the window is up.
+    strings: &'static Strings,
     masked: bool,
     focus_handle: FocusHandle,
     enabled: bool,
@@ -448,17 +452,17 @@ impl Render for FilterInput {
             })
             .key_context("FilterInput")
             .aria_label(match self.kind {
-                TextFieldKind::Filter => "Filter files",
-                TextFieldKind::Password => "Password",
-                TextFieldKind::OutputName => "Output archive name",
-                TextFieldKind::AddPassword => "Optional archive password",
+                TextFieldKind::Filter => self.strings.find_word,
+                TextFieldKind::Password => self.strings.password_word,
+                TextFieldKind::OutputName => self.strings.output_name,
+                TextFieldKind::AddPassword => self.strings.password_optional,
             })
             .aria_value(
                 if matches!(
                     self.kind,
                     TextFieldKind::Password | TextFieldKind::AddPassword
                 ) {
-                    "Password entered".into()
+                    self.strings.password_word.into()
                 } else {
                     self.content.clone()
                 },
@@ -550,8 +554,10 @@ enum ModalKind {
 impl GpuiShell {
     fn new(window: &mut Window, cx: &mut Context<Self>, startup: Startup) -> Self {
         let owner = cx.weak_entity();
+        let strings = super::strings(Settings::load().effective_lang());
         let filter = cx.new(|cx| FilterInput {
             owner: owner.clone(),
+            strings,
             focus_handle: cx.focus_handle(),
             enabled: true,
             kind: TextFieldKind::Filter,
@@ -564,6 +570,7 @@ impl GpuiShell {
         });
         let password = cx.new(|cx| FilterInput {
             owner: owner.clone(),
+            strings,
             focus_handle: cx.focus_handle(),
             enabled: false,
             kind: TextFieldKind::Password,
@@ -576,6 +583,7 @@ impl GpuiShell {
         });
         let output_name = cx.new(|cx| FilterInput {
             owner: owner.clone(),
+            strings,
             focus_handle: cx.focus_handle(),
             enabled: false,
             kind: TextFieldKind::OutputName,
@@ -588,6 +596,7 @@ impl GpuiShell {
         });
         let add_password = cx.new(|cx| FilterInput {
             owner,
+            strings,
             focus_handle: cx.focus_handle(),
             enabled: false,
             kind: TextFieldKind::AddPassword,
@@ -739,7 +748,7 @@ impl GpuiShell {
     fn sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
         let current = self.controller.state.current_dir.clone();
         let at_root = current.is_empty();
-        let root_item = SidebarMenuItem::new("Archive root")
+        let root_item = SidebarMenuItem::new(self.controller.s().archive_root.to_string())
             .icon(IconName::Inbox)
             .active(at_root)
             .on_click(cx.listener(|this, _, _, cx| {
@@ -1408,6 +1417,7 @@ impl GpuiShell {
     }
 
     fn add_dialog(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
+        let s = self.controller.s();
         let format = self.controller.state.format;
         let is_zip = format == super::Format::Zip;
         let format_button = Self::dialog_button(
@@ -1417,7 +1427,7 @@ impl GpuiShell {
             false,
             cx,
         )
-        .aria_label("Output format")
+        .aria_label(s.format)
         .on_click(cx.listener(|this, _, _, cx| {
             this.cycle_format();
             cx.notify();
@@ -1425,7 +1435,7 @@ impl GpuiShell {
         let codec_button = Self::button(
             "add-codec",
             self.controller.codec_name(self.controller.state.codec),
-            "Compression codec".into(),
+            s.compressor.to_string(),
             is_zip,
             cx,
         )
@@ -1441,7 +1451,7 @@ impl GpuiShell {
             false,
             cx,
         )
-        .aria_label("Compression level")
+        .aria_label(s.level)
         .on_click(cx.listener(|this, _, _, cx| {
             this.cycle_level();
             cx.notify();
@@ -1450,11 +1460,7 @@ impl GpuiShell {
             let show = self.controller.state.show_password;
             let toggle = Self::dialog_button(
                 "add-password-visibility",
-                if show {
-                    "Hide password"
-                } else {
-                    "Show password"
-                },
+                if show { s.hide_word } else { s.show_password },
                 &self.add_password_toggle_focus,
                 false,
                 cx,
@@ -1473,9 +1479,9 @@ impl GpuiShell {
         } else {
             None
         };
-        let start = Self::dialog_button("add-start", "Start", &self.add_start_focus, true, cx)
+        let start = Self::dialog_button("add-start", s.start, &self.add_start_focus, true, cx)
             .on_click(cx.listener(|this, _, _, cx| this.start_add(cx)));
-        let cancel = Self::dialog_button("add-cancel", "Cancel", &self.add_cancel_focus, false, cx)
+        let cancel = Self::dialog_button("add-cancel", s.cancel, &self.add_cancel_focus, false, cx)
             .on_click(cx.listener(|this, _, _, cx| {
                 this.controller.state.view = View::Browse;
                 cx.notify();
@@ -1490,7 +1496,7 @@ impl GpuiShell {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .child("Format")
+                    .child(s.format)
                     .child(format_button),
             )
             .child(
@@ -1498,7 +1504,7 @@ impl GpuiShell {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .child("Codec")
+                    .child(s.compressor)
                     .child(codec_button),
             )
             .child(
@@ -1506,7 +1512,7 @@ impl GpuiShell {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .child("Level")
+                    .child(s.level)
                     .child(level_button),
             );
         let mut body = div()
@@ -1519,7 +1525,7 @@ impl GpuiShell {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child("Output name")
+                    .child(s.output_name)
                     .child(self.output_name.clone()),
             )
             .child(options);
@@ -1527,21 +1533,19 @@ impl GpuiShell {
             body = body.child(password);
         }
         body = body
-            .child(format!(
-                "{count} input{}",
-                if count == 1 { "" } else { "s" }
-            ))
+            .child(format!("{count} {}", s.files_word))
             .child(div().flex().gap_2().child(start).child(cancel));
         self.dialog_overlay(
             ModalKind::Add,
-            "Add files",
-            "Choose the output archive and compression options.",
+            s.add_to_archive,
+            s.defaults_title,
             body,
             cx,
         )
     }
 
     fn dialogs(&mut self, cx: &mut Context<Self>) -> Option<Stateful<gpui::Div>> {
+        let s = self.controller.s();
         if matches!(self.controller.state.view, View::Add) {
             return Some(self.add_dialog(cx));
         }
@@ -1552,24 +1556,20 @@ impl GpuiShell {
                     Some(Pending::NewPassword(_) | Pending::CurrentPassword(_))
                 );
                 let title = if setting {
-                    "Set archive password"
+                    s.set_password
                 } else {
-                    "Password required"
+                    s.password_needed
                 };
                 let hint = if setting {
-                    "Enter the password used to protect this ZIP archive."
+                    s.new_password
                 } else {
-                    "Enter the archive password to continue."
+                    s.password_hint
                 };
                 let password = self.password.clone();
                 let show = !self.controller.state.show_password;
                 let toggle = Self::dialog_button(
                     "password-visibility",
-                    if show {
-                        "Show password"
-                    } else {
-                        "Hide password"
-                    },
+                    if show { s.show_password } else { s.hide_word },
                     &self.password_toggle_focus,
                     false,
                     cx,
@@ -1581,7 +1581,7 @@ impl GpuiShell {
                 }));
                 let submit = Self::dialog_button(
                     "password-submit",
-                    if setting { "Set Password" } else { "Unlock" },
+                    if setting { s.set_password } else { s.start },
                     &self.dialog_primary_focus,
                     true,
                     cx,
@@ -1594,7 +1594,7 @@ impl GpuiShell {
                 }));
                 let cancel = Self::dialog_button(
                     "password-cancel",
-                    "Cancel",
+                    s.cancel,
                     &self.dialog_cancel_focus,
                     false,
                     cx,
@@ -1624,7 +1624,7 @@ impl GpuiShell {
                 let path = self.controller.state.conflict.clone().unwrap_or_default();
                 let overwrite = Self::dialog_button(
                     "conflict-replace",
-                    "Replace",
+                    s.yes,
                     &self.dialog_primary_focus,
                     true,
                     cx,
@@ -1635,7 +1635,7 @@ impl GpuiShell {
                 }));
                 let overwrite_all = Self::dialog_button(
                     "conflict-replace-all",
-                    "Replace All",
+                    s.yes_all,
                     &self.dialog_secondary_focus,
                     false,
                     cx,
@@ -1646,7 +1646,7 @@ impl GpuiShell {
                 }));
                 let skip = Self::dialog_button(
                     "conflict-skip",
-                    "Skip",
+                    s.no,
                     &self.dialog_tertiary_focus,
                     false,
                     cx,
@@ -1657,7 +1657,7 @@ impl GpuiShell {
                 }));
                 let skip_all = Self::dialog_button(
                     "conflict-skip-all",
-                    "Skip All",
+                    s.no_all,
                     &self.dialog_quaternary_focus,
                     false,
                     cx,
@@ -1668,7 +1668,7 @@ impl GpuiShell {
                 }));
                 let keep = Self::dialog_button(
                     "conflict-keep-both",
-                    "Keep Both",
+                    s.rename,
                     &self.dialog_rename_focus,
                     false,
                     cx,
@@ -1679,7 +1679,7 @@ impl GpuiShell {
                 }));
                 let rename_all = Self::dialog_button(
                     "conflict-keep-both-all",
-                    "Keep Both Always",
+                    s.rename_all,
                     &self.dialog_rename_all_focus,
                     false,
                     cx,
@@ -1690,7 +1690,7 @@ impl GpuiShell {
                 }));
                 let cancel = Self::dialog_button(
                     "conflict-cancel",
-                    "Cancel",
+                    s.cancel,
                     &self.dialog_cancel_focus,
                     false,
                     cx,
@@ -1702,8 +1702,8 @@ impl GpuiShell {
                 Some(
                     self.dialog_overlay(
                         ModalKind::Conflict,
-                        "File conflict",
-                        format!("The destination already contains: {path}"),
+                        s.conflict_title,
+                        format!("{} {path}", s.already_there),
                         div()
                             .id("conflict-dialog-body")
                             .flex()
@@ -1731,7 +1731,7 @@ impl GpuiShell {
                     .unwrap_or_default();
                 let confirm = Self::dialog_button(
                     "delete-confirm",
-                    "Delete",
+                    s.delete_word,
                     &self.dialog_primary_focus,
                     true,
                     cx,
@@ -1742,7 +1742,7 @@ impl GpuiShell {
                 }));
                 let cancel = Self::dialog_button(
                     "delete-cancel",
-                    "Cancel",
+                    s.cancel,
                     &self.dialog_cancel_focus,
                     false,
                     cx,
@@ -1754,12 +1754,8 @@ impl GpuiShell {
                 Some(
                     self.dialog_overlay(
                         ModalKind::Delete,
-                        "Delete selected entries",
-                        format!(
-                            "Delete {} selected entr{}?",
-                            names.len(),
-                            if names.len() == 1 { "y" } else { "ies" }
-                        ),
+                        s.delete_word,
+                        fill(s.confirm_delete, &[("n", &names.len().to_string())]),
                         div()
                             .id("delete-dialog-body")
                             .flex()
@@ -1777,22 +1773,27 @@ impl GpuiShell {
                     .clone()
                     .unwrap_or_default();
                 let open =
-                    Self::dialog_button("drop-open", "Open", &self.dialog_primary_focus, true, cx)
+                    Self::dialog_button("drop-open", s.open_word, &self.dialog_primary_focus, true, cx)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.controller
                                 .dispatch(AppAction::AnswerDrop(DropChoice::Open));
                             cx.notify();
                         }));
-                let add =
-                    Self::dialog_button("drop-add", "Add", &self.dialog_secondary_focus, false, cx)
-                        .on_click(cx.listener(|this, _, _, cx| {
+                let add = Self::dialog_button(
+                    "drop-add",
+                    s.add_to_archive,
+                    &self.dialog_secondary_focus,
+                    false,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
                             this.controller
                                 .dispatch(AppAction::AnswerDrop(DropChoice::Add));
                             cx.notify();
                         }));
                 let cancel = Self::dialog_button(
                     "drop-cancel",
-                    "Cancel",
+                    s.cancel,
                     &self.dialog_cancel_focus,
                     false,
                     cx,
@@ -1812,8 +1813,8 @@ impl GpuiShell {
                 Some(
                     self.dialog_overlay(
                         ModalKind::Drop,
-                        "Dropped archives",
-                        format!("Open or add these files? {names}"),
+                        s.drop_title,
+                        format!("{} {names}", s.dropped_word),
                         div()
                             .id("drop-dialog-body")
                             .flex()
@@ -1929,10 +1930,11 @@ impl GpuiShell {
     }
 
     fn status(&self) -> String {
+        let s = self.controller.s();
         let state = &self.controller.state;
         if state.busy || (matches!(state.view, View::Running) && state.notice.is_empty()) {
             let progress = if state.total_count == 0 {
-                "working".to_string()
+                s.working_word.to_string()
             } else {
                 format!("{} / {}", state.done_count, state.total_count)
             };
@@ -1942,10 +1944,10 @@ impl GpuiShell {
             return state.notice.clone();
         }
         if matches!(state.view, View::Add) {
-            return format!("Ready to add {} input(s)", state.pending_inputs.len());
+            return format!("{}: {}", s.add_to_archive, state.pending_inputs.len());
         }
         if state.entries.is_empty() {
-            return "Drop an archive here to begin".into();
+            return s.drop_here.into();
         }
         self.controller.summary()
     }
@@ -2019,18 +2021,19 @@ impl GpuiShell {
         enabled: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<gpui::Div> {
+        let s = self.controller.s();
         let active = self.controller.state.order.0 == column;
         let ascending = self.controller.state.order.1;
-        let direction = if ascending { "ascending" } else { "descending" };
+        let direction = if ascending { s.ascending } else { s.descending };
         let text = if active {
             format!("{} {}", label, if ascending { "↑" } else { "↓" })
         } else {
             label.to_string()
         };
         let accessible = if active {
-            format!("Sort by {label}, currently {direction}")
+            format!("{} {label} ({direction})", s.sort_by)
         } else {
-            format!("Sort by {label}")
+            format!("{} {label}", s.sort_by)
         };
         let mut cell = div()
             .id(label)
@@ -2147,29 +2150,14 @@ impl GpuiShell {
                 .cut_names
                 .contains(&self.controller.state.entries[entry].name)
         });
-        let mut description = format!("Name {}", row.label);
+        let s = self.controller.s();
+        let mut description = format!("{} {}", s.col_name, row.label);
         for column in columns.iter().copied().skip(1) {
-            let label = match column {
-                SortColumn::Size => "Size",
-                SortColumn::Packed => "Packed",
-                SortColumn::Method => "Method",
-                SortColumn::Saved => "Saved",
-                SortColumn::Modified => "Modified",
-                SortColumn::Created => "Created",
-                SortColumn::Accessed => "Accessed",
-                SortColumn::Attributes => "Attributes",
-                SortColumn::Crc => "CRC32",
-                SortColumn::Type => "Type",
-                SortColumn::Path => "Path",
-                SortColumn::Name => continue,
-            };
+            let label = Columns::label(column, s);
             description.push_str(&format!("; {label} {}", self.column_text(row, column)));
         }
-        description.push_str(if selected {
-            "; selected"
-        } else {
-            "; not selected"
-        });
+        description.push_str("; ");
+        description.push_str(if selected { s.checked } else { s.not_checked });
         let accessible = self.background_idle();
         // A cut entry is still there until it lands somewhere; it is drawn in
         // the muted ink so it reads as "about to leave" rather than as gone.
@@ -2510,7 +2498,7 @@ impl GpuiShell {
         .size_full();
         let mut table = div()
             .id("file-table")
-            .aria_label("Archive contents")
+            .aria_label(strings.archive_contents)
             .aria_row_count(total + 1)
             .aria_column_count(column_count)
             .track_focus(&self.list_focus)
@@ -2558,6 +2546,7 @@ impl Render for GpuiShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_window_title(&self.controller.state.window_title);
         self.remember_background_focus(window, cx);
+        let s = self.controller.s();
         let modal = self.modal_kind();
         let idle = self.background_idle();
         self.sync_modal_focus(window, cx);
@@ -2565,6 +2554,7 @@ impl Render for GpuiShell {
         let add_password_value = self.controller.state.add_password.clone();
         let password_masked = !self.controller.state.show_password;
         self.password.update(cx, |input, _| {
+            input.strings = s;
             input.enabled = matches!(modal, Some(ModalKind::Password));
             input.masked = password_masked;
             if input.content != password_value {
@@ -2572,12 +2562,14 @@ impl Render for GpuiShell {
             }
         });
         self.output_name.update(cx, |input, _| {
+            input.strings = s;
             input.enabled = matches!(modal, Some(ModalKind::Add));
             if input.content != self.controller.state.output_name {
                 input.sync_from_state(&self.controller.state.output_name);
             }
         });
         self.add_password.update(cx, |input, _| {
+            input.strings = s;
             input.enabled = matches!(modal, Some(ModalKind::Add))
                 && self.controller.state.format == super::Format::Zip;
             input.masked = password_masked;
@@ -2586,7 +2578,10 @@ impl Render for GpuiShell {
             }
         });
         let state_filter = self.controller.state.filter.clone();
-        self.filter.update(cx, |input, _| input.enabled = idle);
+        self.filter.update(cx, |input, _| {
+            input.strings = s;
+            input.enabled = idle;
+        });
         if let Some(value) = filter_value_to_sync(&self.filter.read(cx).content, &state_filter) {
             self.filter
                 .update(cx, |input, _| input.sync_from_state(value));
@@ -2604,7 +2599,7 @@ impl Render for GpuiShell {
 
         let mut toolbar = div()
             .id("toolbar")
-            .aria_label("Archive actions")
+            .aria_label(s.toolbar_region)
             .w_full()
             .flex()
             .items_center()
@@ -2613,7 +2608,7 @@ impl Render for GpuiShell {
             toolbar = toolbar.role(Role::Toolbar);
         }
 
-        let open = Self::button("open", "Open", "Open archive (Ctrl+O)".into(), idle, cx)
+        let open = Self::button("open", s.open, format!("{} (Ctrl+O)", s.open), idle, cx)
             .track_focus(&self.open_trigger_focus);
         toolbar = toolbar.child(open.on_click(cx.listener(|this, _, window, cx| {
             if this.background_idle() {
@@ -2624,8 +2619,8 @@ impl Render for GpuiShell {
         })));
         let compress = Self::button(
             "compress",
-            "Compress",
-            "Compress files (Ctrl+N)".into(),
+            s.compress,
+            format!("{} (Ctrl+N)", s.compress),
             idle,
             cx,
         )
@@ -2641,8 +2636,8 @@ impl Render for GpuiShell {
 
         let extract_all = Self::button(
             "extract-all",
-            "Extract All",
-            "Extract all files (Ctrl+E)".into(),
+            s.extract_all,
+            format!("{} (Ctrl+E)", s.extract_all),
             can_extract,
             cx,
         )
@@ -2662,8 +2657,8 @@ impl Render for GpuiShell {
         })));
         let extract_selected = Self::button(
             "extract-selected",
-            "Extract Selected",
-            "Extract selected files".into(),
+            s.extract_selected,
+            s.extract_selected.to_string(),
             can_extract_selected,
             cx,
         )
@@ -2680,8 +2675,8 @@ impl Render for GpuiShell {
         );
         let password = Self::button(
             "password",
-            "Password",
-            "Set, change, or remove the archive password".into(),
+            s.password_word,
+            format!("{} / {}", s.set_password, s.remove_password),
             password_available,
             cx,
         )
@@ -2695,7 +2690,7 @@ impl Render for GpuiShell {
             }
         })));
         toolbar = toolbar.child(div().px_1().child(Separator::vertical().h(px(16.))));
-        let overflow = Self::button("overflow", "More", "More archive actions".into(), idle, cx)
+        let overflow = Self::button("overflow", s.more_word, s.more_word.to_string(), idle, cx)
             .track_focus(&self.overflow_trigger_focus)
             .aria_expanded(self.overflow_open);
         toolbar = toolbar.child(overflow.on_click(cx.listener(|this, _, window, cx| {
@@ -2730,7 +2725,7 @@ impl Render for GpuiShell {
         let back = Self::icon_button(
             "back",
             IconName::ArrowLeft,
-            "Back".into(),
+            s.back.to_string(),
             idle && self.controller.can_go_back(),
             cx,
         );
@@ -2743,7 +2738,7 @@ impl Render for GpuiShell {
         let forward = Self::icon_button(
             "forward",
             IconName::ArrowRight,
-            "Forward".into(),
+            s.forward.to_string(),
             idle && self.controller.can_go_forward(),
             cx,
         );
@@ -2753,7 +2748,13 @@ impl Render for GpuiShell {
                 this.route_changed(cx);
             }
         })));
-        let up = Self::icon_button("up", IconName::ArrowUp, "Up".into(), idle && !at_root, cx);
+        let up = Self::icon_button(
+            "up",
+            IconName::ArrowUp,
+            s.up.to_string(),
+            idle && !at_root,
+            cx,
+        );
         nav = nav.child(up.on_click(cx.listener(|this, _, _, cx| {
             if this.background_idle() && !this.controller.state.current_dir.is_empty() {
                 let parent = parent_of(&this.controller.state.current_dir);
@@ -2771,7 +2772,8 @@ impl Render for GpuiShell {
                 nav = nav.child(div().text_color(cx.theme().muted_foreground).child("/"));
             }
             if position == 1 && !hidden.is_empty() {
-                let more = Self::button("crumb-more", "…", "Hidden folders".into(), idle, cx)
+                let more =
+                    Self::button("crumb-more", "…", s.hidden_folders.to_string(), idle, cx)
                     .track_focus(&self.breadcrumbs_trigger_focus)
                     .aria_expanded(self.breadcrumbs_open);
                 nav = nav.child(more.on_click(cx.listener(|this, _, window, cx| {
@@ -2797,7 +2799,7 @@ impl Render for GpuiShell {
                 let crumb = Self::button(
                     ("crumb", *index),
                     name,
-                    format!("Open folder {name}"),
+                    fill(s.open_folder, &[("name", name)]),
                     idle,
                     cx,
                 );
@@ -2816,7 +2818,7 @@ impl Render for GpuiShell {
             let mut hidden_menu = div()
                 .id("hidden-breadcrumbs")
                 .role(Role::Menu)
-                .aria_label("Hidden folders")
+                .aria_label(s.hidden_folders)
                 .absolute()
                 .top(px(30.))
                 .left(px(70.))
@@ -2843,7 +2845,7 @@ impl Render for GpuiShell {
                     Self::menu_item(
                         ("hidden-crumb", index),
                         name,
-                        format!("Open folder {name}"),
+                        fill(s.open_folder, &[("name", name)]),
                         true,
                         cx,
                     )
@@ -2897,7 +2899,7 @@ impl Render for GpuiShell {
 
         let mut status_view = div()
             .id("status")
-            .aria_label("Archive status")
+            .aria_label(s.status_region)
             .text_xs()
             .text_color(notice_color)
             .truncate()
@@ -3010,20 +3012,14 @@ impl Render for GpuiShell {
                     .border_color(cx.theme().drag_border)
                     .rounded(cx.theme().radius_lg)
                     .role(Role::Status)
-                    .aria_label(format!(
-                        "Release to open or add {count} dropped file{}",
-                        if count == 1 { "" } else { "s" }
-                    ))
-                    .child(format!(
-                        "Release to open or add {count} file{}",
-                        if count == 1 { "" } else { "s" }
-                    )),
+                    .aria_label(format!("{} ({count})", s.dropped_word))
+                    .child(format!("{} ({count})", s.dropped_word)),
             );
         }
 
         if self.controller.state.busy {
             let progress = if self.controller.state.total_count == 0 {
-                "Working…".to_string()
+                format!("{}…", s.working_word)
             } else {
                 format!(
                     "{} / {}",
@@ -3032,8 +3028,8 @@ impl Render for GpuiShell {
             };
             let cancel = Self::button(
                 "cancel-job",
-                "Cancel",
-                "Cancel current operation".into(),
+                s.cancel,
+                format!("{} · {}", s.cancel, s.progress_region),
                 !self.background_blocked(),
                 cx,
             )
@@ -3049,7 +3045,7 @@ impl Render for GpuiShell {
             // appears.
             let mut progress_view = div()
                 .id("progress")
-                .aria_label("Operation progress")
+                .aria_label(s.progress_region)
                 .aria_value(progress.clone())
                 .flex_none()
                 .h(px(30.))
@@ -3080,13 +3076,13 @@ impl Render for GpuiShell {
             content = content.child({
                 let mut loading = div()
                     .id("loading-state")
-                    .aria_label("Loading archive")
+                    .aria_label(s.opening)
                     .flex_1()
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Loading archive…");
+                    .child(format!("{}…", s.opening));
                 if !self.background_blocked() {
                     loading = loading.role(Role::Status);
                 }
@@ -3097,9 +3093,9 @@ impl Render for GpuiShell {
                 let mut empty = div()
                     .id("empty-state")
                     .aria_label(if self.controller.state.error {
-                        "Archive loading error"
+                        s.cannot_open
                     } else {
-                        "No archive is open"
+                        s.drop_here
                     })
                     .flex_1()
                     .flex()
@@ -3111,9 +3107,9 @@ impl Render for GpuiShell {
                         cx.theme().muted_foreground
                     })
                     .child(if self.controller.state.error {
-                        "Unable to open this archive."
+                        s.cannot_open
                     } else {
-                        "Open an archive or drop one here to begin."
+                        s.drop_here
                     });
                 if !self.background_blocked() {
                     empty = empty.role(Role::Region);
@@ -3122,15 +3118,15 @@ impl Render for GpuiShell {
             });
         } else if visible == 0 {
             let message = if self.controller.state.error {
-                "Unable to display archive contents."
+                s.cannot_open
             } else if self.controller.state.filter.trim().is_empty() {
                 if self.controller.state.entries.is_empty() {
-                    "This archive has no entries."
+                    s.empty_archive
                 } else {
-                    "This folder is empty."
+                    s.empty_folder
                 }
             } else {
-                "No matching entries."
+                s.no_matches
             };
             content = content.child({
                 let mut empty = div()
@@ -3138,6 +3134,7 @@ impl Render for GpuiShell {
                     .aria_label(empty_state_aria_label(
                         self.controller.state.error,
                         &self.controller.state.filter,
+                        s,
                     ))
                     .flex_1()
                     .flex()
@@ -3180,9 +3177,9 @@ impl Render for GpuiShell {
                         .gap_2()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(format!("{visible} visible"))
+                        .child(format!("{visible} {}", s.visible_of))
                         .child(Separator::vertical().h(px(10.)))
-                        .child(format!("{selected} selected")),
+                        .child(format!("{selected} {}", s.checked)),
                 )
                 .border_t_1()
                 .border_color(cx.theme().border),
@@ -3192,7 +3189,7 @@ impl Render for GpuiShell {
         let mut root = div()
             .id("arca-gpui-shell")
             .role(Role::Application)
-            .aria_label("Arca archive manager")
+            .aria_label("Arca")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::focus_filter))
             .on_action(cx.listener(Self::copy_files_action))
@@ -3215,7 +3212,7 @@ impl Render for GpuiShell {
             let mut menu = div()
                 .id("overflow-menu")
                 .role(Role::Menu)
-                .aria_label("More archive actions")
+                .aria_label(s.more_word)
                 .absolute()
                 .top(px(38.))
                 .right(px(232.))
@@ -3237,7 +3234,7 @@ impl Render for GpuiShell {
                 .focus_visible(focus_ring(cx))
                 .on_key_down(cx.listener(Self::overflow_key_down));
             let test_focus = self.overflow_item_focus[0].clone().tab_stop(has);
-            let test = Self::menu_item("test", "Test", "Test archive".into(), has, cx)
+            let test = Self::menu_item("test", s.test_word, s.test_word.to_string(), has, cx)
                 .track_focus(&test_focus);
             menu = menu.child(test.on_click(cx.listener(|this, _, _, cx| {
                 if this.menu_enabled() {
@@ -3254,8 +3251,8 @@ impl Render for GpuiShell {
             let select_focus = self.overflow_item_focus[1].clone().tab_stop(has);
             let select = Self::menu_item(
                 "select-all",
-                "Select All",
-                "Select all visible entries".into(),
+                s.select_all,
+                s.select_all.to_string(),
                 has,
                 cx,
             )
@@ -3270,8 +3267,8 @@ impl Render for GpuiShell {
             let invert_focus = self.overflow_item_focus[2].clone().tab_stop(has);
             let invert = Self::menu_item(
                 "invert",
-                "Invert",
-                "Invert visible selection".into(),
+                s.invert_selection,
+                s.invert_selection.to_string(),
                 has,
                 cx,
             )
@@ -3284,8 +3281,14 @@ impl Render for GpuiShell {
                 cx.notify();
             })));
             let clear_focus = self.overflow_item_focus[3].clone().tab_stop(has);
-            let clear = Self::menu_item("clear", "Clear", "Clear selection".into(), has, cx)
-                .track_focus(&clear_focus);
+            let clear = Self::menu_item(
+                "clear",
+                s.clear_selection,
+                s.clear_selection.to_string(),
+                has,
+                cx,
+            )
+            .track_focus(&clear_focus);
             menu = menu.child(clear.on_click(cx.listener(|this, _, _, cx| {
                 if this.menu_enabled() && this.controller.state.archive.is_some() {
                     this.controller.dispatch(AppAction::ClearSelection);
@@ -3297,8 +3300,8 @@ impl Render for GpuiShell {
             let copy_focus = self.overflow_item_focus[4].clone().tab_stop(copy_enabled);
             let copy = Self::menu_item(
                 "copy-files",
-                "Copy files\tCtrl/Cmd+C",
-                "Copy selected files to the system clipboard".into(),
+                format!("{}\tCtrl/Cmd+C", s.copy_word),
+                s.copy_word.to_string(),
                 copy_enabled,
                 cx,
             )
@@ -3315,8 +3318,8 @@ impl Render for GpuiShell {
             let cut_focus = self.overflow_item_focus[5].clone().tab_stop(copy_enabled);
             let cut = Self::menu_item(
                 "cut-files",
-                "Cut files\tCtrl/Cmd+X",
-                "Cut selected files to the system clipboard".into(),
+                format!("{}\tCtrl/Cmd+X", s.cut_word),
+                s.cut_word.to_string(),
                 copy_enabled,
                 cx,
             )
@@ -3334,8 +3337,8 @@ impl Render for GpuiShell {
             let paste_focus = self.overflow_item_focus[6].clone().tab_stop(paste_enabled);
             let paste = Self::menu_item(
                 "paste-files",
-                "Paste files\tCtrl/Cmd+V",
-                "Paste files from the system clipboard".into(),
+                format!("{}\tCtrl/Cmd+V", s.paste_word),
+                s.paste_word.to_string(),
                 paste_enabled,
                 cx,
             )
@@ -3352,16 +3355,16 @@ impl Render for GpuiShell {
             let columns_available = menu_enabled;
             for (position, (column, _)) in Columns::ALL.iter().enumerate() {
                 let column = *column;
-                let label = Columns::label(column, self.controller.s());
+                let label = Columns::label(column, s);
                 let shown = self.controller.state.settings.columns.on(column);
-                let action = if shown { "Hide" } else { "Show" };
+                let action = if shown { s.hide_word } else { s.show_word };
                 let item_focus = self.overflow_item_focus[position + 7]
                     .clone()
                     .tab_stop(columns_available);
                 let item = Self::menu_item(
                     ("column", position),
                     format!("{action} {label}"),
-                    format!("{action} {label} column"),
+                    format!("{action} {label}"),
                     columns_available,
                     cx,
                 )
@@ -3384,8 +3387,7 @@ impl Render for GpuiShell {
                     .inset_0()
                     .bg(cx.theme().overlay)
                     .role(Role::Dialog)
-                    .aria_label("Native file dialog open")
-                    .aria_description("Background actions are unavailable until the picker closes")
+                    .aria_label(s.waiting_picker)
                     .occlude()
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, _| {})
                     .child(
@@ -3398,7 +3400,7 @@ impl Render for GpuiShell {
                             .border_color(cx.theme().border)
                             .rounded(cx.theme().radius_lg)
                             .shadow_lg()
-                            .child("Waiting for the native file dialog…"),
+                            .child(s.waiting_picker),
                     ),
             );
         }
@@ -3459,13 +3461,13 @@ fn filter_value_to_sync<'a>(input: &str, state: &'a str) -> Option<&'a str> {
     (input != state).then_some(state)
 }
 
-fn empty_state_aria_label(error: bool, filter: &str) -> &'static str {
+fn empty_state_aria_label(error: bool, filter: &str, s: &'static Strings) -> &'static str {
     if error {
-        "Unable to display archive contents"
+        s.cannot_open
     } else if filter.trim().is_empty() {
-        "Current folder is empty"
+        s.empty_folder
     } else {
-        "No matching entries"
+        s.no_matches
     }
 }
 
@@ -3649,15 +3651,16 @@ mod tests {
 
     #[test]
     fn empty_folder_label_is_not_reported_as_archive_contents() {
-        assert_eq!(empty_state_aria_label(false, ""), "Current folder is empty");
-        assert_eq!(
-            empty_state_aria_label(false, "  "),
-            "Current folder is empty"
-        );
-        assert_eq!(empty_state_aria_label(false, "zip"), "No matching entries");
-        assert_eq!(
-            empty_state_aria_label(true, ""),
-            "Unable to display archive contents"
-        );
+        // Both languages, because the point of the label is that it says the
+        // folder is empty rather than that the archive is unreadable, and a
+        // translation that loses the difference is the same bug in Spanish.
+        for lang in super::super::Lang::ALL {
+            let s = super::super::strings(lang);
+            assert_eq!(empty_state_aria_label(false, "", s), s.empty_folder);
+            assert_eq!(empty_state_aria_label(false, "  ", s), s.empty_folder);
+            assert_eq!(empty_state_aria_label(false, "zip", s), s.no_matches);
+            assert_eq!(empty_state_aria_label(true, "", s), s.cannot_open);
+            assert_ne!(s.empty_folder, s.cannot_open);
+        }
     }
 }

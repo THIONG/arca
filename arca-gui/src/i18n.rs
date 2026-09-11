@@ -198,6 +198,27 @@ pub struct Strings {
     pub toggle_word: &'static str,
     pub jump_word: &'static str,
     pub move_word: &'static str,
+    // Names the GPUI surface reads out to a screen reader. egui had no
+    // equivalent because a region there has no name of its own; here every
+    // landmark does, and a landmark named in English inside a Spanish window
+    // is worse than one with no name at all.
+    pub toolbar_region: &'static str,
+    pub hidden_folders: &'static str,
+    pub open_folder: &'static str,
+    pub status_region: &'static str,
+    pub progress_region: &'static str,
+    pub cannot_open: &'static str,
+    pub empty_archive: &'static str,
+    pub empty_folder: &'static str,
+    pub no_matches: &'static str,
+    pub archive_contents: &'static str,
+    pub waiting_picker: &'static str,
+    pub ascending: &'static str,
+    pub descending: &'static str,
+    pub not_checked: &'static str,
+    pub show_word: &'static str,
+    pub hide_word: &'static str,
+    pub working_word: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -362,6 +383,23 @@ const EN: Strings = Strings {
     toggle_word: "Tick or untick",
     jump_word: "Jump to a name",
     move_word: "Move around the list",
+    toolbar_region: "Archive actions",
+    hidden_folders: "Hidden folders",
+    open_folder: "Open folder {name}",
+    status_region: "Archive status",
+    progress_region: "Operation progress",
+    cannot_open: "This archive could not be opened",
+    empty_archive: "This archive has no entries",
+    empty_folder: "This folder is empty",
+    no_matches: "Nothing matches the filter",
+    archive_contents: "Archive contents",
+    waiting_picker: "Waiting for the system dialog...",
+    ascending: "ascending",
+    descending: "descending",
+    not_checked: "not checked",
+    show_word: "Show",
+    hide_word: "Hide",
+    working_word: "Working",
 };
 
 const ES: Strings = Strings {
@@ -526,6 +564,23 @@ const ES: Strings = Strings {
     toggle_word: "Marcar o desmarcar",
     jump_word: "Saltar a un nombre",
     move_word: "Moverse por la lista",
+    toolbar_region: "Acciones del archivo",
+    hidden_folders: "Carpetas ocultas",
+    open_folder: "Abrir la carpeta {name}",
+    status_region: "Estado del archivo",
+    progress_region: "Progreso de la operación",
+    cannot_open: "Este archivo no se ha podido abrir",
+    empty_archive: "Este archivo no tiene entradas",
+    empty_folder: "Esta carpeta está vacía",
+    no_matches: "Nada coincide con el filtro",
+    archive_contents: "Contenido del archivo",
+    waiting_picker: "Esperando al diálogo del sistema...",
+    ascending: "ascendente",
+    descending: "descendente",
+    not_checked: "sin marcar",
+    show_word: "Mostrar",
+    hide_word: "Ocultar",
+    working_word: "Trabajando",
 };
 
 pub fn strings(l: Lang) -> &'static Strings {

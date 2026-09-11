@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// The GPUI feature shares the controller with the legacy egui implementation;
+// the latter remains compiled for the transition but is not called by GPUI.
+#![cfg_attr(feature = "gpui", allow(dead_code))]
 
 mod clipboard;
 mod glyphs;
