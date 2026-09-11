@@ -564,6 +564,14 @@ struct GpuiShell {
     settings_focus: Vec<FocusHandle>,
     /// Which row the right button was pressed on, and where the pointer was,
     /// so the menu opens under it instead of in a fixed corner.
+    /// The band being drawn, while it is being drawn.
+    band: Option<Band>,
+    /// The wheel used as a button: press it and the list runs towards the
+    /// pointer until something puts it away.
+    wheel: Option<WheelPan>,
+    /// Where the pointer was last seen, so the tick that keeps the list running
+    /// knows which way to go without an event of its own.
+    pointer: gpui::Point<gpui::Pixels>,
     /// Which column edge is in hand: its slot in `Settings::widths`, where the
     /// pointer was when it was grabbed, and how wide the column was then.
     /// Kept as the state at the grab rather than as a running delta, so a
@@ -795,6 +803,11 @@ impl GpuiShell {
                 if view
                     .update_in(async_cx, |shell, window, cx| {
                         shell.poll_dialog(window, cx);
+                        // The list keeps running while the hand is still, which
+                        // is the whole point of the gesture: without a step
+                        // here it would only move on a stray mouse event.
+                        let pointer = shell.pointer;
+                        shell.tick_wheel(pointer);
                         shell.controller.ask_about_updates();
                         let conflict_was_open = shell.controller.state.conflict.is_some();
                         let close_window = shell.controller.receive();
@@ -866,6 +879,9 @@ impl GpuiShell {
                 .iter()
                 .map(|_| cx.focus_handle().tab_stop(true))
                 .collect(),
+            band: None,
+            wheel: None,
+            pointer: point(px(0.), px(0.)),
             resizing: None,
             row_menu: None,
             row_menu_focus: cx.focus_handle(),
@@ -2947,6 +2963,176 @@ impl GpuiShell {
         menu
     }
 
+    /// The list's geometry, or nothing before it has been laid out once.
+    fn list_view(&self) -> Option<ListView> {
+        let state = self.list_scroll.0.borrow();
+        let row = f32::from(state.last_item_size?.item.height);
+        if row <= 0.0 {
+            return None;
+        }
+        let bounds = state.base_handle.bounds();
+        let top = f32::from(bounds.origin.y);
+        let left = f32::from(bounds.origin.x);
+        let height = f32::from(bounds.size.height);
+        if height <= 0.0 {
+            return None;
+        }
+        Some(ListView {
+            top,
+            bottom: top + height,
+            left,
+            right: left + f32::from(bounds.size.width),
+            row,
+            offset: -f32::from(state.base_handle.offset().y),
+            reach: f32::from(state.base_handle.max_offset().y),
+        })
+    }
+
+    fn scroll_to(&self, view: &ListView, offset: f32) {
+        let state = self.list_scroll.0.borrow();
+        let x = state.base_handle.offset().x;
+        state
+            .base_handle
+            .set_offset(point(x, px(-offset.clamp(0.0, view.reach))));
+    }
+
+    /// The row under a point, or nothing if that is past the last one.
+    fn row_under(view: &ListView, y: f32, len: usize) -> Option<usize> {
+        let local = y - view.top + view.offset;
+        if local < 0.0 || view.row <= 0.0 {
+            return None;
+        }
+        let index = (local / view.row) as usize;
+        (index < len).then_some(index)
+    }
+
+    /// Pressing the left button inside the list, which is where a band begins.
+    ///
+    /// Pressing on a row that is already picked and pulling is how you take the
+    /// selection somewhere else, so that one is left to the drag; pressing
+    /// anywhere else and pulling draws a new band. That is the rule in the
+    /// Explorer, and it is the only one that lets both gestures share a button.
+    fn begin_band(&mut self, at: gpui::Point<gpui::Pixels>, secondary: bool, shift: bool) {
+        if !self.background_idle() || shift {
+            return;
+        }
+        let Some(view) = self.list_view() else { return };
+        let (x, y) = (f32::from(at.x), f32::from(at.y));
+        if y < view.top || y > view.bottom || x < view.left || x > view.right {
+            return;
+        }
+        let rows = self.controller.visible_rows();
+        let anchor = Self::row_under(&view, y, rows.len());
+        if let Some(index) = anchor {
+            if !secondary && self.controller.is_checked(&rows[index]) {
+                return;
+            }
+        }
+        self.band = Some(Band {
+            origin: at,
+            // Begun in the empty space under the list, where there is no row to
+            // hang the band on: it still picks everything between there and
+            // wherever it goes.
+            anchor: anchor.unwrap_or(rows.len().saturating_sub(1)),
+            base: if secondary {
+                self.controller.state.checked.clone()
+            } else {
+                vec![false; self.controller.state.checked.len()]
+            },
+            head: at,
+            live: false,
+        });
+    }
+
+    /// The band following the pointer, and the list following it past an edge.
+    fn drag_band(&mut self, at: gpui::Point<gpui::Pixels>) -> bool {
+        let Some(band) = &mut self.band else {
+            return false;
+        };
+        band.head = at;
+        let travelled = (f32::from(at.x) - f32::from(band.origin.x)).hypot(
+            f32::from(at.y) - f32::from(band.origin.y),
+        );
+        if !band.live && travelled < DRAG_SLOP {
+            return false;
+        }
+        band.live = true;
+        let anchor = band.anchor;
+        let base = band.base.clone();
+        let Some(view) = self.list_view() else {
+            return false;
+        };
+        let rows = self.controller.visible_rows();
+        if rows.is_empty() {
+            return false;
+        }
+        let y = f32::from(at.y);
+        let head = Self::row_under(&view, y.clamp(view.top, view.bottom), rows.len())
+            .unwrap_or(rows.len() - 1);
+        let (lo, hi) = if anchor <= head {
+            (anchor, head)
+        } else {
+            (head, anchor)
+        };
+        self.controller.state.checked.clone_from(&base);
+        for row in &rows[lo..=hi.min(rows.len() - 1)] {
+            self.controller.set_checked(row, true);
+        }
+        // Past either edge the list follows the pointer, the way the Explorer
+        // does it. Without this a selection could never be longer than the
+        // window, because dragging no longer scrolls.
+        let over = if y < view.top {
+            y - view.top
+        } else if y > view.bottom {
+            y - view.bottom
+        } else {
+            0.0
+        };
+        if over != 0.0 {
+            self.scroll_to(&view, view.offset + over.clamp(-24.0, 24.0));
+        }
+        true
+    }
+
+    /// Drops the anchor, or picks it back up.
+    fn toggle_wheel(&mut self, at: gpui::Point<gpui::Pixels>) {
+        if self.wheel.is_some() || !self.background_idle() {
+            self.wheel = None;
+            return;
+        }
+        let Some(view) = self.list_view() else { return };
+        let (x, y) = (f32::from(at.x), f32::from(at.y));
+        if y < view.top || y > view.bottom || x < view.left || x > view.right {
+            return;
+        }
+        self.wheel = Some(WheelPan {
+            anchor: at,
+            moved: false,
+        });
+    }
+
+    /// One step of the list running towards the pointer, for the tick that
+    /// keeps a gesture moving while the hand is still.
+    ///
+    /// ponytail: driven by the shell's existing 100 ms poll rather than by a
+    /// frame callback, so the run is ten steps a second. Move it onto a frame
+    /// request if the stepping ever reads as stutter.
+    fn tick_wheel(&mut self, at: gpui::Point<gpui::Pixels>) -> bool {
+        let Some(wheel) = &mut self.wheel else {
+            return false;
+        };
+        let speed = super::wheel_speed(f32::from(at.y) - f32::from(wheel.anchor.y));
+        wheel.moved |= speed != 0.0;
+        if speed == 0.0 {
+            return false;
+        }
+        let Some(view) = self.list_view() else {
+            return false;
+        };
+        self.scroll_to(&view, view.offset + speed * 0.1);
+        true
+    }
+
     /// Whether the keyboard is inside a text field.
     ///
     /// A bare key means something different there -- F5 in a filter box is a
@@ -3022,7 +3208,13 @@ impl GpuiShell {
                 }
             }
             Shortcut::Invert => self.controller.dispatch(AppAction::InvertVisible),
-            Shortcut::ClearSelection => self.controller.dispatch(AppAction::ClearSelection),
+            // Escape backs out of the innermost thing there is to back out of,
+            // and while the list is running itself that is the running.
+            Shortcut::ClearSelection => {
+                if self.wheel.take().is_none() {
+                    self.controller.dispatch(AppAction::ClearSelection);
+                }
+            }
             // The names as text, which is all a desktop without a file
             // clipboard can be given, and useful on one that has it too.
             Shortcut::CopyNames => {
@@ -3749,6 +3941,15 @@ impl GpuiShell {
     ) {
         if self.background_blocked() || !event.standard_click() {
             return;
+        }
+        // A click is a drag of no distance. Anything further than that was a
+        // band or a carry, and the row it started on is not being clicked.
+        if let ClickEvent::Mouse(mouse) = event {
+            let travelled = (f32::from(mouse.up.position.x) - f32::from(mouse.down.position.x))
+                .hypot(f32::from(mouse.up.position.y) - f32::from(mouse.down.position.y));
+            if travelled >= DRAG_SLOP {
+                return;
+            }
         }
         let rows = self.controller.visible_rows();
         let Some(target) = rows.get(index).cloned() else {
@@ -4483,28 +4684,97 @@ impl Render for GpuiShell {
                         });
                     });
 
-                    // A column edge in hand has to keep following the pointer
-                    // after it has left the six pixels it was grabbed by, so
-                    // the move and the release are watched on the window and
-                    // not on the strip.
+                    // A column edge in hand, a band being pulled, and the list
+                    // running after the pointer all have to keep working once
+                    // the pointer has left the thing it started on, so the move
+                    // and the release are watched on the window.
                     let dragging = view.clone();
-                    window.on_mouse_event(move |event: &gpui::MouseMoveEvent, _, _, app| {
+                    window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, app| {
+                        if !phase.bubble() {
+                            return;
+                        }
                         dragging.update(app, |shell, cx| {
-                            let Some((slot, from, width)) = shell.resizing else {
-                                return;
-                            };
-                            shell.set_column_width(slot, width + f32::from(event.position.x) - from);
-                            cx.notify();
+                            shell.pointer = event.position;
+                            let mut moved = false;
+                            if let Some((slot, from, width)) = shell.resizing {
+                                shell
+                                    .set_column_width(slot, width + f32::from(event.position.x) - from);
+                                moved = true;
+                            }
+                            moved |= shell.drag_band(event.position);
+                            moved |= shell.wheel.is_some();
+                            if moved {
+                                cx.notify();
+                            }
+                        });
+                    });
+                    let pressed = view.clone();
+                    window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, _, app| {
+                        if !phase.bubble() {
+                            return;
+                        }
+                        pressed.update(app, |shell, cx| {
+                            match event.button {
+                                // Pressing the wheel again puts it away, the way
+                                // it does in a browser.
+                                gpui::MouseButton::Middle => {
+                                    shell.toggle_wheel(event.position);
+                                    cx.notify();
+                                }
+                                // Any other button is somebody asking for
+                                // something else.
+                                _ if shell.wheel.is_some() => {
+                                    shell.wheel = None;
+                                    cx.notify();
+                                }
+                                gpui::MouseButton::Left => {
+                                    shell.begin_band(
+                                        event.position,
+                                        event.modifiers.secondary(),
+                                        event.modifiers.shift,
+                                    );
+                                }
+                                _ => {}
+                            }
                         });
                     });
                     let released = view.clone();
-                    window.on_mouse_event(move |_: &gpui::MouseUpEvent, _, _, app| {
+                    window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, _, app| {
+                        if !phase.bubble() {
+                            return;
+                        }
                         released.update(app, |shell, cx| {
+                            let mut changed = shell.band.take().is_some_and(|band| band.live);
                             if shell.resizing.take().is_some() {
                                 // Written when the hand lets go rather than on
                                 // the way, so pulling an edge across the window
                                 // is one visit to the disk and not one a frame.
                                 shell.controller.state.settings.save();
+                                changed = true;
+                            }
+                            // Held down and pulled: the gesture ends where the
+                            // hand lets go. Let go without having pulled and it
+                            // stays on, waiting.
+                            if event.button == gpui::MouseButton::Middle
+                                && shell.wheel.as_ref().is_some_and(|wheel| wheel.moved)
+                            {
+                                shell.wheel = None;
+                                changed = true;
+                            }
+                            if changed {
+                                cx.notify();
+                            }
+                        });
+                    });
+                    // The wheel turning is somebody scrolling by hand, which is
+                    // asking for something other than the list running itself.
+                    let spun = view.clone();
+                    window.on_mouse_event(move |_: &gpui::ScrollWheelEvent, phase, _, app| {
+                        if !phase.bubble() {
+                            return;
+                        }
+                        spun.update(app, |shell, cx| {
+                            if shell.wheel.take().is_some() {
                                 cx.notify();
                             }
                         });
@@ -5169,6 +5439,65 @@ impl Render for GpuiShell {
             }
             root = root.child(menu);
         }
+        // The band, and the anchor the wheel dropped. Both are drawn over
+        // everything rather than inside the list, because the hand is free to
+        // wander off it while either gesture runs and a mark that vanished at
+        // the edge would be worse than no mark at all.
+        if let Some(band) = self.band.as_ref().filter(|band| band.live) {
+            if let Some(view) = self.list_view() {
+                let (x0, x1) = minmax(band.origin.x, band.head.x);
+                let (y0, y1) = minmax(band.origin.y, band.head.y);
+                let top = y0.max(view.top);
+                let bottom = y1.min(view.bottom);
+                if bottom > top {
+                    // A quarter of the selection ink, so the rows underneath
+                    // stay readable while they are being swept: the band says
+                    // what it is reaching, and a solid one would hide it.
+                    // Nothing is occluded either, because the pointer has to
+                    // keep being followed through it.
+                    let mut fill = cx.theme().selection;
+                    fill.a *= 0.25;
+                    root = root.child(
+                        div()
+                            .id("selection-band")
+                            .absolute()
+                            .left(px(x0))
+                            .top(px(top))
+                            .w(px((x1 - x0).max(1.0)))
+                            .h(px(bottom - top))
+                            .bg(fill)
+                            .border_1()
+                            .border_color(cx.theme().ring),
+                    );
+                }
+            }
+        }
+        if let Some(wheel) = &self.wheel {
+            // A ring with a dot in it, left where the wheel went down: the mark
+            // Windows leaves, so it reads as the same gesture rather than as
+            // one of ours.
+            root = root.child(
+                div()
+                    .id("wheel-anchor")
+                    .absolute()
+                    .left(px(f32::from(wheel.anchor.x) - 10.0))
+                    .top(px(f32::from(wheel.anchor.y) - 10.0))
+                    .size(px(20.))
+                    .rounded_full()
+                    .bg(cx.theme().popover)
+                    .border_1()
+                    .border_color(cx.theme().muted_foreground)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .size(px(3.))
+                            .rounded_full()
+                            .bg(cx.theme().muted_foreground),
+                    ),
+            );
+        }
         if let Some((index, at)) = self.row_menu {
             root = root.child(self.row_menu_view(index, at, cx));
         }
@@ -5215,6 +5544,57 @@ enum OverflowAction {
     SaveCopy,
     DefaultPassword,
 }
+
+/// A selection being drawn by pulling across the list.
+struct Band {
+    /// Where the button went down, in window coordinates.
+    origin: gpui::Point<gpui::Pixels>,
+    /// The row it went down on. Two row numbers rather than a rectangle: the
+    /// list moves underneath while the drag happens, and a rectangle frozen
+    /// where the button went down stops meaning anything the moment it does.
+    anchor: usize,
+    /// What was picked before it started, so that Ctrl adds to a selection and
+    /// a plain drag replaces one.
+    base: Vec<bool>,
+    /// Where the pointer is now, which is the other end of the band.
+    head: gpui::Point<gpui::Pixels>,
+    /// Whether it has been pulled far enough to be a gesture rather than a
+    /// click. A click is a drag of no distance, and under this it is left
+    /// alone so clicking a row still means clicking a row.
+    live: bool,
+}
+
+/// The anchor the wheel dropped, and whether the pointer has pulled away from
+/// it yet. Letting the wheel go after it has ends the gesture; letting it go
+/// before leaves it running until the next click, which is what makes
+/// press-and-drag and click-and-go both work off the one button.
+struct WheelPan {
+    anchor: gpui::Point<gpui::Pixels>,
+    moved: bool,
+}
+
+/// Where the list is on screen, how tall a row is and how far down it is
+/// scrolled: everything the two pointer gestures need, read off the one scroll
+/// handle rather than measured again.
+struct ListView {
+    top: f32,
+    bottom: f32,
+    left: f32,
+    right: f32,
+    row: f32,
+    /// How far down the list is. GPUI keeps this as a negative offset; it is
+    /// turned the right way up here so the arithmetic below reads like the
+    /// list does.
+    offset: f32,
+    reach: f32,
+}
+
+/// How far a click may travel and still be a click.
+///
+/// Further than GPUI waits before calling a drag a drag, on purpose: a band
+/// that appeared first would flash over the rows for the pixel or two between
+/// the two thresholds every time a column was resized.
+const DRAG_SLOP: f32 = 10.0;
 
 /// The selection while it is in the air. An empty marker rather than the rows
 /// themselves: what is carried is whatever is picked when it lands, and the
@@ -5288,6 +5668,16 @@ fn shortcut_for(
         "+" | "plus" | "add" => Some(Shortcut::PickGroup(true)),
         "-" | "minus" | "subtract" => Some(Shortcut::PickGroup(false)),
         _ => None,
+    }
+}
+
+/// The two ends of a span, in the order they are drawn in.
+fn minmax(a: gpui::Pixels, b: gpui::Pixels) -> (f32, f32) {
+    let (a, b) = (f32::from(a), f32::from(b));
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
     }
 }
 
@@ -5527,6 +5917,38 @@ mod tests {
         let paths = vec![PathBuf::from("queued.zip")];
         assert_eq!(drop_paths_for_enter(&paths, true), paths);
         assert!(drop_paths_for_enter(&paths, false).is_empty());
+    }
+
+    #[test]
+    fn a_point_lands_on_the_row_that_is_drawn_under_it() {
+        // The list is virtualized, so which row a pointer is over is arithmetic
+        // on the scroll offset and not a rectangle anybody kept. Off by one row
+        // here and a band would pick everything one place along.
+        let view = ListView {
+            top: 100.0,
+            bottom: 360.0,
+            left: 0.0,
+            right: 800.0,
+            row: 26.0,
+            offset: 0.0,
+            reach: 1000.0,
+        };
+        assert_eq!(GpuiShell::row_under(&view, 100.0, 50), Some(0));
+        assert_eq!(GpuiShell::row_under(&view, 125.9, 50), Some(0));
+        assert_eq!(GpuiShell::row_under(&view, 126.0, 50), Some(1));
+        // Above the first row is no row at all, not the first one.
+        assert_eq!(GpuiShell::row_under(&view, 99.0, 50), None);
+        // And past the last there is nothing either, however far down it is.
+        assert_eq!(GpuiShell::row_under(&view, 100.0, 0), None);
+        assert_eq!(GpuiShell::row_under(&view, 100.0 + 26.0 * 3.0, 3), None);
+
+        // Scrolled down by ten rows, the top of the list is row ten.
+        let scrolled = ListView {
+            offset: 260.0,
+            ..view
+        };
+        assert_eq!(GpuiShell::row_under(&scrolled, 100.0, 50), Some(10));
+        assert_eq!(GpuiShell::row_under(&scrolled, 126.0, 50), Some(11));
     }
 
     #[test]
