@@ -76,7 +76,12 @@ jobs:
           libfontconfig1-dev
 
       - name: Build release binaries
+        if: matrix.os != 'windows-latest'
         run: cargo build --release
+
+      - name: Build Windows release binaries
+        if: matrix.os == 'windows-latest'
+        run: cargo build --release --target x86_64-pc-windows-msvc
 
       # Keep the install smoke test beside the build that produced its binaries.
       - name: Installer smoke test
