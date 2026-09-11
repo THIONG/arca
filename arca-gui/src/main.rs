@@ -3623,6 +3623,48 @@ impl AppController {
             Codec::Zstd => s.codec_zstd,
         }
     }
+    // Dragging the selection out of the window. Blocks until it has been
+    // dropped or abandoned, because that is what `DoDragDrop` does: the window
+    // stops repainting for as long as the drag lasts, which nobody sees because
+    // the pointer is somewhere else by then.
+    //
+    // Nothing is extracted here. The shell is handed a list of names and sizes
+    // and asks for one file at a time while it is dropping, so a drag that is
+    // thought better of costs nothing, and a drag of six gigabytes starts as
+    // fast as a drag of one file.
+    #[cfg(windows)]
+    fn drag_out(&mut self) {
+        let Some(archive) = self.state.archive.clone() else {
+            return;
+        };
+        let picked = self.dragged_files();
+        if picked.is_empty() {
+            return;
+        }
+        let items: Vec<arca_drag::Item> = picked
+            .iter()
+            .map(|(e, name)| arca_drag::Item {
+                name: name.clone(),
+                size: e.size,
+                mtime: e.mtime,
+            })
+            .collect();
+        let password = self.state.archive_password.clone();
+        let entries: Vec<Entry> = picked.into_iter().map(|(e, _)| e).collect();
+        let deliver = Box::new(move |i: usize| {
+            entries
+                .get(i)
+                .and_then(|e| extract_one(&archive, e, password.as_deref()).ok())
+        });
+        // Copy only. Moving would mean taking the entries out of the archive,
+        // and the one gesture that does that already asks first.
+        let _ = arca_drag::drag(items, deliver, false);
+        // However it ended -- dropped, or called off with Escape -- the button
+        // that started it went up somewhere this window never saw.
+        self.state.drag_settling = true;
+    }
+
+    #[cfg(not(windows))]
     fn drag_out(&mut self) {}
 
     // Ctrl+V: whatever files the shell is holding, into the folder on screen.

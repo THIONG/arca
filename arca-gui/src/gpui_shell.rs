@@ -573,6 +573,9 @@ struct GpuiShell {
     /// Where the pointer was last seen, so the tick that keeps the list running
     /// knows which way to go without an event of its own.
     pointer: gpui::Point<gpui::Pixels>,
+    /// A selection is in the air. Where it lands is not decided until it leaves
+    /// the list or is dropped on a folder.
+    carrying: bool,
     /// Which column edge is in hand: its slot in `Settings::widths`, where the
     /// pointer was when it was grabbed, and how wide the column was then.
     /// Kept as the state at the grab rather than as a running delta, so a
@@ -890,6 +893,7 @@ impl GpuiShell {
             band: None,
             wheel: None,
             pointer: point(px(0.), px(0.)),
+            carrying: false,
             resizing: None,
             row_menu: None,
             row_menu_focus: cx.focus_handle(),
@@ -3003,12 +3007,9 @@ impl GpuiShell {
     }
 
     /// The list's geometry, or nothing before it has been laid out once.
-    fn list_view(&self) -> Option<ListView> {
+    fn list_view(&self, count: usize) -> Option<ListView> {
         let state = self.list_scroll.0.borrow();
-        let row = f32::from(state.last_item_size?.item.height);
-        if row <= 0.0 {
-            return None;
-        }
+        let row = row_height(f32::from(state.last_item_size?.contents.height), count)?;
         let bounds = state.base_handle.bounds();
         let top = f32::from(bounds.origin.y);
         let left = f32::from(bounds.origin.x);
@@ -3025,6 +3026,17 @@ impl GpuiShell {
             offset: -f32::from(state.base_handle.offset().y),
             reach: f32::from(state.base_handle.max_offset().y),
         })
+    }
+
+    /// Whether the pointer has left the list. What is being carried goes to the
+    /// system from here; inside, it is still a move between folders.
+    fn left_the_list(&self, at: gpui::Point<gpui::Pixels>) -> bool {
+        let count = self.controller.visible_rows().len();
+        let Some(view) = self.list_view(count) else {
+            return false;
+        };
+        let (x, y) = (f32::from(at.x), f32::from(at.y));
+        y < view.top || y > view.bottom || x < view.left || x > view.right
     }
 
     fn scroll_to(&self, view: &ListView, offset: f32) {
@@ -3055,12 +3067,14 @@ impl GpuiShell {
         if !self.background_idle() || shift {
             return;
         }
-        let Some(view) = self.list_view() else { return };
+        let rows = self.controller.visible_rows();
+        let Some(view) = self.list_view(rows.len()) else {
+            return;
+        };
         let (x, y) = (f32::from(at.x), f32::from(at.y));
         if y < view.top || y > view.bottom || x < view.left || x > view.right {
             return;
         }
-        let rows = self.controller.visible_rows();
         let anchor = Self::row_under(&view, y, rows.len());
         if let Some(index) = anchor {
             if !secondary && self.controller.is_checked(&rows[index]) {
@@ -3098,13 +3112,10 @@ impl GpuiShell {
         band.live = true;
         let anchor = band.anchor;
         let base = band.base.clone();
-        let Some(view) = self.list_view() else {
+        let rows = self.controller.visible_rows();
+        let Some(view) = self.list_view(rows.len()) else {
             return false;
         };
-        let rows = self.controller.visible_rows();
-        if rows.is_empty() {
-            return false;
-        }
         let y = f32::from(at.y);
         let head = Self::row_under(&view, y.clamp(view.top, view.bottom), rows.len())
             .unwrap_or(rows.len() - 1);
@@ -3139,7 +3150,10 @@ impl GpuiShell {
             self.wheel = None;
             return;
         }
-        let Some(view) = self.list_view() else { return };
+        let count = self.controller.visible_rows().len();
+        let Some(view) = self.list_view(count) else {
+            return;
+        };
         let (x, y) = (f32::from(at.x), f32::from(at.y));
         if y < view.top || y > view.bottom || x < view.left || x > view.right {
             return;
@@ -3165,7 +3179,8 @@ impl GpuiShell {
         if speed == 0.0 {
             return false;
         }
-        let Some(view) = self.list_view() else {
+        let count = self.controller.visible_rows().len();
+        let Some(view) = self.list_view(count) else {
             return false;
         };
         self.scroll_to(&view, view.offset + speed * 0.1);
@@ -3936,36 +3951,19 @@ impl GpuiShell {
                 ));
             }
 
-            // GPUI owns the threshold and gesture lifetime. Where the drag is
-            // going is not decided here: a folder of this archive takes it as a
-            // move, and everything else on Windows hands it to arca-drag's lazy
+            // GPUI owns the threshold and the gesture's lifetime. Where the
+            // drag is going is not decided here: a folder of this archive takes
+            // it as a move, and leaving the list hands it to arca-drag's lazy
             // IDataObject, so no archive bytes are extracted merely to begin a
-            // drag. On other platforms there is no drag out, because arca-drag
-            // has no backend there, but a move inside the archive still works.
+            // drag. That second half is watched on the window rather than on
+            // the row -- the pointer leaves the row it started on as soon as it
+            // reaches the next one, which is not leaving the list.
             if selected {
+                let shell = cx.entity();
                 item = item.on_drag(DraggedRows, move |_, _, _window, app| {
+                    let _ = shell.update(app, |shell, _| shell.carrying = true);
                     app.new(|_| gpui::Empty)
                 });
-                #[cfg(windows)]
-                {
-                    let shell = cx.entity();
-                    item = item.on_drag_move(move |event: &gpui::DragMoveEvent<DraggedRows>, window, app| {
-                        // Out of the list is out of the archive. Started here
-                        // rather than at the press, because the instant the
-                        // native drag begins the system takes the pointer and
-                        // there is no way back into the list.
-                        if event.bounds.contains(&event.event.position) {
-                            return;
-                        }
-                        let _ = shell.update(app, |shell, cx| {
-                            shell.controller.drag_out();
-                            cx.notify();
-                        });
-                        window.on_next_frame(|window, app| {
-                            app.stop_active_drag(window);
-                        });
-                    });
-                }
             }
         }
         item
@@ -4747,11 +4745,11 @@ impl Render for GpuiShell {
                     // the pointer has left the thing it started on, so the move
                     // and the release are watched on the window.
                     let dragging = view.clone();
-                    window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, app| {
+                    window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, window, app| {
                         if !phase.bubble() {
                             return;
                         }
-                        dragging.update(app, |shell, cx| {
+                        let leaving = dragging.update(app, |shell, cx| {
                             shell.pointer = event.position;
                             let mut moved = false;
                             if let Some((slot, from, width)) = shell.resizing {
@@ -4764,7 +4762,20 @@ impl Render for GpuiShell {
                             if moved {
                                 cx.notify();
                             }
+                            shell.carrying && shell.left_the_list(event.position)
                         });
+                        // Out of the list is out of the archive. Started here
+                        // and not at the press, because the instant the native
+                        // drag begins the system takes the pointer and there is
+                        // no way back into the list to drop on a folder.
+                        if leaving {
+                            app.stop_active_drag(window);
+                            let _ = dragging.update(app, |shell, cx| {
+                                shell.carrying = false;
+                                shell.controller.drag_out();
+                                cx.notify();
+                            });
+                        }
                     });
                     let pressed = view.clone();
                     window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, _, app| {
@@ -4803,6 +4814,7 @@ impl Render for GpuiShell {
                         }
                         released.update(app, |shell, cx| {
                             let mut changed = shell.band.take().is_some_and(|band| band.live);
+                            shell.carrying = false;
                             if shell.resizing.take().is_some() {
                                 // Written when the hand lets go rather than on
                                 // the way, so pulling an edge across the window
@@ -5534,7 +5546,7 @@ impl Render for GpuiShell {
         // wander off it while either gesture runs and a mark that vanished at
         // the edge would be worse than no mark at all.
         if let Some(band) = self.band.as_ref().filter(|band| band.live) {
-            if let Some(view) = self.list_view() {
+            if let Some(view) = self.list_view(visible) {
                 let (x0, x1) = minmax(band.origin.x, band.head.x);
                 let (y0, y1) = minmax(band.origin.y, band.head.y);
                 let top = y0.max(view.top);
@@ -5762,6 +5774,20 @@ fn shortcut_for(
         "-" | "minus" | "subtract" => Some(Shortcut::PickGroup(false)),
         _ => None,
     }
+}
+
+/// How tall one row is, from the height of everything and how many there are.
+///
+/// Not `last_item_size.item`, whatever that name suggests: that field holds the
+/// size of the whole viewport. Reading it as a row height divided by four
+/// hundred instead of by twenty-eight, which put every pointer on the first row
+/// and left the band picking nothing.
+fn row_height(contents: f32, count: usize) -> Option<f32> {
+    if count == 0 || contents <= 0.0 {
+        return None;
+    }
+    let row = contents / count as f32;
+    (row > 0.0).then_some(row)
 }
 
 /// The two ends of a span, in the order they are drawn in.
@@ -6011,6 +6037,18 @@ mod tests {
         let paths = vec![PathBuf::from("queued.zip")];
         assert_eq!(drop_paths_for_enter(&paths, true), paths);
         assert!(drop_paths_for_enter(&paths, false).is_empty());
+    }
+
+    #[test]
+    fn the_row_height_comes_from_the_content_and_not_from_the_viewport() {
+        // A list showing fifty rows of twenty-eight pixels has fourteen hundred
+        // pixels of content and a viewport of whatever the window left it. The
+        // viewport is what `last_item_size.item` holds, so reading that as a
+        // row height divided by four hundred instead of by twenty-eight: every
+        // pointer landed on the first row and the band picked nothing.
+        assert_eq!(row_height(1400.0, 50), Some(28.0));
+        assert_eq!(row_height(1400.0, 0), None, "an empty list has no rows");
+        assert_eq!(row_height(0.0, 50), None, "nor has one not laid out yet");
     }
 
     #[test]
