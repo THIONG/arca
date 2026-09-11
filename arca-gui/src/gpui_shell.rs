@@ -24,8 +24,11 @@ use gpui::{
 };
 use gpui_component::separator::Separator;
 use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::status_bar::StatusBar;
-use gpui_component::{TitleBar, TITLE_BAR_HEIGHT};
+use gpui_component::tooltip::Tooltip;
+use gpui_component::{Disableable, TitleBar, TITLE_BAR_HEIGHT};
 use gpui_component::{ActiveTheme, Icon, IconName};
 use gpui_platform::application;
 use std::ops::Range;
@@ -1256,9 +1259,11 @@ impl GpuiShell {
         enabled: bool,
         cx: &App,
     ) -> Stateful<gpui::Div> {
+        let tooltip = accessible_name.clone();
         let mut button = div()
             .id(id)
             .aria_label(accessible_name)
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
             .size(px(26.))
             .flex_none()
             .flex()
@@ -1282,6 +1287,19 @@ impl GpuiShell {
             button = button.tab_stop(false);
         }
         button
+    }
+
+    fn popup_action(
+        owner: WeakEntity<GpuiShell>,
+        label: impl Into<gpui::SharedString>,
+        action: OverflowAction,
+    ) -> PopupMenuItem {
+        PopupMenuItem::new(label).on_click(move |_, _, cx| {
+            let _ = owner.update(cx, |this, cx| {
+                this.overflow_action(action, cx);
+                cx.notify();
+            });
+        })
     }
 
     /// A row of the menu: what it does on the left, the keys that do the same
@@ -4351,14 +4369,20 @@ impl Render for GpuiShell {
             .w_full()
             .flex()
             .items_center()
-            .gap_1();
+            .gap_2();
         if !self.background_blocked() {
             toolbar = toolbar.role(Role::Toolbar);
         }
 
-        let open = Self::button("open", s.open, format!("{} (Ctrl+O)", s.open), idle, cx)
-            .aria_keyshortcuts("Control+O")
-            .track_focus(&self.open_trigger_focus);
+        let open = Self::icon_button(
+            "open",
+            IconName::FolderOpen,
+            format!("{} (Ctrl+O)", s.open),
+            idle,
+            cx,
+        )
+        .aria_keyshortcuts("Control+O")
+        .track_focus(&self.open_trigger_focus);
         toolbar = toolbar.child(open.on_click(cx.listener(|this, _, window, cx| {
             if this.background_idle() {
                 this.dialog_return_focus = this.open_trigger_focus.clone();
@@ -4366,13 +4390,14 @@ impl Render for GpuiShell {
                 window.focus(&this.open_trigger_focus, cx);
             }
         })));
-        let compress = Self::button(
+        let compress = Self::icon_button(
             "compress",
-            s.compress,
+            IconName::Inbox,
             format!("{} (Ctrl+N)", s.compress),
             idle,
             cx,
         )
+        .aria_keyshortcuts("Control+N")
         .track_focus(&self.compress_trigger_focus);
         toolbar = toolbar.child(compress.on_click(cx.listener(|this, _, window, cx| {
             if this.background_idle() {
@@ -4383,13 +4408,14 @@ impl Render for GpuiShell {
         })));
         toolbar = toolbar.child(div().px_1().child(Separator::vertical().h(px(16.))));
 
-        let extract_all = Self::button(
+        let extract_all = Self::icon_button(
             "extract-all",
-            s.extract_all,
+            IconName::PanelBottomOpen,
             format!("{} (Ctrl+E)", s.extract_all),
             can_extract,
             cx,
         )
+        .aria_keyshortcuts("Control+E")
         .track_focus(&self.extract_all_trigger_focus);
         toolbar = toolbar.child(extract_all.on_click(cx.listener(|this, _, window, cx| {
             if !this.background_idle() {
@@ -4404,9 +4430,9 @@ impl Render for GpuiShell {
                 cx,
             );
         })));
-        let extract_selected = Self::button(
+        let extract_selected = Self::icon_button(
             "extract-selected",
-            s.extract_selected,
+            IconName::File,
             s.extract_selected.to_string(),
             can_extract_selected,
             cx,
@@ -4422,9 +4448,9 @@ impl Render for GpuiShell {
                 this.begin_dialog(DialogKind::Extract { only_checked: true }, cx);
             })),
         );
-        let password = Self::button(
+        let password = Self::icon_button(
             "password",
-            s.password_word,
+            IconName::EyeOff,
             format!("{} / {}", s.set_password, s.remove_password),
             password_available,
             cx,
@@ -4439,20 +4465,295 @@ impl Render for GpuiShell {
             }
         })));
         toolbar = toolbar.child(div().px_1().child(Separator::vertical().h(px(16.))));
-        let overflow = Self::button("overflow", s.more_word, s.more_word.to_string(), idle, cx)
-            .track_focus(&self.overflow_trigger_focus)
-            .aria_expanded(self.overflow_open);
-        toolbar = toolbar.child(overflow.on_click(cx.listener(|this, _, window, cx| {
-            if this.menu_enabled() {
-                this.overflow_open = !this.overflow_open;
-                this.breadcrumbs_open = false;
-                if this.overflow_open {
-                    let menu_focus = this.overflow_item_focus[0].clone();
-                    window.on_next_frame(move |window, cx| window.focus(&menu_focus, cx));
-                }
-                cx.notify();
-            }
-        })));
+        let owner = cx.entity().downgrade();
+        let recent = self
+            .controller
+            .state
+            .settings
+            .recent
+            .iter()
+            .take(RECENT_MAX)
+            .cloned()
+            .collect::<Vec<_>>();
+        let writable = has_archive && self.controller.state.format == super::Format::Zip;
+        let can_undo = has_archive && self.controller.state.undo.is_some();
+        let can_copy = self.can_copy_files();
+        let can_paste = self.can_paste_files();
+        let release = self
+            .controller
+            .state
+            .update
+            .as_ref()
+            .map(|release| fill(s.update_ready, &[("version", &release.tag)]));
+        let flat_view = self.controller.state.settings.flat;
+        let visible_columns = Columns::ALL
+            .iter()
+            .map(|(column, _)| (*column, self.controller.state.settings.columns.on(*column)))
+            .collect::<Vec<_>>();
+        let overflow = Button::new("overflow")
+            .icon(IconName::Ellipsis)
+            .accessibility_label(s.more_word)
+            .tooltip(s.more_word)
+            .ghost()
+            .compact()
+            .disabled(!idle)
+            .dropdown_menu(move |menu, window, popup_cx| {
+                let mut menu = menu;
+                let archive_owner = owner.clone();
+                let archive_release = release.clone();
+                menu = menu.submenu_with_icon(
+                    Some(Icon::new(IconName::Inbox)),
+                    s.archive_group,
+                    window,
+                    popup_cx,
+                    move |submenu, _, _| {
+                        let test_owner = archive_owner.clone();
+                        let add_owner = archive_owner.clone();
+                        let folder_owner = archive_owner.clone();
+                        let undo_owner = archive_owner.clone();
+                        let save_owner = archive_owner.clone();
+                        let password_owner = archive_owner.clone();
+                        let mut submenu = submenu
+                            .item(
+                                PopupMenuItem::new(s.test_word)
+                                    .disabled(!has_archive)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = test_owner.update(cx, |this, cx| {
+                                            if let Some(archive) = this.controller.state.archive.clone() {
+                                                this.controller.dispatch(AppAction::Run(Job::Test {
+                                                    archive,
+                                                    only: None,
+                                                }));
+                                            }
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .separator()
+                            .item(
+                                Self::popup_action(add_owner, s.add_to_archive, OverflowAction::AddFiles)
+                                    .disabled(!writable),
+                            )
+                            .item(
+                                Self::popup_action(folder_owner, s.new_folder, OverflowAction::NewFolder)
+                                    .disabled(!writable),
+                            )
+                            .item(
+                                Self::popup_action(undo_owner, s.undo_word, OverflowAction::Undo)
+                                    .disabled(!can_undo),
+                            )
+                            .item(
+                                Self::popup_action(save_owner, s.save_copy, OverflowAction::SaveCopy)
+                                    .disabled(!has_archive),
+                            )
+                            .item(
+                                Self::popup_action(
+                                    password_owner,
+                                    s.default_password,
+                                    OverflowAction::DefaultPassword,
+                                )
+                                .disabled(!idle),
+                            );
+                        if let Some(label) = archive_release.clone() {
+                            let release_owner = archive_owner.clone();
+                            submenu = submenu.item(Self::popup_action(
+                                release_owner,
+                                label,
+                                OverflowAction::Release,
+                            ));
+                        }
+                        submenu
+                    },
+                );
+
+                let selection_owner = owner.clone();
+                menu = menu.submenu_with_icon(
+                    Some(Icon::new(IconName::Check)),
+                    s.selection_group,
+                    window,
+                    popup_cx,
+                    move |submenu, _, _| {
+                        let select_owner = selection_owner.clone();
+                        let invert_owner = selection_owner.clone();
+                        let clear_owner = selection_owner.clone();
+                        submenu
+                            .item(
+                                PopupMenuItem::new(s.select_all)
+                                    .disabled(!has_archive)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = select_owner.update(cx, |this, cx| {
+                                            this.controller.dispatch(AppAction::SelectAllVisible);
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new(s.invert_selection)
+                                    .disabled(!has_archive)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = invert_owner.update(cx, |this, cx| {
+                                            this.controller.dispatch(AppAction::InvertVisible);
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new(s.clear_selection)
+                                    .disabled(!has_archive)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = clear_owner.update(cx, |this, cx| {
+                                            this.controller.dispatch(AppAction::ClearSelection);
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                    },
+                );
+
+                let clipboard_owner = owner.clone();
+                menu = menu.submenu_with_icon(
+                    Some(Icon::new(IconName::Copy)),
+                    s.clipboard_group,
+                    window,
+                    popup_cx,
+                    move |submenu, _, _| {
+                        let copy_owner = clipboard_owner.clone();
+                        let cut_owner = clipboard_owner.clone();
+                        let paste_owner = clipboard_owner.clone();
+                        submenu
+                            .item(
+                                PopupMenuItem::new(s.copy_word)
+                                    .disabled(!can_copy)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = copy_owner.update(cx, |this, cx| {
+                                            this.controller.dispatch(AppAction::Copy { cut: false });
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new(s.cut_word)
+                                    .disabled(!can_copy)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = cut_owner.update(cx, |this, cx| {
+                                            this.controller.dispatch(AppAction::Copy { cut: true });
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new(s.paste_word)
+                                    .disabled(!can_paste)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = paste_owner.update(cx, |this, cx| {
+                                            this.controller.dispatch(AppAction::Paste);
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                    },
+                );
+
+                let recent_owner = owner.clone();
+                let recent_menu = recent.clone();
+                menu = menu.submenu(s.recent_group, window, popup_cx, move |submenu, _, _| {
+                    let mut submenu = submenu;
+                    for path in recent_menu.iter().cloned() {
+                        let open_owner = recent_owner.clone();
+                        let target = PathBuf::from(&path);
+                        let leaf = target
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or(path.clone());
+                        submenu = submenu.item(PopupMenuItem::new(leaf).on_click(
+                            move |_, _, cx| {
+                                let _ = open_owner.update(cx, |this, cx| {
+                                    this.controller.dispatch(AppAction::Open(target.clone()));
+                                    cx.notify();
+                                });
+                            },
+                        ));
+                    }
+                    submenu.item(
+                        PopupMenuItem::new(s.clear_history).disabled(recent_menu.is_empty()).on_click(
+                            {
+                                let history_owner = recent_owner.clone();
+                                move |_, _, cx| {
+                                    let _ = history_owner.update(cx, |this, cx| {
+                                        this.controller.state.settings.recent.clear();
+                                        this.controller.state.settings.save();
+                                        cx.notify();
+                                    });
+                                }
+                            },
+                        ),
+                    )
+                });
+
+                let view_owner = owner.clone();
+                let columns_menu = visible_columns.clone();
+                menu = menu.submenu(s.view_group, window, popup_cx, move |submenu, _, _| {
+                    let flat_owner = view_owner.clone();
+                    let column_owner = view_owner.clone();
+                    let mut submenu = submenu.item(
+                        PopupMenuItem::new(s.flat_view)
+                            .disabled(!has_archive)
+                            .checked(flat_view)
+                            .on_click(move |_, _, cx| {
+                                let _ = flat_owner.update(cx, |this, cx| {
+                                    let settings = &mut this.controller.state.settings;
+                                    settings.flat = !settings.flat;
+                                    if settings.flat && !settings.columns.on(SortColumn::Path) {
+                                        settings.columns.set(SortColumn::Path, true);
+                                    }
+                                    settings.save();
+                                    this.controller.dispatch(AppAction::ClearSelection);
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                    for (column, shown) in columns_menu.iter().copied() {
+                        let label = Columns::label(column, s);
+                        let column_owner = column_owner.clone();
+                        submenu = submenu.item(
+                            PopupMenuItem::new(format!(
+                                "{} {label}",
+                                if shown { s.hide_word } else { s.show_word }
+                            ))
+                            .checked(shown)
+                            .on_click(move |_, _, cx| {
+                                let _ = column_owner.update(cx, |this, cx| {
+                                    this.controller.dispatch(AppAction::ToggleColumn(column));
+                                    cx.notify();
+                                });
+                            }),
+                        );
+                    }
+                    submenu
+                });
+
+                let app_owner = owner.clone();
+                menu.submenu(s.application_group, window, popup_cx, move |submenu, _, _| {
+                    let shortcuts_owner = app_owner.clone();
+                    let settings_owner = app_owner.clone();
+                    submenu
+                        .item(PopupMenuItem::new(s.shortcuts_title).on_click(
+                            move |_, _, cx| {
+                                let _ = shortcuts_owner.update(cx, |this, cx| {
+                                    this.controller.state.show_shortcuts = true;
+                                    cx.notify();
+                                });
+                            },
+                        ))
+                        .item(PopupMenuItem::new(s.settings).on_click(move |_, _, cx| {
+                            let _ = settings_owner.update(cx, |this, cx| {
+                                this.controller.state.show_settings = true;
+                                cx.notify();
+                            });
+                        }))
+                })
+            });
+        toolbar = toolbar.child(overflow);
 
         // The filter sits at the far end of the bar, the way a search field
         // does in every file manager on the desktop, instead of stretching
