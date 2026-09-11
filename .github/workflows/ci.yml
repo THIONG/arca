@@ -45,7 +45,7 @@ jobs:
       - name: Build CLI with the default codecs
         run: cargo build -p arca-cli
       - name: Interoperability verified by hash
-        run: ARCA=target/debug/arca bash interop.sh
+        run: ARCA="$GITHUB_WORKSPACE/target/debug/arca" bash interop.sh
 
   build:
     name: Build on ${{ matrix.name }}
