@@ -164,7 +164,7 @@ fn paint(mode: ThemeMode, cx: &mut App) {
 
     theme.button = hex(p.surface);
     theme.button_foreground = hex(p.text);
-    theme.button_hover = hex(p.raised);
+    theme.button_hover = hex(p.border);
     theme.button_active = hex(p.border);
     theme.button_primary = theme.primary;
     theme.button_primary_foreground = theme.primary_foreground;

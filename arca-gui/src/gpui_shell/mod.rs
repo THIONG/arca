@@ -20,7 +20,7 @@ use gpui::{
     Entity, FocusHandle, Focusable, KeyBinding, KeyDownEvent, Role, ScrollStrategy, Stateful,
     UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowOptions,
 };
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_component::dialog::{Dialog, DialogAction, DialogClose, DialogDescription, DialogFooter};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::kbd::Kbd;
@@ -875,6 +875,7 @@ impl GpuiShell {
     /// understood has cost a word and bought nothing. The accessible name is
     /// still the word, so nothing changes for a screen reader.
     fn icon_button(
+        cx: &App,
         id: impl Into<ElementId>,
         icon: impl Into<Icon>,
         accessible_name: String,
@@ -884,7 +885,11 @@ impl GpuiShell {
             .icon(icon.into().size_4())
             .accessibility_label(accessible_name.clone())
             .tooltip(accessible_name)
-            .ghost()
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .hover(cx.theme().button_hover)
+                    .active(cx.theme().button_active),
+            )
             .compact()
             .disabled(!enabled)
     }
@@ -2430,6 +2435,7 @@ impl Render for GpuiShell {
         }
 
         let open = Self::icon_button(
+            cx,
             "open",
             IconName::FolderOpen,
             format!("{} (Ctrl+O)", s.open),
@@ -2441,6 +2447,7 @@ impl Render for GpuiShell {
             }
         })));
         let compress = Self::icon_button(
+            cx,
             "compress",
             IconName::Inbox,
             format!("{} (Ctrl+N)", s.compress),
@@ -2454,6 +2461,7 @@ impl Render for GpuiShell {
         toolbar = toolbar.child(div().px_1().child(Separator::vertical().h(px(16.))));
 
         let extract_all = Self::icon_button(
+            cx,
             "extract-all",
             IconName::PanelBottomOpen,
             format!("{} (Ctrl+E)", s.extract_all),
@@ -2471,6 +2479,7 @@ impl Render for GpuiShell {
             );
         })));
         let extract_selected = Self::icon_button(
+            cx,
             "extract-selected",
             Icon::empty().path("icons/file-output.svg"),
             s.extract_selected.to_string(),
@@ -2483,6 +2492,7 @@ impl Render for GpuiShell {
             this.begin_dialog(DialogKind::Extract { only_checked: true }, cx);
         })));
         let password = Self::icon_button(
+            cx,
             "password",
             Icon::empty().path("icons/lock.svg"),
             format!("{} / {}", s.set_password, s.remove_password),
@@ -2521,7 +2531,13 @@ impl Render for GpuiShell {
             .map(|(column, _)| (*column, self.controller.state.settings.columns.on(*column)))
             .collect::<Vec<_>>();
 
-        let copy = Self::icon_button("copy", IconName::Copy, s.copy_word.to_string(), can_copy);
+        let copy = Self::icon_button(
+            cx,
+            "copy",
+            IconName::Copy,
+            s.copy_word.to_string(),
+            can_copy,
+        );
         toolbar = toolbar.child(copy.on_click(cx.listener(|this, _, window, cx| {
             if this.background_idle() {
                 this.dispatch_clipboard(false, window, cx);
@@ -2529,6 +2545,7 @@ impl Render for GpuiShell {
             }
         })));
         let cut = Self::icon_button(
+            cx,
             "cut",
             Icon::empty().path("icons/scissors.svg"),
             s.cut_word.to_string(),
@@ -2541,6 +2558,7 @@ impl Render for GpuiShell {
             }
         })));
         let delete = Self::icon_button(
+            cx,
             "delete",
             Icon::empty().path("icons/trash-2.svg"),
             s.delete_word.to_string(),
@@ -2554,6 +2572,7 @@ impl Render for GpuiShell {
             }
         })));
         let test = Self::icon_button(
+            cx,
             "test-selection",
             IconName::Check,
             s.test_selection.to_string(),
@@ -2579,7 +2598,11 @@ impl Render for GpuiShell {
             .icon(IconName::Ellipsis)
             .accessibility_label(s.more_word)
             .tooltip(s.more_word)
-            .ghost()
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .hover(cx.theme().button_hover)
+                    .active(cx.theme().button_active),
+            )
             .compact()
             .disabled(!idle)
             .dropdown_menu(move |menu, window, popup_cx| {
@@ -2856,7 +2879,11 @@ impl Render for GpuiShell {
             .icon(IconName::Settings)
             .accessibility_label(s.settings)
             .tooltip(s.settings)
-            .ghost()
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .hover(cx.theme().button_hover)
+                    .active(cx.theme().button_active),
+            )
             .compact()
             .disabled(!idle)
             .on_click(move |_, _, cx| {
@@ -2889,6 +2916,7 @@ impl Render for GpuiShell {
             .text_xs();
         let at_root = self.controller.state.current_dir.is_empty();
         let back = Self::icon_button(
+            cx,
             "back",
             IconName::ArrowLeft,
             s.back.to_string(),
@@ -2901,6 +2929,7 @@ impl Render for GpuiShell {
             }
         })));
         let forward = Self::icon_button(
+            cx,
             "forward",
             IconName::ArrowRight,
             s.forward.to_string(),
@@ -2912,7 +2941,13 @@ impl Render for GpuiShell {
                 this.route_changed(cx);
             }
         })));
-        let up = Self::icon_button("up", IconName::ArrowUp, s.up.to_string(), idle && !at_root);
+        let up = Self::icon_button(
+            cx,
+            "up",
+            IconName::ArrowUp,
+            s.up.to_string(),
+            idle && !at_root,
+        );
         nav = nav.child(up.on_click(cx.listener(|this, _, _, cx| {
             if this.background_idle() && !this.controller.state.current_dir.is_empty() {
                 let parent = parent_of(&this.controller.state.current_dir);
