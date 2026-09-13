@@ -4387,6 +4387,43 @@ const ROW_GUTTER: f32 = 16.0;
 /// selection cannot change while the button is down.
 struct DraggedRows;
 
+/// What follows the pointer while rows are in the air. Without it a drag is
+/// invisible until the pointer leaves the window and the system draws its own.
+struct DragPreview {
+    label: String,
+    extra: usize,
+}
+
+impl Render for DragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut row = div();
+        if self.label.is_empty() {
+            return row;
+        }
+        row = row
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(cx.theme().table_active)
+            .border_1()
+            .border_color(cx.theme().table_active_border)
+            .text_xs()
+            .text_color(cx.theme().foreground)
+            .child(self.label.clone());
+        if self.extra > 0 {
+            row = row.child(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("+{}", self.extra)),
+            );
+        }
+        row
+    }
+}
+
 /// What the kit's table needs to draw a frame of the archive.
 ///
 /// It keeps its own copy rather than reading the shell, because the table is
@@ -4647,6 +4684,10 @@ impl TableDelegate for FileTable {
             let shell = self.shell.clone();
             let dragged = row.clone();
             item = item.on_drag(DraggedRows, move |_, _, _, app| {
+                let mut preview = DragPreview {
+                    label: String::new(),
+                    extra: 0,
+                };
                 let _ = shell.update(app, |shell, _| {
                     // A band was started in this row's dead space; the pull
                     // belongs to it, not to the row.
@@ -4662,8 +4703,10 @@ impl TableDelegate for FileTable {
                         shell.controller.set_checked(&dragged, true);
                     }
                     shell.carrying = true;
+                    preview.label = dragged.label.clone();
+                    preview.extra = shell.controller.selected_roots().len().saturating_sub(1);
                 });
-                app.new(|_| gpui::Empty)
+                app.new(|_| preview)
             });
         }
         item
