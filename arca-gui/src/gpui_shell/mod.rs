@@ -24,17 +24,18 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::dialog::{Dialog, DialogAction, DialogClose, DialogDescription, DialogFooter};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::kbd::Kbd;
+use gpui_component::list::ListItem;
 use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::progress::Progress;
 use gpui_component::radio::RadioGroup;
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::separator::Separator;
-use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_component::status_bar::StatusBar;
 use gpui_component::switch::Switch;
 use gpui_component::table::{Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState};
+use gpui_component::tree::{tree, TreeItem, TreeState};
 use gpui_component::{ActiveTheme, Icon, IconName};
-use gpui_component::{Disableable, Root, Selectable, TitleBar, WindowExt};
+use gpui_component::{Disableable, Root, Selectable, Sizable as _, TitleBar, WindowExt};
 use gpui_platform::application;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -149,6 +150,12 @@ struct GpuiShell {
     /// Handing GPUI a fresh `Image` every frame would decode a thirty megabyte
     /// photograph sixty times a second.
     viewer_image: Option<(String, std::sync::Arc<gpui::Image>)>,
+    /// The archive's folders as the kit's tree, and the archive they were
+    /// grown from. Rebuilding the items every frame would throw away which
+    /// branches are open, so they are grown once per archive and the key says
+    /// when that archive stopped being the same one.
+    folders: Entity<TreeState>,
+    folders_key: Option<(Option<PathBuf>, usize)>,
     drop_paths: Vec<PathBuf>,
 }
 
@@ -264,6 +271,21 @@ enum ModalKind {
     DefaultPassword,
     Settings,
     Shortcuts,
+}
+
+/// One folder and everything under it, as the kit's tree items.
+///
+/// The id is the path the folder is reached by, which is what `Navigate`
+/// takes, so the tree needs no table on the side to say what a row means.
+fn folder_items(folder: &Folder, path: &str) -> Vec<TreeItem> {
+    folder
+        .kids
+        .iter()
+        .map(|(label, kid)| {
+            let id = format!("{path}{label}/");
+            TreeItem::new(id.clone(), label.clone()).children(folder_items(kid, &id))
+        })
+        .collect()
 }
 
 impl GpuiShell {
@@ -413,6 +435,26 @@ impl GpuiShell {
             }
         })
         .detach();
+        // The tree owns which folder is picked; the shell hears about it and
+        // goes there. The guard is what keeps the two from chasing each other:
+        // `sync_folders` puts the mark back on the folder the list is showing,
+        // and that must not read as a request to move.
+        let folders = cx.new(|cx| TreeState::new(cx));
+        cx.observe(&folders, |shell, state, cx| {
+            let Some(path) = state
+                .read(cx)
+                .selected_item()
+                .map(|item| item.id.to_string())
+            else {
+                return;
+            };
+            if path == shell.controller.state.current_dir || !shell.background_idle() {
+                return;
+            }
+            shell.controller.dispatch(AppAction::Navigate(path));
+            shell.route_changed(cx);
+        })
+        .detach();
         let _ = owner;
         let mut controller = AppController::new(Settings::load());
         apply_startup(&mut controller, startup);
@@ -491,57 +533,42 @@ impl GpuiShell {
             viewer_focus: (0..3).map(|_| cx.focus_handle().tab_stop(true)).collect(),
             viewer_scroll: UniformListScrollHandle::new(),
             viewer_image: None,
+            folders,
+            folders_key: None,
             drop_paths: Vec::new(),
         }
     }
 
-    /// One folder and everything under it, as a nestable sidebar item.
+    /// Grow the kit's tree from the archive's folders, and put the mark on the
+    /// folder the list is showing.
     ///
-    /// The branch leading to the folder you are in opens itself, so opening an
-    /// archive three levels down does not present a closed tree you have to
-    /// re-walk by hand. Everything else stays shut, because an archive of a
-    /// source tree fully expanded is not a sidebar, it is a second file list.
-    fn folder_item(
-        folder: &Folder,
-        label: &str,
-        path: String,
-        current: &str,
-        cx: &mut Context<Self>,
-    ) -> SidebarMenuItem {
-        let on_path = current.starts_with(path.as_str());
-        SidebarMenuItem::new(label.to_string())
-            .icon(if on_path {
-                IconName::FolderOpen
-            } else {
-                IconName::Folder
-            })
-            .active(current == path)
-            .default_open(on_path)
-            // Clicking the label navigates; the disclosure chevron is what
-            // opens a branch. Merging the two would make it impossible to look
-            // inside a folder without leaving the one you are in.
-            .click_to_open(false)
-            .children(
-                folder
-                    .kids
-                    .iter()
-                    .map(|(child_label, child)| {
-                        Self::folder_item(
-                            child,
-                            child_label,
-                            format!("{path}{child_label}/"),
-                            current,
-                            cx,
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if this.background_idle() {
-                    this.controller.dispatch(AppAction::Navigate(path.clone()));
-                    this.route_changed(cx);
-                }
-            }))
+    /// The items are only rebuilt when the archive is a different one: they
+    /// carry which branches are open, and handing the tree a fresh set every
+    /// frame would shut the lot on every repaint. Revealing the current folder
+    /// opens the branch that leads to it, so an archive opened three levels
+    /// down does not present a closed tree to re-walk by hand.
+    fn sync_folders(&mut self, cx: &mut Context<Self>) {
+        let key = (
+            self.controller.state.archive.clone(),
+            self.controller.state.entries.len(),
+        );
+        if self.folders_key.as_ref() != Some(&key) {
+            self.folders_key = Some(key);
+            let root = TreeItem::new("", self.controller.s().archive_root)
+                .expanded(true)
+                .children(folder_items(&self.controller.state.folders, ""));
+            self.folders
+                .update(cx, |state, cx| state.set_items(vec![root], cx));
+        }
+        let current: gpui::SharedString = self.controller.state.current_dir.clone().into();
+        self.folders.update(cx, |state, cx| {
+            if state.selected_item().map(|item| item.id.clone()) == Some(current.clone()) {
+                return;
+            }
+            state.reveal_item(&current, ScrollStrategy::Top, cx);
+            let at = state.index_of(&current);
+            state.set_selected_index(at, cx);
+        });
     }
 
     /// The archive's folders, down the left edge.
@@ -549,29 +576,9 @@ impl GpuiShell {
     /// Breadcrumbs say where you are; this says what else there is. A deep
     /// archive was previously only navigable by descending one double-click at
     /// a time and reversing back out.
-    fn sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
-        let current = self.controller.state.current_dir.clone();
-        let at_root = current.is_empty();
-        let root_item = SidebarMenuItem::new(self.controller.s().archive_root.to_string())
-            .icon(IconName::Inbox)
-            .active(at_root)
-            .on_click(cx.listener(|this, _, _, cx| {
-                if this.background_idle() {
-                    this.controller.dispatch(AppAction::Navigate(String::new()));
-                    this.route_changed(cx);
-                }
-            }));
-        let mut items = vec![root_item];
-        let tree = &self.controller.state.folders;
-        items.extend(
-            tree.kids
-                .iter()
-                .map(|(label, folder)| {
-                    Self::folder_item(folder, label, format!("{label}/"), &current, cx)
-                })
-                .collect::<Vec<_>>(),
-        );
-        let menu = SidebarMenu::new().children(items);
+    fn sidebar(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
+        self.sync_folders(cx);
+        let folders = self.controller.s().archive_folders;
         div()
             .id("archive-folders")
             .w(px(224.))
@@ -583,7 +590,53 @@ impl GpuiShell {
             .border_r_1()
             .border_color(cx.theme().border)
             .p_2()
-            .child(menu.render("archive-folder-menu", window, cx))
+            .role(Role::Tree)
+            .aria_label(folders)
+            .child(tree(&self.folders, |_, entry, selected, _, _| {
+                let open = entry.is_expanded();
+                let icon = if entry.is_root() {
+                    IconName::Inbox
+                } else if open {
+                    IconName::FolderOpen
+                } else {
+                    IconName::Folder
+                };
+                // The kit's tree draws no disclosure mark of its own, and a
+                // branch with nothing to say it has one is a branch nobody
+                // opens.
+                let chevron = if entry.is_folder() {
+                    Some(Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    }))
+                } else {
+                    None
+                };
+                ListItem::new(entry.item().id.clone())
+                    .pl(px(4. + 12. * entry.depth() as f32))
+                    .px_1()
+                    .selected(selected)
+                    .role(Role::TreeItem)
+                    .aria_label(entry.item().label.clone())
+                    .aria_level(entry.depth() + 1)
+                    .aria_selected(selected)
+                    .aria_expanded(open)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .w(px(14.))
+                                    .flex_none()
+                                    .children(chevron.map(|icon| icon.small())),
+                            )
+                            .child(Icon::new(icon).small())
+                            .child(div().flex_1().truncate().child(entry.item().label.clone())),
+                    )
+            }))
     }
 
     fn begin_dialog(&mut self, kind: DialogKind, cx: &mut Context<Self>) {
@@ -3237,7 +3290,7 @@ impl Render for GpuiShell {
             .flex()
             .flex_row();
         if has_archive {
-            let sidebar = self.sidebar(window, cx);
+            let sidebar = self.sidebar(cx);
             body = body.child(sidebar);
         }
         root = root.child(body.child(content)).child(
@@ -4974,6 +5027,28 @@ mod tests {
         for (index, action) in RowAction::ALL.iter().enumerate() {
             assert_eq!(*action as usize, index);
         }
+    }
+
+    #[test]
+    fn every_folder_of_the_tree_is_named_by_the_path_it_navigates_to() {
+        // The id is what `Navigate` is dispatched with, so a nested folder
+        // whose id is only its own name would send the window to the wrong
+        // place -- or nowhere.
+        let mut root = Folder::default();
+        let src = root.kids.entry("src".to_string()).or_default();
+        src.kids.entry("deep".to_string()).or_default();
+        root.kids.entry("docs".to_string()).or_default();
+
+        let items = folder_items(&root, "");
+        let ids = items
+            .iter()
+            .map(|item| item.id.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["docs/".to_string(), "src/".to_string()]);
+        let nested = &items[1].children;
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].id.to_string(), "src/deep/");
+        assert_eq!(nested[0].label.to_string(), "deep");
     }
 
     #[test]
