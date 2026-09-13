@@ -1905,15 +1905,15 @@ impl GpuiShell {
         self.controller.state.settings.widths[slot] = width.max(Settings::least(slot));
     }
 
-    fn kind_mark(kind: Kind) -> &'static str {
+    fn kind_icon(kind: Kind) -> (IconName, u32) {
         match kind {
-            Kind::Dir => "▰",
-            Kind::Image => "▧",
-            Kind::Text => "▤",
-            Kind::Archive => "▱",
-            Kind::Audio => "♫",
-            Kind::Video => "▶",
-            Kind::Other => "□",
+            Kind::Dir => (IconName::Folder, 0xF4B740),
+            Kind::Image => (IconName::GalleryVerticalEnd, 0xC084FC),
+            Kind::Text => (IconName::FileText, 0x60A5FA),
+            Kind::Archive => (IconName::File, 0xFB923C),
+            Kind::Audio => (IconName::File, 0xF472B6),
+            Kind::Video => (IconName::Play, 0xF87171),
+            Kind::Other => (IconName::File, 0x94A3B8),
         }
     }
 }
@@ -4518,20 +4518,13 @@ impl TableDelegate for FileTable {
             .gap_2()
             .text_sm()
             .text_color(ink)
-            .child(
-                // The type mark is the one place a folder is allowed to
-                // out-shout a file, and in a monochrome window that is done
-                // with weight, not hue.
+            .child({
+                let (icon, color) = GpuiShell::kind_icon(row.kind);
                 div()
                     .w(px(18.))
                     .flex_none()
-                    .text_color(if row.is_dir {
-                        ink
-                    } else {
-                        cx.theme().muted_foreground
-                    })
-                    .child(GpuiShell::kind_mark(row.kind)),
-            )
+                    .child(Icon::new(icon).size(px(16.)).text_color(gpui::rgb(color)))
+            })
             .child(div().flex_1().truncate().child(row.label.clone()))
     }
 
