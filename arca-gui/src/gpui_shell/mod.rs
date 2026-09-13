@@ -590,6 +590,7 @@ impl GpuiShell {
         self.sync_folders(cx);
         let folders = self.controller.s().archive_folders;
         let widest = self.widest_folder_row(cx);
+        let dropping = cx.weak_entity();
         div()
             .id("archive-folders")
             .size_full()
@@ -608,7 +609,7 @@ impl GpuiShell {
                     .size_full()
                     .overflow_x_scrollbar()
                     .child(
-                        tree(&self.folders, |_, entry, selected, _, _| {
+                        tree(&self.folders, move |_, entry, selected, _, _| {
                             let open = entry.is_expanded();
                             let icon = if entry.is_root() {
                                 IconName::Inbox
@@ -629,7 +630,33 @@ impl GpuiShell {
                             } else {
                                 None
                             };
+                            // A folder here takes what is dropped on it, the
+                            // same move a folder row in the list takes: the
+                            // tree is the only way to reach a folder that is
+                            // not a child of the one being shown.
+                            let target = entry.item().id.to_string();
+                            let shell = dropping.clone();
                             ListItem::new(entry.item().id.clone())
+                                // What is under the pointer is what it lands in,
+                                // and without saying so the whole gesture is a
+                                // guess until the archive has been rewritten.
+                                .drag_over::<DraggedRows>(|style, _, _, cx| {
+                                    style
+                                        .bg(cx.theme().drop_target)
+                                        .border_color(cx.theme().drag_border)
+                                })
+                                .border_1()
+                                .border_color(gpui::transparent_black())
+                                .on_drop(move |_: &DraggedRows, _, cx| {
+                                    let _ = shell.update(cx, |shell, cx| {
+                                        let carried = shell.controller.selected_roots();
+                                        if !carried.is_empty() {
+                                            shell.controller.move_into(&carried, &target);
+                                        }
+                                        shell.carrying = false;
+                                        cx.notify();
+                                    });
+                                })
                                 .pr_1()
                                 .pl(px(4. + 12. * entry.depth() as f32))
                                 .selected(selected)
@@ -1394,7 +1421,10 @@ impl GpuiShell {
             return false;
         };
         let (x, y) = (f32::from(at.x), f32::from(at.y));
-        y < view.top || y > view.bottom || x < view.left || x > view.right
+        // The sidebar sits to the left of the list and its folders take a drop,
+        // so crossing onto it is not leaving the archive: on that side only the
+        // window's own edge is.
+        y < view.top || y > view.bottom || x < 0.0 || x > view.right
     }
 
     fn scroll_to(&self, view: &ListView, offset: f32) {
@@ -4453,26 +4483,46 @@ struct DraggedRows;
 struct DragPreview {
     label: String,
     extra: usize,
+    /// Where inside the row the press landed.
+    offset: gpui::Point<gpui::Pixels>,
 }
 
 impl Render for DragPreview {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut row = div();
+        // GPUI paints this at the pointer less that offset, and a row is as wide
+        // as the list: a press near the right edge would draw the badge back at
+        // the file name, or off the left of the window where it is cut in half.
+        // A wrapper padded by the same amount puts it back at the pointer; it
+        // has to be a wrapper because the badge sets its own padding. The
+        // vertical padding is short of the press by a badge's height, which is
+        // what puts the badge above the pointer instead of under the hand. A
+        // press in the top few pixels of a row cannot be lifted that far and is
+        // left at the row's own top, which is above the pointer anyway.
+        const LIFT: f32 = 30.0;
+        let shift = div()
+            .pl(self.offset.x)
+            .pt(px((f32::from(self.offset.y) - LIFT).max(0.)));
+        let centred = div().w(px(0.)).flex().justify_center();
         if self.label.is_empty() {
-            return row;
+            return shift;
         }
-        row = row
+        let mut row = div()
             .flex()
             .items_center()
             .gap_2()
             .px_2()
             .py_1()
             .rounded_md()
-            .bg(cx.theme().table_active)
+            // Opaque, not a tint: the badge is read against whatever it happens
+            // to be over, which is a list of file names.
+            .bg(cx.theme().popover)
             .border_1()
-            .border_color(cx.theme().table_active_border)
+            .border_color(cx.theme().border)
+            .shadow_md()
             .text_xs()
-            .text_color(cx.theme().foreground)
+            .flex_none()
+            .whitespace_nowrap()
+            .text_color(cx.theme().popover_foreground)
             .child(self.label.clone());
         if self.extra > 0 {
             row = row.child(
@@ -4481,7 +4531,11 @@ impl Render for DragPreview {
                     .child(format!("+{}", self.extra)),
             );
         }
-        row
+        // A box of no width with its one child centred: the free space is
+        // negative, so the badge hangs half over each side of the pointer.
+        // Nothing here knows how wide a file name draws, and this does not have
+        // to ask.
+        shift.child(centred.child(row))
     }
 }
 
@@ -4724,18 +4778,24 @@ impl TableDelegate for FileTable {
         if row.is_dir && self.idle {
             let target = row.path.clone();
             let shell = self.shell.clone();
-            item = item.on_drop(move |_: &DraggedRows, _, cx| {
-                let _ = shell.update(cx, |shell, cx| {
-                    let carried = shell.controller.selected_roots();
-                    let into_itself = carried.iter().any(|carried| {
-                        carried.trim_end_matches('/') == target.trim_end_matches('/')
+            item = item
+                .drag_over::<DraggedRows>(|style, _, _, cx| {
+                    style
+                        .bg(cx.theme().drop_target)
+                        .border_color(cx.theme().drag_border)
+                })
+                .on_drop(move |_: &DraggedRows, _, cx| {
+                    let _ = shell.update(cx, |shell, cx| {
+                        let carried = shell.controller.selected_roots();
+                        let into_itself = carried.iter().any(|carried| {
+                            carried.trim_end_matches('/') == target.trim_end_matches('/')
+                        });
+                        if !carried.is_empty() && !into_itself {
+                            shell.controller.move_into(&carried, &target);
+                        }
+                        cx.notify();
                     });
-                    if !carried.is_empty() && !into_itself {
-                        shell.controller.move_into(&carried, &target);
-                    }
-                    cx.notify();
                 });
-            });
         }
         // GPUI owns the threshold and the gesture's lifetime. Where the drag is
         // going is not decided here: a folder of this archive takes it as a
@@ -4744,10 +4804,11 @@ impl TableDelegate for FileTable {
         if self.idle {
             let shell = self.shell.clone();
             let dragged = row.clone();
-            item = item.on_drag(DraggedRows, move |_, _, _, app| {
+            item = item.on_drag(DraggedRows, move |_, offset, _, app| {
                 let mut preview = DragPreview {
                     label: String::new(),
                     extra: 0,
+                    offset,
                 };
                 let _ = shell.update(app, |shell, _| {
                     // A band was started in this row's dead space; the pull
