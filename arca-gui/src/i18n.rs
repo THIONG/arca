@@ -205,7 +205,6 @@ pub struct Strings {
     pub ascending: &'static str,
     pub descending: &'static str,
     pub not_checked: &'static str,
-    pub show_word: &'static str,
     pub hide_word: &'static str,
     pub working_word: &'static str,
 }
@@ -378,7 +377,6 @@ const EN: Strings = Strings {
     ascending: "ascending",
     descending: "descending",
     not_checked: "not checked",
-    show_word: "Show",
     hide_word: "Hide",
     working_word: "Working",
 };
@@ -551,7 +549,6 @@ const ES: Strings = Strings {
     ascending: "ascendente",
     descending: "descendente",
     not_checked: "sin marcar",
-    show_word: "Mostrar",
     hide_word: "Ocultar",
     working_word: "Trabajando",
 };

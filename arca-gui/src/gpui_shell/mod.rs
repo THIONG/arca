@@ -2714,19 +2714,14 @@ impl Render for GpuiShell {
                     for (column, shown) in columns_menu.iter().copied() {
                         let label = Columns::label(column, s);
                         let column_owner = column_owner.clone();
-                        submenu = submenu.item(
-                            PopupMenuItem::new(format!(
-                                "{} {label}",
-                                if shown { s.hide_word } else { s.show_word }
-                            ))
-                            .checked(shown)
-                            .on_click(move |_, _, cx| {
+                        submenu = submenu.item(PopupMenuItem::new(label).checked(shown).on_click(
+                            move |_, _, cx| {
                                 let _ = column_owner.update(cx, |this, cx| {
                                     this.controller.dispatch(AppAction::ToggleColumn(column));
                                     cx.notify();
                                 });
-                            }),
-                        );
+                            },
+                        ));
                     }
                     submenu
                 });
