@@ -846,7 +846,7 @@ impl GpuiShell {
             .accessibility_label(accessible_name)
             .ghost()
             .compact()
-            .text_xs()
+            .xsmall()
             .disabled(!enabled)
     }
 
