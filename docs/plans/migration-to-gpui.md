@@ -170,14 +170,13 @@ Después de alcanzar la paridad funcional, validar accesibilidad y completar la 
     dibujaban en el flujo y empujaban media ventana hacia abajo.
   - **Tabla a sangre**, sin borde ni radio propios, con cabecera fijada y
     franjas alternas.
-- **G7.3 pendiente** — sustituir los widgets internos por los de
-  `gpui-component`: `Input` (retira las ~400 líneas de `FilterInput` y su
-  contrato UTF-16 con el IME), `Button`, `Modal`/`Root` para los diálogos,
-  `Popover` real anclado al disparador en vez de `absolute` con offsets fijos,
-  `Table` y `Notification`.
-- **G7.4 pendiente** — el diálogo de configuración de la superficie GPUI, que es
-  lo que permite cambiar tema e idioma sin editar `gui.conf`. Hasta entonces la
-  preferencia se lee al arrancar y `System` sigue al escritorio.
+- **G7.3 hecho** — los widgets internos son los de `gpui-component`: `Input`,
+  `Button`, `Dialog` sobre `Root`, menús anclados al disparador, `Table`,
+  `Progress`, `Kbd`, `Radio`, `Tree` y la barra de desplazamiento del kit. El
+  detalle por fases está en `docs/todos/migracion-gpui-kit.md`.
+- **G7.4 hecho** — el diálogo de configuración existe en la superficie GPUI:
+  idioma y tema en radios, y formato, compresor, nivel y página de códigos en
+  menús.
 
 ### 8. Retirada del backend anterior
 

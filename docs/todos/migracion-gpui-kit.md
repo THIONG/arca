@@ -1,7 +1,7 @@
 # Migración de la UI a GPUI Kit
 
-Estado: en curso. Fase 1 y el piloto de la fase 2 están en `main` de la rama
-`gpui-kit-redesign`; el resto de la interfaz sigue dibujándose a mano.
+Estado: en curso. Las fases 1 a 6 están hechas; queda la 7, que solo retira
+andamiaje sin uso.
 
 - `590862d` — `Root` del kit como vista raíz de la ventana.
 - `0ae9f27` — confirmación de borrado con el `Dialog` del kit.
@@ -28,18 +28,18 @@ ya trae. El recuento de partida en `gpui_shell/mod.rs` (6067 líneas) era de 95
 | `file_table`, `column_header`, `column_edge`, `file_row` | `table` y `resizable` |
 | Migas de pan y su menú de ocultas | `breadcrumb` |
 | `button`, `icon_button`, `dialog_button`, `menu_item` | `Button` |
-| Fila de progreso como texto | `progress` |
+| Fila de progreso como texto | `progress` (hecho) |
 | `FilterInput` en `gpui_shell/input.rs` | `Input` y `InputState` |
-| Atajos como texto plano | `kbd` |
-| Controles del panel de ajustes | `switch`, `radio`, `select`, `setting` |
-| `uniform_list` del visor | `list` y `virtual_list` |
+| Atajos como texto plano | `kbd` (hecho) |
+| Controles del panel de ajustes | `radio` y menú desplegable (hecho) |
+| `uniform_list` del visor | `Scrollbar` del kit (hecho) |
 | Campo de renombrado en la fila | `Input` (hecho) |
 | `button` e `icon_button` | `Button` (hecho) |
 | Menú del botón derecho | `ContextMenu` (hecho) |
 | Tabla, cabecera y anchos | `DataTable` y `TableState` (hecho) |
 | Campos de texto de los diálogos | `Input` y `InputState` (hecho) |
 | Carpetas ocultas de las migas | `dropdown_menu` (hecho) |
-| Árbol de carpetas sobre `SidebarMenuItem` | `tree` |
+| Árbol de carpetas sobre `SidebarMenuItem` | `tree` (hecho) |
 
 ## Decisiones tomadas
 
@@ -174,10 +174,36 @@ modo que el árbol queda utilizable después de cada fase.
    trae y se reconstruyó encima: marcar muchas filas a la vez, la cebra sólo
    bajo las filas que existen, los roles y descripciones de accesibilidad, y
    ordenar pulsando el nombre de la columna y no sólo su flechita.
-6. Migas de pan, progreso, atajos, controles de ajustes y campos de texto. El
-   menú de carpetas ocultas de las migas es el último que queda dibujado a
-   mano, y con él se van `menu_row` y `menu_key_down`.
-7. Retirar `gpui_shell/input.rs` y el resto de andamiaje que quede sin uso.
+6. **Hecha.** Migas de pan, progreso, atajos, controles de ajustes, campos de
+   texto, visor y árbol lateral.
+   - **Progreso**: barra del kit con su rol y su valor numérico. El nombre
+     accesible pasó del contenedor a la barra: dos nodos con el mismo nombre lo
+     anunciaban dos veces.
+   - **Atajos**: la tabla guarda pulsaciones (`ctrl-o`), no cadenas escritas a
+     mano, y el kit las deletrea y las encajona. Con eso se fue el `Supr` que
+     la ventana pedía a un teclado cuya tecla dice Delete.
+   - **Ajustes**: idioma y tema son grupos de radios; el formato, el compresor,
+     el nivel y la página de códigos son menús que enseñan todas las opciones.
+     Los cuatro eran botones que avanzaban al siguiente valor, así que volver
+     al que se acababa de pasar era dar la vuelta entera y nada decía cuáles
+     eran las demás opciones. `cycle_format`, `cycle_codec` y `cycle_level`
+     desaparecieron, y con ellos cinco variantes de `SettingsControl`. El
+     mismo selector lo usa el diálogo de añadir, que tenía los mismos tres
+     botones.
+   - **Visor**: barra de desplazamiento del kit colgada del `UniformListScrollHandle`
+     que ya usaba. El `uniform_list` se queda: es la virtualización, y el
+     `virtual_list` del kit es para filas de altura variable.
+   - **Árbol lateral**: `tree` del kit. El panel reconstruía un
+     `SidebarMenuItem` anidado por carpeta en cada fotograma y recortaba lo que
+     no cabía, sin manera de llegar a ello. Ahora pulsar una carpeta a la vez
+     va a ella y la abre —lo que hace el árbol del kit en todas partes—, y los
+     roles se ponen a mano porque el árbol del kit no pone ninguno.
+   - No se usó `Select`: necesita una entidad `SelectState` y una suscripción
+     por control, y el propio kit dibuja sus ajustes desplegables con un
+     `Button` y un `DropdownMenu`, que es lo que hay aquí.
+7. Retirar `gpui_shell/input.rs` y el resto de andamiaje que quede sin uso
+   (`settings_focus`, `viewer_focus` y las ramas de `sync_modal_focus`, que ya
+   no se alcanzan porque todos los modales son del kit).
 
 ## Comprobación de cada fase
 
