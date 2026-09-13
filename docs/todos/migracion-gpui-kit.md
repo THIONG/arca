@@ -58,6 +58,11 @@ código. Saltárselas aborta el proceso, no da un error de compilación.
 3. `on_close` responde la pregunta pendiente solo si el estado sigue en ese
    modal. Ese guardia evita a la vez el doble despacho, cuando ya respondieron
    aceptar o cancelar, y el ciclo de abrir y cerrar sin fin.
+4. Antes de abrir un diálogo hay que llevar el foco al shell. El kit enfoca su
+   diálogo un fotograma más tarde, y hasta entonces el teclado se queda en una
+   fila del fondo que ya ha salido del árbol de accesibilidad; marcar ese mismo
+   nodo como descendiente activo aborta con `set_active_descendant called on
+   the focused node`.
 
 La tercera es la que sostiene el cierre estándar del kit: descartar un diálogo
 cancela la operación de verdad en lugar de dejar al worker esperando una
@@ -74,9 +79,10 @@ modo que el árbol queda utilizable después de cada fase.
 ## Fases
 
 1. **Hecha.** `Root` como vista raíz y capas del kit en `Frame`.
-2. **En curso.** Diálogos. Migrado el de borrado; quedan contraseña, conflicto,
-   soltar, añadir, visor, carpeta nueva, renombrar, máscara, contraseña por
-   defecto, ajustes y atajos.
+2. **Hecha.** Los doce diálogos salen del kit. Con ellos se fueron
+   `dialog_overlay`, `dialog_button`, `dialogs`, `modal_key_down`,
+   `modal_enter`, `modal_focus_targets`, once manejadores de foco y la cadena
+   `close`, que ya no tiene botón que la use.
 3. Botones: `button`, `icon_button`, `dialog_button` y `menu_item`.
 4. Menú contextual de fila.
 5. Tabla de ficheros, con sus gestos reconstruidos.
@@ -102,3 +108,5 @@ estado y el ZIP con cero entradas en disco.
   del kit. Hay que validar con el teclado.
 - Borrar trabaja sobre las filas marcadas, no sobre la fila enfocada: hace falta
   `Ctrl+A` antes de `Supr`.
+- Las teclas de función solo llegan con el foco dentro de la lista, y el arnés
+  no siempre lo consigue a la primera.

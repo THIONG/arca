@@ -960,6 +960,13 @@ impl GpuiShell {
             window.close_all_dialogs(cx);
         }
         if let Some(kind) = want {
+            // Park the keyboard on the shell before the dialog exists. The row
+            // that had the focus drops out of the accessibility tree as soon as
+            // the modal opens, and leaving the focus on it until the kit
+            // focuses its own dialog a frame later aborts the process the next
+            // time something marks an active descendant.
+            let neutral = self.focus_handle.clone();
+            window.focus(&neutral, cx);
             let shell = cx.weak_entity();
             window.open_dialog(cx, move |dialog, window, cx| {
                 let Some(shell) = shell.upgrade() else {
