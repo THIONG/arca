@@ -26,6 +26,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::kbd::Kbd;
 use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::progress::Progress;
+use gpui_component::radio::RadioGroup;
 use gpui_component::separator::Separator;
 use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_component::status_bar::StatusBar;
@@ -222,9 +223,10 @@ impl RowAction {
     }
 }
 
-/// A control in the settings dialog, in draw order. The index into
-/// `settings_focus` is `control as usize`, so the keyboard and the mouse reach
-/// the same code instead of two copies of it.
+/// A control in the settings dialog whose choices are named rather than
+/// listed: the language, the theme, and the switch that extracts into a
+/// subfolder. The settings that pick a value out of a list go through `pick`
+/// and need no name of their own.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsControl {
     LangSystem,
@@ -233,31 +235,18 @@ enum SettingsControl {
     ThemeSystem,
     ThemeLight,
     ThemeDark,
-    Format,
-    Codec,
-    Level,
     Subfolder,
-    /// Which code page an unflagged zip has its names written in. Only the
-    /// person looking at the archive can know, so it is a choice, and a choice
-    /// that is remembered is a setting.
-    NamePage,
-    Close,
 }
 
 impl SettingsControl {
-    const ALL: [SettingsControl; 12] = [
+    const ALL: [SettingsControl; 7] = [
         SettingsControl::LangSystem,
         SettingsControl::LangEn,
         SettingsControl::LangEs,
         SettingsControl::ThemeSystem,
         SettingsControl::ThemeLight,
         SettingsControl::ThemeDark,
-        SettingsControl::Format,
-        SettingsControl::Codec,
-        SettingsControl::Level,
         SettingsControl::Subfolder,
-        SettingsControl::NamePage,
-        SettingsControl::Close,
     ];
 }
 
@@ -949,22 +938,9 @@ impl GpuiShell {
                 self.set_theme(super::ThemePreference::Light, window, cx)
             }
             SettingsControl::ThemeDark => self.set_theme(super::ThemePreference::Dark, window, cx),
-            SettingsControl::Format => self.cycle_format(),
-            SettingsControl::Codec => self.cycle_codec(),
-            SettingsControl::Level => self.cycle_level(),
             SettingsControl::Subfolder => {
                 self.controller.state.into_subfolder = !self.controller.state.into_subfolder;
             }
-            SettingsControl::NamePage => {
-                let pages = arca_zip::pages::Page::ALL;
-                let at = pages
-                    .iter()
-                    .position(|(page, _, _)| *page == self.controller.state.settings.page)
-                    .unwrap_or(0);
-                self.controller
-                    .reread_names(pages[(at + 1) % pages.len()].0);
-            }
-            SettingsControl::Close => self.controller.state.show_settings = false,
         }
     }
 
@@ -1175,35 +1151,6 @@ impl GpuiShell {
         self.controller.state.password_input.clear();
         self.controller.state.notice = s.password_forgotten.to_string();
         self.controller.state.error = false;
-    }
-
-    /// The dialogs that are one text field and two buttons: a new folder, a
-    /// new name, a mask.
-    fn cycle_format(&mut self) {
-        self.controller.state.format = match self.controller.state.format {
-            super::Format::Zip => super::Format::Tar,
-            super::Format::Tar => super::Format::TarGz,
-            super::Format::TarGz => super::Format::Zip,
-        };
-    }
-
-    fn cycle_codec(&mut self) {
-        if self.controller.state.format == super::Format::Zip {
-            self.controller.state.codec = match self.controller.state.codec {
-                super::Codec::Store => super::Codec::Deflate,
-                super::Codec::Deflate => super::Codec::Zstd,
-                super::Codec::Zstd => super::Codec::Store,
-            };
-        }
-    }
-
-    fn cycle_level(&mut self) {
-        self.controller.state.level = match self.controller.state.level {
-            super::Level::Store => super::Level::Fast,
-            super::Level::Fast => super::Level::Normal,
-            super::Level::Normal => super::Level::Best,
-            super::Level::Best => super::Level::Store,
-        };
     }
 
     fn start_add(&mut self, cx: &mut Context<Self>) {
@@ -3431,6 +3378,126 @@ impl Render for Frame {
 /// `Frame`, so it may read the shell, but it must never write it -- a write
 /// here would repaint from inside a paint. The handlers below are fine,
 /// because a click is dispatched between frames.
+/// A setting picked from everything it can be, rather than cycled one press
+/// at a time.
+///
+/// A button that cycles hides every other choice behind the one written on it,
+/// and the only way back to the choice you just passed is round again. The
+/// name of the setting goes to the accessible name, because the label is the
+/// value.
+fn pick<T: Copy + PartialEq + 'static>(
+    id: &'static str,
+    name: &'static str,
+    options: Vec<(T, &'static str)>,
+    current: T,
+    enabled: bool,
+    weak: WeakEntity<GpuiShell>,
+    apply: fn(&mut GpuiShell, T),
+) -> gpui::AnyElement {
+    let label = options
+        .iter()
+        .find(|(candidate, _)| *candidate == current)
+        .map(|(_, label)| *label)
+        .unwrap_or_default();
+    Button::new(id)
+        .label(label)
+        .accessibility_label(name)
+        .dropdown_caret(true)
+        .outline()
+        .disabled(!enabled)
+        .dropdown_menu(move |menu, _, _| {
+            options.iter().fold(menu, |menu, (value, label)| {
+                let (value, weak) = (*value, weak.clone());
+                menu.item(
+                    PopupMenuItem::new(*label)
+                        .checked(value == current)
+                        .on_click(move |_, _, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                apply(this, value);
+                                cx.notify();
+                            });
+                        }),
+                )
+            })
+        })
+        .into_any_element()
+}
+
+/// The three compression settings, shared by the settings dialog and the add
+/// dialog so the two cannot drift apart.
+fn format_pick(
+    id: &'static str,
+    shell: &Entity<GpuiShell>,
+    weak: &WeakEntity<GpuiShell>,
+    cx: &App,
+) -> gpui::AnyElement {
+    let s = shell.read(cx).controller.s();
+    let options = [super::Format::Zip, super::Format::Tar, super::Format::TarGz]
+        .map(|format| (format, format.label()))
+        .to_vec();
+    pick(
+        id,
+        s.format,
+        options,
+        shell.read(cx).controller.state.format,
+        true,
+        weak.clone(),
+        |this, format| this.controller.state.format = format,
+    )
+}
+
+fn codec_pick(
+    id: &'static str,
+    shell: &Entity<GpuiShell>,
+    weak: &WeakEntity<GpuiShell>,
+    enabled: bool,
+    cx: &App,
+) -> gpui::AnyElement {
+    let this = shell.read(cx);
+    let options = [
+        super::Codec::Store,
+        super::Codec::Deflate,
+        super::Codec::Zstd,
+    ]
+    .map(|codec| (codec, this.controller.codec_name(codec)))
+    .to_vec();
+    pick(
+        id,
+        this.controller.s().compressor,
+        options,
+        this.controller.state.codec,
+        enabled,
+        weak.clone(),
+        |this, codec| this.controller.state.codec = codec,
+    )
+}
+
+fn level_pick(
+    id: &'static str,
+    shell: &Entity<GpuiShell>,
+    weak: &WeakEntity<GpuiShell>,
+    cx: &App,
+) -> gpui::AnyElement {
+    let this = shell.read(cx);
+    let options = [
+        super::Level::Store,
+        super::Level::Fast,
+        super::Level::Normal,
+        super::Level::Best,
+    ]
+    .map(|level| (level, this.controller.level_name(level)))
+    .to_vec();
+    pick(
+        id,
+        this.controller.s().level,
+        options,
+        this.controller.state.level,
+        true,
+        weak.clone(),
+        |this, level| this.controller.state.level = level,
+    )
+}
+
 fn build_dialog(
     kind: ModalKind,
     shell: &Entity<GpuiShell>,
@@ -3784,35 +3851,11 @@ fn build_dialog(
                 })
         }
         ModalKind::Add => {
-            let format = shell.read(cx).controller.state.format;
-            let is_zip = format == super::Format::Zip;
-            let codec_label = {
-                let this = shell.read(cx);
-                this.controller.codec_name(this.controller.state.codec)
-            };
-            let level_label = {
-                let this = shell.read(cx);
-                this.controller.level_name(this.controller.state.level)
-            };
+            let is_zip = shell.read(cx).controller.state.format == super::Format::Zip;
             let count = shell.read(cx).controller.state.pending_inputs.len();
             let output_name = shell.read(cx).output_name.clone();
             let add_password = shell.read(cx).add_password.clone();
-            // The kit's `Button` names itself from its label, and the label
-            // beside it says which setting it belongs to.
-            let cycle =
-                |id: &'static str, label: &'static str, enabled: bool, step: fn(&mut GpuiShell)| {
-                    let weak = weak.clone();
-                    Button::new(id)
-                        .label(label)
-                        .disabled(!enabled)
-                        .on_click(move |_, _, cx| {
-                            let _ = weak.update(cx, |this, cx| {
-                                step(this);
-                                cx.notify();
-                            });
-                        })
-                };
-            let labelled = |label: &'static str, control: Button| {
+            let labelled = |label: &'static str, control: gpui::AnyElement| {
                 div()
                     .flex()
                     .items_center()
@@ -3840,16 +3883,13 @@ fn build_dialog(
                         .gap_2()
                         .child(labelled(
                             s.format,
-                            cycle("add-format", format.label(), true, GpuiShell::cycle_format),
+                            format_pick("add-format", shell, &weak, cx),
                         ))
                         .child(labelled(
                             s.compressor,
-                            cycle("add-codec", codec_label, is_zip, GpuiShell::cycle_codec),
+                            codec_pick("add-codec", shell, &weak, is_zip, cx),
                         ))
-                        .child(labelled(
-                            s.level,
-                            cycle("add-level", level_label, true, GpuiShell::cycle_level),
-                        )),
+                        .child(labelled(s.level, level_pick("add-level", shell, &weak, cx))),
                 );
             if is_zip {
                 body = body.child(
@@ -4021,47 +4061,68 @@ fn build_dialog(
             let lang = shell.read(cx).controller.state.settings.lang;
             let theme = shell.read(cx).controller.state.settings.theme;
             let is_zip = shell.read(cx).controller.state.format == super::Format::Zip;
-            let format_label = shell.read(cx).controller.state.format.label();
-            let codec_label = {
-                let this = shell.read(cx);
-                this.controller.codec_name(this.controller.state.codec)
-            };
-            let level_label = {
-                let this = shell.read(cx);
-                this.controller.level_name(this.controller.state.level)
-            };
-            let page_label = {
-                let page = shell.read(cx).controller.state.settings.page;
-                arca_zip::pages::Page::ALL
-                    .iter()
-                    .find(|(candidate, _, _)| *candidate == page)
-                    .map(|(_, _, label)| *label)
-                    .unwrap_or("")
-            };
+            let page = shell.read(cx).controller.state.settings.page;
+            let pages = arca_zip::pages::Page::ALL
+                .iter()
+                .map(|(page, _, label)| (*page, *label))
+                .collect::<Vec<_>>();
             let subfolder_on = shell.read(cx).controller.state.into_subfolder;
             let muted = cx.theme().muted_foreground;
-            let choice =
-                |control: SettingsControl, label: &'static str, active: bool, enabled: bool| {
-                    let weak = weak.clone();
-                    Button::new(("settings", control as usize))
-                        .label(label)
-                        .selected(active)
-                        .disabled(!enabled)
-                        .on_click(move |_, window, cx| {
-                            let _ = weak.update(cx, |this, cx| {
-                                this.settings_activate(control, window, cx);
-                                cx.notify();
-                            });
-                        })
-                };
-            let row = |label: &'static str, children: Vec<Button>| {
+            // Radios rather than a row of buttons where one looks pressed:
+            // these are one-of-three choices, and the kit's radio says so to
+            // the keyboard and to the screen reader without being told.
+            let langs = [None, Some(super::Lang::En), Some(super::Lang::Es)];
+            let language = {
+                let weak = weak.clone();
+                RadioGroup::horizontal("settings-language")
+                    .selected_index(langs.iter().position(|candidate| *candidate == lang))
+                    .children(vec![
+                        s.theme_system,
+                        super::Lang::En.label(),
+                        super::Lang::Es.label(),
+                    ])
+                    .on_click(move |index, window, cx| {
+                        let control = match index {
+                            0 => SettingsControl::LangSystem,
+                            1 => SettingsControl::LangEn,
+                            _ => SettingsControl::LangEs,
+                        };
+                        let _ = weak.update(cx, |this, cx| {
+                            this.settings_activate(control, window, cx);
+                            cx.notify();
+                        });
+                    })
+            };
+            let themes = [
+                super::ThemePreference::System,
+                super::ThemePreference::Light,
+                super::ThemePreference::Dark,
+            ];
+            let appearance = {
+                let weak = weak.clone();
+                RadioGroup::horizontal("settings-theme")
+                    .selected_index(themes.iter().position(|candidate| *candidate == theme))
+                    .children(vec![s.theme_system, s.theme_light, s.theme_dark])
+                    .on_click(move |index, window, cx| {
+                        let control = match index {
+                            0 => SettingsControl::ThemeSystem,
+                            1 => SettingsControl::ThemeLight,
+                            _ => SettingsControl::ThemeDark,
+                        };
+                        let _ = weak.update(cx, |this, cx| {
+                            this.settings_activate(control, window, cx);
+                            cx.notify();
+                        });
+                    })
+            };
+            let row = |label: &'static str, control: gpui::AnyElement| {
                 div()
                     .flex()
                     .items_center()
                     .flex_wrap()
                     .gap_2()
                     .child(div().w(px(110.)).flex_none().child(label))
-                    .children(children)
+                    .child(control)
             };
             let subfolder = {
                 let weak = weak.clone();
@@ -4084,70 +4145,31 @@ fn build_dialog(
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .child(row(
-                            s.language,
-                            vec![
-                                choice(
-                                    SettingsControl::LangSystem,
-                                    s.theme_system,
-                                    lang.is_none(),
-                                    true,
-                                ),
-                                choice(
-                                    SettingsControl::LangEn,
-                                    super::Lang::En.label(),
-                                    lang == Some(super::Lang::En),
-                                    true,
-                                ),
-                                choice(
-                                    SettingsControl::LangEs,
-                                    super::Lang::Es.label(),
-                                    lang == Some(super::Lang::Es),
-                                    true,
-                                ),
-                            ],
-                        ))
-                        .child(row(
-                            s.theme,
-                            vec![
-                                choice(
-                                    SettingsControl::ThemeSystem,
-                                    s.theme_system,
-                                    theme == super::ThemePreference::System,
-                                    true,
-                                ),
-                                choice(
-                                    SettingsControl::ThemeLight,
-                                    s.theme_light,
-                                    theme == super::ThemePreference::Light,
-                                    true,
-                                ),
-                                choice(
-                                    SettingsControl::ThemeDark,
-                                    s.theme_dark,
-                                    theme == super::ThemePreference::Dark,
-                                    true,
-                                ),
-                            ],
-                        ))
+                        .child(row(s.language, language.into_any_element()))
+                        .child(row(s.theme, appearance.into_any_element()))
                         .child(row(
                             s.name_encoding,
-                            vec![choice(SettingsControl::NamePage, page_label, false, true)],
+                            pick(
+                                "settings-page",
+                                s.name_encoding,
+                                pages,
+                                page,
+                                true,
+                                weak.clone(),
+                                |this, page| this.controller.reread_names(page),
+                            ),
                         ))
                         .child(Separator::horizontal())
                         .child(div().text_sm().text_color(muted).child(s.defaults_title))
                         .child(row(
                             s.format,
-                            vec![choice(SettingsControl::Format, format_label, false, true)],
+                            format_pick("settings-format", shell, &weak, cx),
                         ))
                         .child(row(
                             s.compressor,
-                            vec![choice(SettingsControl::Codec, codec_label, false, is_zip)],
+                            codec_pick("settings-codec", shell, &weak, is_zip, cx),
                         ))
-                        .child(row(
-                            s.level,
-                            vec![choice(SettingsControl::Level, level_label, false, true)],
-                        ))
+                        .child(row(s.level, level_pick("settings-level", shell, &weak, cx)))
                         .child(subfolder),
                 )
         }
