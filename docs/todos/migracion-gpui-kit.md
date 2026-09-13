@@ -37,6 +37,7 @@ ya trae. El recuento de partida en `gpui_shell/mod.rs` (6067 líneas) era de 95
 | `button` e `icon_button` | `Button` (hecho) |
 | Menú del botón derecho | `ContextMenu` (hecho) |
 | Tabla, cabecera y anchos | `DataTable` y `TableState` (hecho) |
+| Campos de texto de los diálogos | `Input` y `InputState` (hecho) |
 | Árbol de carpetas sobre `SidebarMenuItem` | `tree` |
 
 ## Decisiones tomadas
@@ -88,6 +89,21 @@ pero tampoco lo pone el kit:
 - Los roles de accesibilidad se ponen a mano en el delegate. Sin ellos la
   tabla desaparece del árbol: es lo primero que hay que volver a mirar si
   alguna vez se cambia cómo se dibuja una fila.
+
+## El editor de texto que ya no hace falta
+
+`gpui_shell/input.rs` eran 452 líneas para escribir en cuatro campos: el
+contrato UTF-16 que esperan los IME del sistema, un elemento propio con su
+medida y su pintado, y la cuenta de dónde está el cursor. Todo eso lo trae
+`InputState`, que ya se usaba para el filtro y para el renombrado; los cuatro
+campos que quedaban a mano (contraseña, nombre de salida, contraseña al
+comprimir y el campo compartido de nombre) pasaron a suscribirse a
+`InputEvent::Change` y el módulo entero desapareció.
+
+Lo que se gana además de las líneas: deshacer, portapapeles, selección con el
+ratón y un IME de verdad, que el campo a mano no tenía. `select_all` sí
+existe en `InputState` — estaba mal anotado aquí — así que al renombrar el
+nombre viejo ya sale seleccionado, como en cualquier explorador.
 
 ## El tema se pinta dos veces
 

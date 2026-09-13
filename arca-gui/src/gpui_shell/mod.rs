@@ -6,9 +6,6 @@
 //! `uniform_list`; dialog state and overlays are rendered by GPUI, while native
 //! file pickers stay on worker threads.
 
-mod input;
-use input::*;
-
 use super::{
     fill, human, parent_of, saved_of, when, Answer, AppAction, AppController, Columns, DropChoice,
     Job, Pending, Settings, SortColumn, Startup, Strings, View,
@@ -59,17 +56,19 @@ const MINIMUM_SIZE: (f32, f32) = (720.0, 320.0);
 /// many as anybody scans before giving up and going to the folder instead.
 const RECENT_MAX: usize = 10;
 
-actions!(
-    arca_gpui,
-    [
-        Backspace,
-        SelectAll,
-        FocusFilter,
-        CopyFiles,
-        CutFiles,
-        PasteFiles
-    ]
-);
+actions!(arca_gpui, [FocusFilter, CopyFiles, CutFiles, PasteFiles]);
+
+/// What came back from a native file dialog, which runs off the main thread.
+enum DialogResult {
+    Open(Option<PathBuf>),
+    Compress(Option<Vec<PathBuf>>),
+    Extract {
+        only_checked: bool,
+        destination: Option<PathBuf>,
+    },
+    AddFiles(Option<Vec<PathBuf>>),
+    SaveCopy(Option<PathBuf>),
+}
 
 struct GpuiShell {
     controller: AppController,
@@ -78,10 +77,10 @@ struct GpuiShell {
     /// happens in the row, the way every file manager does it, so there is no
     /// dialog for it.
     rename_input: Entity<InputState>,
-    password: Entity<FilterInput>,
-    output_name: Entity<FilterInput>,
-    add_password: Entity<FilterInput>,
-    name_input: Entity<FilterInput>,
+    password: Entity<InputState>,
+    output_name: Entity<InputState>,
+    add_password: Entity<InputState>,
+    name_input: Entity<InputState>,
     focus_handle: FocusHandle,
     list_focus: FocusHandle,
     /// The same handle the kit's table scrolls with. The band needs the list's
@@ -381,62 +380,53 @@ impl GpuiShell {
             }
         })
         .detach();
-        let password = cx.new(|cx| FilterInput {
-            owner: owner.clone(),
-            strings,
-            label: strings.password_word,
-            focus_handle: cx.focus_handle(),
-            enabled: false,
-            kind: TextFieldKind::Password,
-            masked: true,
-            content: String::new(),
-            selected_range: 0..0,
-            marked_range: None,
-            last_layout: None,
-            last_bounds: None,
+        let password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(strings.password_word)
+                .masked(true)
         });
-        let output_name = cx.new(|cx| FilterInput {
-            owner: owner.clone(),
-            strings,
-            label: strings.output_name,
-            focus_handle: cx.focus_handle(),
-            enabled: false,
-            kind: TextFieldKind::OutputName,
-            masked: false,
-            content: String::new(),
-            selected_range: 0..0,
-            marked_range: None,
-            last_layout: None,
-            last_bounds: None,
+        let output_name = cx.new(|cx| InputState::new(window, cx).placeholder(strings.output_name));
+        let add_password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(strings.password_optional)
+                .masked(true)
         });
-        let add_password = cx.new(|cx| FilterInput {
-            owner: owner.clone(),
-            strings,
-            label: strings.password_optional,
-            focus_handle: cx.focus_handle(),
-            enabled: false,
-            kind: TextFieldKind::AddPassword,
-            masked: true,
-            content: String::new(),
-            selected_range: 0..0,
-            marked_range: None,
-            last_layout: None,
-            last_bounds: None,
-        });
-        let name_input = cx.new(|cx| FilterInput {
-            owner,
-            strings,
-            label: strings.folder_name,
-            focus_handle: cx.focus_handle(),
-            enabled: false,
-            kind: TextFieldKind::Name,
-            masked: false,
-            content: String::new(),
-            selected_range: 0..0,
-            marked_range: None,
-            last_layout: None,
-            last_bounds: None,
-        });
+        let name_input = cx.new(|cx| InputState::new(window, cx).placeholder(strings.folder_name));
+        // Every dialog field lands in a different place, but they all land the
+        // same way: one subscription each, so a new field is one arm here
+        // rather than a second path that can be forgotten.
+        cx.subscribe(&password, |shell, state, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                let value = state.read(cx).value().to_string();
+                shell
+                    .controller
+                    .dispatch(AppAction::SetPasswordInput(value));
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe(&output_name, |shell, state, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                shell.controller.state.output_name = state.read(cx).value().to_string();
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe(&add_password, |shell, state, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                shell.controller.state.add_password = state.read(cx).value().to_string();
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe(&name_input, |shell, state, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                shell.name_value = state.read(cx).value().to_string();
+                cx.notify();
+            }
+        })
+        .detach();
+        let _ = owner;
         let mut controller = AppController::new(Settings::load());
         apply_startup(&mut controller, startup);
         // The stored preference decides light, dark or whatever the desktop is
@@ -948,10 +938,10 @@ impl GpuiShell {
     fn modal_text_field(&self, kind: ModalKind, cx: &App) -> Option<FocusHandle> {
         match kind {
             ModalKind::Password | ModalKind::DefaultPassword => {
-                Some(self.password.read(cx).focus_handle.clone())
+                Some(self.password.read(cx).focus_handle(cx).clone())
             }
             ModalKind::NewFolder | ModalKind::Mask => {
-                Some(self.name_input.read(cx).focus_handle.clone())
+                Some(self.name_input.read(cx).focus_handle(cx).clone())
             }
             _ => None,
         }
@@ -1070,16 +1060,16 @@ impl GpuiShell {
         }
         self.modal_seen = current;
         let target = match current {
-            Some(ModalKind::Password) => self.password.read(cx).focus_handle.clone(),
+            Some(ModalKind::Password) => self.password.read(cx).focus_handle(cx).clone(),
             Some(ModalKind::Conflict | ModalKind::Delete | ModalKind::Drop) => {
                 self.dialog_primary_focus.clone()
             }
-            Some(ModalKind::Add) => self.output_name.read(cx).focus_handle.clone(),
+            Some(ModalKind::Add) => self.output_name.read(cx).focus_handle(cx).clone(),
             Some(ModalKind::Viewer) => self.viewer_focus[0].clone(),
             Some(ModalKind::NewFolder | ModalKind::Mask) => {
-                self.name_input.read(cx).focus_handle.clone()
+                self.name_input.read(cx).focus_handle(cx).clone()
             }
-            Some(ModalKind::DefaultPassword) => self.password.read(cx).focus_handle.clone(),
+            Some(ModalKind::DefaultPassword) => self.password.read(cx).focus_handle(cx).clone(),
             Some(ModalKind::Settings) => self.settings_focus[0].clone(),
             Some(ModalKind::Shortcuts) => self.dialog_cancel_focus.clone(),
             None => match self.dialog_return_focus.clone() {
@@ -1239,6 +1229,9 @@ impl GpuiShell {
         self.controller.state.renaming = Some((row.path.clone(), label.clone()));
         self.rename_input.update(cx, |state, cx| {
             state.set_value(label, window, cx);
+            // Renaming usually replaces the name rather than appends to it, so
+            // the old one starts out selected and the first keystroke wipes it.
+            state.select_all(window, cx);
         });
         let field = self.rename_input.read(cx).focus_handle(cx);
         window.focus(&field, cx);
@@ -1665,9 +1658,14 @@ impl GpuiShell {
                 .read(cx)
                 .focus_handle(cx)
                 .is_focused(window)
-            || [&self.password, &self.output_name, &self.add_password]
-                .iter()
-                .any(|input| input.read(cx).focus_handle.is_focused(window))
+            || [
+                &self.password,
+                &self.output_name,
+                &self.add_password,
+                &self.name_input,
+            ]
+            .iter()
+            .any(|input| input.read(cx).focus_handle(cx).is_focused(window))
     }
 
     /// The shortcuts that belong to the window rather than to the list.
@@ -2386,16 +2384,18 @@ impl Render for GpuiShell {
         let password_value = self.controller.state.password_input.clone();
         let add_password_value = self.controller.state.add_password.clone();
         let password_masked = !self.controller.state.show_password;
-        self.password.update(cx, |input, _| {
-            input.strings = s;
-            input.label = s.password_word;
-            input.enabled = matches!(
-                modal,
-                Some(ModalKind::Password | ModalKind::DefaultPassword)
+        self.password.update(cx, |input, cx| {
+            input.set_placeholder(s.password_word, window, cx);
+            input.set_disabled(
+                !matches!(
+                    modal,
+                    Some(ModalKind::Password | ModalKind::DefaultPassword)
+                ),
+                cx,
             );
-            input.masked = password_masked;
-            if input.content != password_value {
-                input.sync_from_state(&password_value);
+            input.set_masked(password_masked, window, cx);
+            if input.value() != password_value.as_str() {
+                input.set_value(password_value.clone(), window, cx);
             }
         });
         // The shared text field takes the name of whichever dialog is asking.
@@ -2404,30 +2404,31 @@ impl Render for GpuiShell {
             _ => s.folder_name,
         };
         let name_value = self.name_value.clone();
-        self.name_input.update(cx, |input, _| {
-            input.strings = s;
-            input.label = name_label;
-            input.enabled = matches!(modal, Some(ModalKind::NewFolder | ModalKind::Mask));
-            if input.content != name_value {
-                input.sync_from_state(&name_value);
+        self.name_input.update(cx, |input, cx| {
+            input.set_placeholder(name_label, window, cx);
+            input.set_disabled(
+                !matches!(modal, Some(ModalKind::NewFolder | ModalKind::Mask)),
+                cx,
+            );
+            if input.value() != name_value.as_str() {
+                input.set_value(name_value.clone(), window, cx);
             }
         });
-        self.output_name.update(cx, |input, _| {
-            input.strings = s;
-            input.label = s.output_name;
-            input.enabled = matches!(modal, Some(ModalKind::Add));
-            if input.content != self.controller.state.output_name {
-                input.sync_from_state(&self.controller.state.output_name);
+        let output_value = self.controller.state.output_name.clone();
+        self.output_name.update(cx, |input, cx| {
+            input.set_placeholder(s.output_name, window, cx);
+            input.set_disabled(!matches!(modal, Some(ModalKind::Add)), cx);
+            if input.value() != output_value.as_str() {
+                input.set_value(output_value.clone(), window, cx);
             }
         });
-        self.add_password.update(cx, |input, _| {
-            input.strings = s;
-            input.label = s.password_optional;
-            input.enabled = matches!(modal, Some(ModalKind::Add))
-                && self.controller.state.format == super::Format::Zip;
-            input.masked = password_masked;
-            if input.content != add_password_value {
-                input.sync_from_state(&add_password_value);
+        let zip = self.controller.state.format == super::Format::Zip;
+        self.add_password.update(cx, |input, cx| {
+            input.set_placeholder(s.password_optional, window, cx);
+            input.set_disabled(!(matches!(modal, Some(ModalKind::Add)) && zip), cx);
+            input.set_masked(password_masked, window, cx);
+            if input.value() != add_password_value.as_str() {
+                input.set_value(add_password_value.clone(), window, cx);
             }
         });
         let state_filter = self.controller.state.filter.clone();
@@ -3903,7 +3904,7 @@ fn build_dialog(
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .child(field)
+                        .child(Input::new(&field))
                         .child(reveal_button("password-visibility")),
                 )
                 .footer(
@@ -3917,7 +3918,7 @@ fn build_dialog(
                 )
                 .on_ok(move |_, _, cx| {
                     let _ = submit.update(cx, |this, cx| {
-                        let password = this.password.read(cx).content.clone();
+                        let password = this.password.read(cx).value().to_string();
                         this.controller
                             .dispatch(AppAction::SubmitPassword(password));
                         cx.notify();
@@ -3938,7 +3939,7 @@ fn build_dialog(
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .child(field)
+                        .child(Input::new(&field))
                         .child(reveal_button("default-password-visibility"))
                         .child(div().text_xs().text_color(muted).child(s.password_kept)),
                 )
@@ -4019,7 +4020,7 @@ fn build_dialog(
                         .items_center()
                         .gap_2()
                         .child(s.output_name)
-                        .child(output_name),
+                        .child(Input::new(&output_name)),
                 )
                 .child(
                     div()
@@ -4044,7 +4045,7 @@ fn build_dialog(
                     div()
                         .flex()
                         .gap_2()
-                        .child(add_password)
+                        .child(Input::new(&add_password))
                         .child(reveal_button("add-password-visibility")),
                 );
             }
@@ -4365,7 +4366,7 @@ fn build_dialog(
             dialog
                 .title(title)
                 .child(DialogDescription::new().child(hint))
-                .child(field)
+                .child(Input::new(&field))
                 .footer(
                     DialogFooter::new()
                         .child(cancel_button("name-cancel", s.cancel))
@@ -4976,9 +4977,6 @@ pub(crate) fn run() {
                 KeyBinding::new("cmd-x", CutFiles, None),
                 KeyBinding::new("ctrl-v", PasteFiles, None),
                 KeyBinding::new("cmd-v", PasteFiles, None),
-                KeyBinding::new("backspace", Backspace, Some("FilterInput")),
-                KeyBinding::new("ctrl-a", SelectAll, Some("FilterInput")),
-                KeyBinding::new("cmd-a", SelectAll, Some("FilterInput")),
             ]);
             let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
             let window = cx
