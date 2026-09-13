@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod archive_ops;
+mod assets;
 mod clipboard;
 mod controller;
 mod gpui_shell;

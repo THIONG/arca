@@ -242,6 +242,23 @@ impl RowAction {
     }
 }
 
+fn row_action_icon(action: RowAction) -> Option<Icon> {
+    match action {
+        RowAction::Open => Some(Icon::new(IconName::FolderOpen)),
+        RowAction::ExtractSelection => Some(Icon::empty().path("icons/file-output.svg")),
+        RowAction::ExtractHere => Some(Icon::new(IconName::PanelBottomOpen)),
+        RowAction::TestSelection => Some(Icon::new(IconName::Check)),
+        RowAction::View => Some(Icon::new(IconName::Eye)),
+        RowAction::Rename => Some(Icon::new(IconName::Replace)),
+        RowAction::Delete => Some(Icon::empty().path("icons/trash-2.svg")),
+        RowAction::Copy => Some(Icon::new(IconName::Copy)),
+        RowAction::Cut => Some(Icon::empty().path("icons/scissors.svg")),
+        RowAction::Paste => None,
+        RowAction::CopyNames => Some(Icon::new(IconName::FileText)),
+        RowAction::SelectAll => Some(Icon::new(IconName::Check)),
+    }
+}
+
 /// A control in the settings dialog whose choices are named rather than
 /// listed: the language, the theme, and the switch that extracts into a
 /// subfolder. The settings that pick a value out of a list go through `pick`
@@ -859,12 +876,12 @@ impl GpuiShell {
     /// still the word, so nothing changes for a screen reader.
     fn icon_button(
         id: impl Into<ElementId>,
-        icon: IconName,
+        icon: impl Into<Icon>,
         accessible_name: String,
         enabled: bool,
     ) -> Button {
         Button::new(id)
-            .icon(Icon::new(icon).size_4())
+            .icon(icon.into().size_4())
             .accessibility_label(accessible_name.clone())
             .tooltip(accessible_name)
             .ghost()
@@ -2455,7 +2472,7 @@ impl Render for GpuiShell {
         })));
         let extract_selected = Self::icon_button(
             "extract-selected",
-            IconName::File,
+            Icon::empty().path("icons/file-output.svg"),
             s.extract_selected.to_string(),
             can_extract_selected,
         );
@@ -2467,7 +2484,7 @@ impl Render for GpuiShell {
         })));
         let password = Self::icon_button(
             "password",
-            IconName::EyeOff,
+            Icon::empty().path("icons/lock.svg"),
             format!("{} / {}", s.set_password, s.remove_password),
             password_available,
         );
@@ -2503,6 +2520,61 @@ impl Render for GpuiShell {
             .iter()
             .map(|(column, _)| (*column, self.controller.state.settings.columns.on(*column)))
             .collect::<Vec<_>>();
+
+        let copy = Self::icon_button("copy", IconName::Copy, s.copy_word.to_string(), can_copy);
+        toolbar = toolbar.child(copy.on_click(cx.listener(|this, _, window, cx| {
+            if this.background_idle() {
+                this.dispatch_clipboard(false, window, cx);
+                cx.notify();
+            }
+        })));
+        let cut = Self::icon_button(
+            "cut",
+            Icon::empty().path("icons/scissors.svg"),
+            s.cut_word.to_string(),
+            can_copy,
+        );
+        toolbar = toolbar.child(cut.on_click(cx.listener(|this, _, window, cx| {
+            if this.background_idle() {
+                this.dispatch_clipboard(true, window, cx);
+                cx.notify();
+            }
+        })));
+        let delete = Self::icon_button(
+            "delete",
+            Icon::empty().path("icons/trash-2.svg"),
+            s.delete_word.to_string(),
+            writable && selected > 0 && idle,
+        );
+        toolbar = toolbar.child(delete.on_click(cx.listener(|this, _, _, cx| {
+            if this.background_idle() {
+                this.dialog_return_focus = Some(this.delete_trigger_focus.clone());
+                this.controller.dispatch(AppAction::RequestDelete);
+                cx.notify();
+            }
+        })));
+        let test = Self::icon_button(
+            "test-selection",
+            IconName::Check,
+            s.test_selection.to_string(),
+            has_archive && idle,
+        );
+        toolbar = toolbar.child(test.on_click(cx.listener(|this, _, _, cx| {
+            if !this.background_idle() {
+                return;
+            }
+            let names = this.controller.selected_names();
+            if let Some(archive) = this.controller.state.archive.clone() {
+                this.controller.dispatch(AppAction::Run(Job::Test {
+                    archive,
+                    only: (!names.is_empty()).then(|| names.into_iter().collect()),
+                }));
+            }
+            cx.notify();
+        })));
+        toolbar = toolbar.child(div().px_1().child(Separator::vertical().h(px(16.))));
+
+        let settings_owner = owner.clone();
         let overflow = Button::new("overflow")
             .icon(IconName::Ellipsis)
             .accessibility_label(s.more_word)
@@ -2780,7 +2852,20 @@ impl Render for GpuiShell {
                     },
                 )
             });
-        toolbar = toolbar.child(overflow);
+        let settings = Button::new("settings")
+            .icon(IconName::Settings)
+            .accessibility_label(s.settings)
+            .tooltip(s.settings)
+            .ghost()
+            .compact()
+            .disabled(!idle)
+            .on_click(move |_, _, cx| {
+                let _ = settings_owner.update(cx, |this, cx| {
+                    this.controller.state.show_settings = true;
+                    cx.notify();
+                });
+            });
+        toolbar = toolbar.child(settings).child(overflow);
 
         // The filter sits at the far end of the bar, the way a search field
         // does in every file manager on the desktop, instead of stretching
@@ -4907,29 +4992,32 @@ impl TableDelegate for FileTable {
             }
             drawn = true;
             let (label, keys) = action.label(strings);
+            let icon = row_action_icon(action);
             let shell = shell.clone();
-            menu = menu.item(
-                PopupMenuItem::element(move |_, cx| {
-                    // Two children rather than one string with a tab in it:
-                    // GPUI lays out text and a tab is nothing at all there.
-                    let mut row = div().flex().w_full().gap_4().items_center();
-                    row = row.child(div().flex_1().truncate().child(label));
-                    if !keys.is_empty() {
-                        row = row.child(
-                            div()
-                                .flex_none()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(keys),
-                        );
-                    }
-                    row
-                })
-                .on_click(move |_, window, cx| {
-                    let _ = shell.update(cx, |shell, cx| {
-                        shell.row_action(action, row_ix, window, cx);
-                    });
-                }),
-            );
+            let item = PopupMenuItem::element(move |_, cx| {
+                // Two children rather than one string with a tab in it:
+                // GPUI lays out text and a tab is nothing at all there.
+                let mut row = div().flex().w_full().gap_4().items_center();
+                row = row.child(div().flex_1().truncate().child(label));
+                if !keys.is_empty() {
+                    row = row.child(
+                        div()
+                            .flex_none()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(keys),
+                    );
+                }
+                row
+            });
+            let item = match icon {
+                Some(icon) => item.icon(icon),
+                None => item,
+            };
+            menu = menu.item(item.on_click(move |_, window, cx| {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.row_action(action, row_ix, window, cx);
+                });
+            }));
         }
         menu
     }
@@ -5093,7 +5181,7 @@ pub(crate) fn run() {
     // The kit's icons are SVG assets, not glyphs; without an asset source every
     // `IconName` resolves to nothing and the toolbar renders blank.
     application()
-        .with_assets(gpui_kit_assets::Assets)
+        .with_assets(crate::assets::Assets)
         .run(move |cx: &mut App| {
             gpui_theme::init(cx);
             cx.bind_keys([
