@@ -27,6 +27,12 @@ const NAME_WIDE: f32 = 320.0;
 const NAME_LEAST: f32 = 140.0;
 const CELL_WIDE: f32 = 95.0;
 const CELL_LEAST: f32 = 60.0;
+// How wide the folder sidebar starts out, and the range a pull can take it
+// through: narrow enough to leave a deep name scrollable, wide enough that one
+// does not have to be.
+const SIDEBAR_WIDE: f32 = 224.0;
+const SIDEBAR_LEAST: f32 = 160.0;
+const SIDEBAR_MOST: f32 = 520.0;
 
 fn main() {
     gpui_shell::run();
@@ -179,6 +185,7 @@ c76ecf12e8e05b8f4730fb9933450ea121fe1ce3699ab9b7d20b058f872815f4 *arca-setup-0.6
         before.widths[0] = 271.0;
         before.widths[3] = 88.0;
         before.window = Some([12.0, 34.0, 1000.0, 700.0]);
+        before.sidebar = 311.0;
         before.recent = vec!["C:\\uno.zip".into(), "D:\\dos, con coma.zip".into()];
 
         let after = Settings::parse(&before.text());
@@ -190,6 +197,7 @@ c76ecf12e8e05b8f4730fb9933450ea121fe1ce3699ab9b7d20b058f872815f4 *arca-setup-0.6
         assert_eq!(after.updates, before.updates);
         assert_eq!(after.page, before.page);
         assert_eq!(after.widths, before.widths);
+        assert_eq!(after.sidebar, before.sidebar);
         assert_eq!(after.window, before.window);
         assert_eq!(
             after.recent, before.recent,

@@ -8,7 +8,7 @@
 
 use super::{
     fill, human, parent_of, saved_of, when, Answer, AppAction, AppController, Columns, DropChoice,
-    Job, Pending, Settings, SortColumn, Startup, Strings, View,
+    Job, Pending, Settings, SortColumn, Startup, Strings, View, SIDEBAR_LEAST, SIDEBAR_MOST,
 };
 use crate::{
     clipboard, gpui_theme,
@@ -34,6 +34,7 @@ use gpui_component::status_bar::StatusBar;
 use gpui_component::switch::Switch;
 use gpui_component::table::{Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState};
 use gpui_component::tree::{tree, TreeItem, TreeState};
+use gpui_component::{h_resizable, resizable_panel, ResizableState};
 use gpui_component::{ActiveTheme, Icon, IconName};
 use gpui_component::{Disableable, Root, Selectable, Sizable as _, TitleBar, WindowExt};
 use gpui_platform::application;
@@ -53,9 +54,12 @@ fn focus_ring(cx: &App) -> impl FnOnce(gpui::StyleRefinement) -> gpui::StyleRefi
     move |style: gpui::StyleRefinement| style.border_2().border_color(ring).bg(accent)
 }
 
-/// The sidebar's width less its padding: the room a folder row has before it
-/// has to be scrolled to.
-const SIDEBAR_INNER: f32 = 208.0;
+/// The room a folder row has inside a sidebar `width` wide, before it has to be
+/// scrolled to: both sides of the padding, plus the right border, which eats
+/// into the content box and would otherwise clip the selected row's outline.
+fn sidebar_inner(width: f32) -> f32 {
+    (width - 17.0).max(1.0)
+}
 
 const COMPACT_SIZE: (f32, f32) = (560.0, 300.0);
 const NORMAL_SIZE: (f32, f32) = (1000.0, 660.0);
@@ -160,6 +164,8 @@ struct GpuiShell {
     /// when that archive stopped being the same one.
     folders: Entity<TreeState>,
     folders_key: Option<(Option<PathBuf>, usize)>,
+    /// How the sidebar and the file list divide the window between them.
+    sidebar_state: Entity<ResizableState>,
     drop_paths: Vec<PathBuf>,
 }
 
@@ -538,6 +544,7 @@ impl GpuiShell {
             viewer_image: None,
             folders,
             folders_key: None,
+            sidebar_state: cx.new(|_| ResizableState::default()),
             drop_paths: Vec::new(),
         }
     }
@@ -585,8 +592,7 @@ impl GpuiShell {
         let widest = self.widest_folder_row(cx);
         div()
             .id("archive-folders")
-            .w(px(224.))
-            .flex_none()
+            .size_full()
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -659,11 +665,31 @@ impl GpuiShell {
             )
     }
 
+    /// How wide the sidebar is right now: what the pull left it at, and the
+    /// remembered width until the first frame has laid the panels out.
+    fn sidebar_width(&self, cx: &App) -> f32 {
+        self.sidebar_state
+            .read(cx)
+            .sizes()
+            .first()
+            .map(|width| f32::from(*width))
+            .filter(|width| *width > 0.0)
+            .unwrap_or(self.controller.state.settings.sidebar)
+    }
+
+    /// The sidebar width the pull ended on, kept where the column widths are
+    /// kept so it survives the window.
+    fn remember_sidebar(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.controller.state.settings.sidebar = width.clamp(SIDEBAR_LEAST, SIDEBAR_MOST);
+        self.controller.state.settings.save();
+        cx.notify();
+    }
+
     /// How wide the widest open folder row wants to be, so a deep branch can be
     /// scrolled to instead of being cut off at the sidebar's edge.
     fn widest_folder_row(&self, cx: &App) -> f32 {
         let state = self.folders.read(cx);
-        let mut widest = SIDEBAR_INNER;
+        let mut widest = sidebar_inner(self.sidebar_width(cx));
         let mut at = 0;
         while let Some(entry) = state.entry(at) {
             // The label is estimated rather than measured: laying out every row
@@ -3335,9 +3361,38 @@ impl Render for GpuiShell {
             .flex_row();
         if has_archive {
             let sidebar = self.sidebar(cx);
-            body = body.child(sidebar);
+            let width = self.sidebar_width(cx);
+            body = body.child(
+                h_resizable("archive-split")
+                    .with_state(&self.sidebar_state)
+                    .child(
+                        resizable_panel()
+                            .size(px(width))
+                            .size_range(px(SIDEBAR_LEAST)..px(SIDEBAR_MOST))
+                            .flex_none()
+                            .child(sidebar),
+                    )
+                    .child(resizable_panel().child(content))
+                    // Written when the kit says the pull is over, so dragging
+                    // the divider is not a stream of writes to disk.
+                    .on_resize({
+                        let shell = cx.entity().downgrade();
+                        move |state, _, cx| {
+                            let Some(width) = state.read(cx).sizes().first().copied() else {
+                                return;
+                            };
+                            shell
+                                .update(cx, |shell, cx| {
+                                    shell.remember_sidebar(f32::from(width), cx);
+                                })
+                                .ok();
+                        }
+                    }),
+            );
+        } else {
+            body = body.child(content);
         }
-        root = root.child(body.child(content)).child(
+        root = root.child(body).child(
             StatusBar::new()
                 .left(status_view)
                 .right(

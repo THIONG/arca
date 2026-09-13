@@ -1,7 +1,10 @@
 //! Persistent user preferences for the Arca GUI.
 
 use crate::i18n::Lang;
-use crate::{Columns, ThemePreference, CELL_LEAST, CELL_WIDE, NAME_LEAST, NAME_WIDE};
+use crate::{
+    Columns, ThemePreference, CELL_LEAST, CELL_WIDE, NAME_LEAST, NAME_WIDE, SIDEBAR_LEAST,
+    SIDEBAR_MOST, SIDEBAR_WIDE,
+};
 use std::fs;
 use std::path::PathBuf;
 
@@ -42,6 +45,9 @@ pub(crate) struct Settings {
     // turned off, in the order of `Columns::ALL`. A column keeps its width
     // while it is off, so turning one back on does not lose how it was set.
     pub(crate) widths: Vec<f32>,
+    // How wide the folder sidebar was left, kept within its pull range in case
+    // the file was written by hand.
+    pub(crate) sidebar: f32,
 }
 
 impl Settings {
@@ -75,6 +81,7 @@ impl Default for Settings {
             window: None,
             recent: Vec::new(),
             widths: Settings::default_widths(),
+            sidebar: SIDEBAR_WIDE,
         }
     }
 }
@@ -159,6 +166,11 @@ impl Settings {
                         s.widths = read;
                     }
                 }
+                ("sidebar", v) => {
+                    if let Ok(width) = v.parse::<f32>() {
+                        s.sidebar = width.clamp(SIDEBAR_LEAST, SIDEBAR_MOST);
+                    }
+                }
                 _ => {}
             }
         }
@@ -205,6 +217,7 @@ impl Settings {
         out.push_str(&format!("page = {}\n", self.page.code()));
         out.push_str(&format!("columns = {}\n", columns.join(",")));
         out.push_str(&format!("widths = {}\n", widths.join(",")));
+        out.push_str(&format!("sidebar = {:.1}\n", self.sidebar));
         if let Some([x, y, w, h]) = self.window {
             out.push_str(&format!("window = {x:.0},{y:.0},{w:.0},{h:.0}\n"));
         }
