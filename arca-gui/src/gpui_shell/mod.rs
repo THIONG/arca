@@ -1332,7 +1332,8 @@ impl GpuiShell {
             return false;
         };
         let (x, y) = (f32::from(at.x), f32::from(at.y));
-        y < view.top || y > view.bottom || x < view.left || x > view.right
+        // The gutter is still the list: crossing into it is not leaving.
+        y < view.top || y > view.bottom || x < view.left - ROW_GUTTER || x > view.right
     }
 
     fn scroll_to(&self, view: &ListView, offset: f32) {
@@ -1353,12 +1354,23 @@ impl GpuiShell {
         (index < len).then_some(index)
     }
 
+    /// The width the shown columns take up, which is where the row ends and
+    /// the dead space on its right begins.
+    fn columns_span(&self) -> f32 {
+        self.shown_columns()
+            .into_iter()
+            .map(|column| self.column_width(Self::column_slot(column)))
+            .sum()
+    }
+
     /// Pressing the left button inside the list, which is where a band begins.
     ///
-    /// Pressing on a row that is already picked and pulling is how you take the
-    /// selection somewhere else, so that one is left to the drag; pressing
-    /// anywhere else and pulling draws a new band. That is the rule in the
-    /// Explorer, and it is the only one that lets both gestures share a button.
+    /// A band belongs to the empty space around the columns: the gutter the
+    /// table is inset by at either end, whatever the columns leave over on the
+    /// right, and the space under the last row. Pressing the row itself is a
+    /// click or the start of a carry. That is the rule in the Explorer's
+    /// details view, and it is the only one that lets both gestures share a
+    /// button without guessing which was meant.
     fn begin_band(&mut self, at: gpui::Point<gpui::Pixels>, secondary: bool, shift: bool) {
         if !self.background_idle() || shift {
             return;
@@ -1368,21 +1380,18 @@ impl GpuiShell {
             return;
         };
         let (x, y) = (f32::from(at.x), f32::from(at.y));
-        if y < view.top || y > view.bottom || x < view.left || x > view.right {
+        if y < view.top || y > view.bottom || x < view.left - ROW_GUTTER || x > view.right {
             return;
         }
         let anchor = Self::row_under(&view, y, rows.len());
-        if let Some(index) = anchor {
-            if !secondary && self.controller.is_checked(&rows[index]) {
-                return;
-            }
+        if anchor.is_some() && x > view.left && x < view.left + self.columns_span() {
+            return;
         }
         self.band = Some(Band {
             origin: at,
             rows: rows.clone(),
-            // Begun in the empty space under the list, where there is no row to
-            // hang the band on: it still picks everything between there and
-            // wherever it goes.
+            // Begun under the last row, where there is none to hang the band
+            // on: it still picks everything between there and wherever it goes.
             anchor: anchor.unwrap_or(rows.len().saturating_sub(1)),
             base: if secondary {
                 self.controller.state.checked.clone()
@@ -1865,15 +1874,7 @@ impl GpuiShell {
             .as_ref()
             .and_then(|(path, _)| rows.iter().position(|row| row.path == *path));
         let widths = (0..Settings::default_widths().len())
-            .map(|slot| {
-                self.controller
-                    .state
-                    .settings
-                    .widths
-                    .get(slot)
-                    .copied()
-                    .unwrap_or_else(|| Settings::default_widths()[slot])
-            })
+            .map(|slot| self.column_width(slot))
             .collect();
         let cursor = self.controller.state.cursor;
         let order = self.controller.state.order;
@@ -1902,6 +1903,16 @@ impl GpuiShell {
                 state.refresh(cx);
             }
         });
+    }
+
+    fn column_width(&self, slot: usize) -> f32 {
+        self.controller
+            .state
+            .settings
+            .widths
+            .get(slot)
+            .copied()
+            .unwrap_or_else(|| Settings::default_widths()[slot])
     }
 
     fn set_column_width(&mut self, slot: usize, width: f32) {
@@ -2160,6 +2171,10 @@ impl GpuiShell {
             .min_h(px(1.))
             .flex()
             .flex_col()
+            // The strip the Explorer keeps before the first column: real empty
+            // space, held back from the columns, so there is somewhere to
+            // start a band even on a line where every row is taken.
+            .pl(px(ROW_GUTTER))
             .child(DataTable::new(&self.table).stripe(false).bordered(false))
             .child(
                 div()
@@ -2937,7 +2952,7 @@ impl Render for GpuiShell {
                             if !phase.bubble() {
                                 return;
                             }
-                            let leaving = dragging.update(app, |shell, cx| {
+                            let (leaving, banding) = dragging.update(app, |shell, cx| {
                                 shell.pointer = event.position;
                                 let mut moved = false;
                                 if let Some((slot, from, width)) = shell.resizing {
@@ -2952,8 +2967,19 @@ impl Render for GpuiShell {
                                 if moved {
                                     cx.notify();
                                 }
-                                shell.carrying && shell.left_the_list(event.position)
+                                (
+                                    shell.carrying && shell.left_the_list(event.position),
+                                    shell.band.is_some(),
+                                )
                             });
+                            // The press that started the band was in a row's
+                            // dead space, so the row underneath took it as the
+                            // start of a carry -- GPUI lets go of a row after
+                            // two pixels, long before the band comes alive.
+                            // One gesture to a button: the band keeps it.
+                            if banding && app.has_active_drag() {
+                                app.stop_active_drag(window);
+                            }
                             // Out of the list is out of the archive. Started here
                             // and not at the press, because the instant the native
                             // drag begins the system takes the pointer and there is
@@ -4350,6 +4376,12 @@ struct ListView {
 /// the two thresholds every time a column was resized.
 const DRAG_SLOP: f32 = 10.0;
 
+/// The strip the table is inset by on the left, which belongs to the band
+/// rather than to the rows, the way the Explorer keeps one before the first
+/// column. The right edge has the scrollbar, so the space left over by the
+/// columns is all there is on that side.
+const ROW_GUTTER: f32 = 16.0;
+
 /// The selection while it is in the air. An empty marker rather than the rows
 /// themselves: what is carried is whatever is picked when it lands, and the
 /// selection cannot change while the button is down.
@@ -4611,10 +4643,26 @@ impl TableDelegate for FileTable {
         // going is not decided here: a folder of this archive takes it as a
         // move, and leaving the list hands it to arca-drag's lazy IDataObject,
         // so no archive bytes are extracted merely to begin a drag.
-        if checked && self.idle {
+        if self.idle {
             let shell = self.shell.clone();
+            let dragged = row.clone();
             item = item.on_drag(DraggedRows, move |_, _, _, app| {
-                let _ = shell.update(app, |shell, _| shell.carrying = true);
+                let _ = shell.update(app, |shell, _| {
+                    // A band was started in this row's dead space; the pull
+                    // belongs to it, not to the row.
+                    if shell.band.is_some() {
+                        return;
+                    }
+                    // Pulling a row that was not picked carries that row on
+                    // its own, the way pressing and releasing it would have
+                    // picked it. Without this the only way to drag a file out
+                    // would be to select it first.
+                    if !shell.controller.is_checked(&dragged) {
+                        shell.controller.state.checked.fill(false);
+                        shell.controller.set_checked(&dragged, true);
+                    }
+                    shell.carrying = true;
+                });
                 app.new(|_| gpui::Empty)
             });
         }
