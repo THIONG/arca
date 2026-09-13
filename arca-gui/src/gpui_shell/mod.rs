@@ -53,6 +53,10 @@ fn focus_ring(cx: &App) -> impl FnOnce(gpui::StyleRefinement) -> gpui::StyleRefi
     move |style: gpui::StyleRefinement| style.border_2().border_color(ring).bg(accent)
 }
 
+/// The sidebar's width less its padding: the room a folder row has before it
+/// has to be scrolled to.
+const SIDEBAR_INNER: f32 = 208.0;
+
 const COMPACT_SIZE: (f32, f32) = (560.0, 300.0);
 const NORMAL_SIZE: (f32, f32) = (1000.0, 660.0);
 const MINIMUM_SIZE: (f32, f32) = (720.0, 320.0);
@@ -579,6 +583,7 @@ impl GpuiShell {
     fn sidebar(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
         self.sync_folders(cx);
         let folders = self.controller.s().archive_folders;
+        let widest = self.widest_folder_row(cx);
         div()
             .id("archive-folders")
             .w(px(224.))
@@ -592,51 +597,83 @@ impl GpuiShell {
             .p_2()
             .role(Role::Tree)
             .aria_label(folders)
-            .child(tree(&self.folders, |_, entry, selected, _, _| {
-                let open = entry.is_expanded();
-                let icon = if entry.is_root() {
-                    IconName::Inbox
-                } else if open {
-                    IconName::FolderOpen
-                } else {
-                    IconName::Folder
-                };
-                // The kit's tree draws no disclosure mark of its own, and a
-                // branch with nothing to say it has one is a branch nobody
-                // opens.
-                let chevron = if entry.is_folder() {
-                    Some(Icon::new(if open {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    }))
-                } else {
-                    None
-                };
-                ListItem::new(entry.item().id.clone())
-                    .pl(px(4. + 12. * entry.depth() as f32))
-                    .px_1()
-                    .selected(selected)
-                    .role(Role::TreeItem)
-                    .aria_label(entry.item().label.clone())
-                    .aria_level(entry.depth() + 1)
-                    .aria_selected(selected)
-                    .aria_expanded(open)
+            .child(
+                div()
+                    .id("archive-folders-scroll")
+                    .size_full()
+                    .overflow_x_scrollbar()
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .w(px(14.))
-                                    .flex_none()
-                                    .children(chevron.map(|icon| icon.small())),
-                            )
-                            .child(Icon::new(icon).small())
-                            .child(div().flex_1().truncate().child(entry.item().label.clone())),
-                    )
-            }))
+                        tree(&self.folders, |_, entry, selected, _, _| {
+                            let open = entry.is_expanded();
+                            let icon = if entry.is_root() {
+                                IconName::Inbox
+                            } else if open {
+                                IconName::FolderOpen
+                            } else {
+                                IconName::Folder
+                            };
+                            // The kit's tree draws no disclosure mark of its own, and a
+                            // branch with nothing to say it has one is a branch nobody
+                            // opens.
+                            let chevron = if entry.is_folder() {
+                                Some(Icon::new(if open {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                }))
+                            } else {
+                                None
+                            };
+                            ListItem::new(entry.item().id.clone())
+                                .pr_1()
+                                .pl(px(4. + 12. * entry.depth() as f32))
+                                .selected(selected)
+                                .role(Role::TreeItem)
+                                .aria_label(entry.item().label.clone())
+                                .aria_level(entry.depth() + 1)
+                                .aria_selected(selected)
+                                .aria_expanded(open)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .w(px(14.))
+                                                .flex_none()
+                                                .children(chevron.map(|icon| icon.small())),
+                                        )
+                                        .child(Icon::new(icon).small())
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .truncate()
+                                                .child(entry.item().label.clone()),
+                                        ),
+                                )
+                        })
+                        .h_full()
+                        .w(px(widest))
+                        .flex_none(),
+                    ),
+            )
+    }
+
+    /// How wide the widest open folder row wants to be, so a deep branch can be
+    /// scrolled to instead of being cut off at the sidebar's edge.
+    fn widest_folder_row(&self, cx: &App) -> f32 {
+        let state = self.folders.read(cx);
+        let mut widest = SIDEBAR_INNER;
+        let mut at = 0;
+        while let Some(entry) = state.entry(at) {
+            // The label is estimated rather than measured: laying out every row
+            // twice per frame to gain a few pixels of accuracy is not worth it.
+            let label = entry.item().label.chars().count() as f32 * 7.0;
+            widest = widest.max(46.0 + 12.0 * entry.depth() as f32 + label);
+            at += 1;
+        }
+        widest
     }
 
     fn begin_dialog(&mut self, kind: DialogKind, cx: &mut Context<Self>) {
