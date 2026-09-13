@@ -38,6 +38,7 @@ ya trae. El recuento de partida en `gpui_shell/mod.rs` (6067 líneas) era de 95
 | Menú del botón derecho | `ContextMenu` (hecho) |
 | Tabla, cabecera y anchos | `DataTable` y `TableState` (hecho) |
 | Campos de texto de los diálogos | `Input` y `InputState` (hecho) |
+| Carpetas ocultas de las migas | `dropdown_menu` (hecho) |
 | Árbol de carpetas sobre `SidebarMenuItem` | `tree` |
 
 ## Decisiones tomadas
@@ -89,6 +90,25 @@ pero tampoco lo pone el kit:
 - Los roles de accesibilidad se ponen a mano en el delegate. Sin ellos la
   tabla desaparece del árbol: es lo primero que hay que volver a mirar si
   alguna vez se cambia cómo se dibuja una fila.
+
+## El último menú dibujado a mano
+
+Con las carpetas ocultas de las migas se fue el andamiaje que mantenía vivo un
+menú hecho a mano: un `FocusHandle` por fila, las flechas arriba y abajo, la
+trampa de foco con el tabulador, el escape que devuelve el teclado al botón y
+el recorte de los handles cuando la ruta se acorta. Todo eso lo trae el menú
+del kit; el botón `…` sólo tiene que decir qué carpetas hay.
+
+Se fueron con él `menu_row`, `menu_item`, `menu_key_down`, `breadcrumbs_key_down`,
+`trap_focus`, `sync_breadcrumb_item_focus`, `visible_menu_items`,
+`focus_cycle_index`, `menu_target`, cuatro campos de estado y sus tres tests.
+Los tests no prueban comportamiento del usuario sino la aritmética de un menú
+que ya no se dibuja aquí: navegar con flechas dentro del menú sigue
+funcionando, sólo que ahora es problema del kit.
+
+`overflow_open` se fue también: quedó sin ponerse a `true` desde que el menú
+de la barra pasó al kit, y seguía apareciendo en las condiciones que deciden
+si la ventana está en reposo.
 
 ## El editor de texto que ya no hace falta
 

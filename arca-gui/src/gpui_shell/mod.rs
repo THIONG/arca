@@ -93,14 +93,9 @@ struct GpuiShell {
     /// its modal from controller state, the kit opens and closes one
     /// imperatively; this is what tells the two apart.
     open_modal: Option<ModalKind>,
-    overflow_open: bool,
-    breadcrumbs_open: bool,
-    breadcrumbs_trigger_focus: FocusHandle,
     delete_trigger_focus: FocusHandle,
     drop_trigger_focus: FocusHandle,
     conflict_trigger_focus: FocusHandle,
-    breadcrumbs_menu_focus: FocusHandle,
-    breadcrumbs_item_focus: Vec<FocusHandle>,
     /// Where the keyboard goes when a dialog closes, when somebody asked for
     /// it. None means leave it alone: a kit button holds its own focus and
     /// still has it when a native file dialog closes on top of it.
@@ -482,14 +477,9 @@ impl GpuiShell {
             table,
             dialog: None,
             open_modal: None,
-            overflow_open: false,
-            breadcrumbs_open: false,
-            breadcrumbs_trigger_focus: cx.focus_handle(),
             delete_trigger_focus: cx.focus_handle(),
             drop_trigger_focus: cx.focus_handle(),
             conflict_trigger_focus: cx.focus_handle(),
-            breadcrumbs_menu_focus: cx.focus_handle(),
-            breadcrumbs_item_focus: Vec::new(),
             dialog_return_focus: None,
             modal_seen: None,
             dialog_primary_focus: cx.focus_handle().tab_stop(true),
@@ -695,61 +685,7 @@ impl GpuiShell {
         window.focus(&handle, cx);
     }
 
-    fn menu_key_down(
-        event: &KeyDownEvent,
-        items: &[FocusHandle],
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let key = event.keystroke.key.as_str();
-        if key == "tab" {
-            Self::trap_focus(items, event.keystroke.modifiers.shift, window, cx);
-            return;
-        }
-        if !matches!(key, "down" | "up") {
-            return;
-        }
-        let Some(current) = items.iter().position(|item| item.is_focused(window)) else {
-            cx.stop_propagation();
-            return;
-        };
-        let Some(next) = menu_target(current, key, items.len()) else {
-            cx.stop_propagation();
-            return;
-        };
-        items[next].focus(window, cx);
-        cx.stop_propagation();
-    }
-
-    fn breadcrumbs_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if event.keystroke.key == "escape" {
-            self.breadcrumbs_open = false;
-            self.breadcrumbs_trigger_focus.focus(window, cx);
-            cx.stop_propagation();
-            cx.notify();
-        } else {
-            let hidden_len = Self::visible_crumb_indices(self.crumbs().len()).1.len();
-            let visible_items = visible_menu_items(&self.breadcrumbs_item_focus, hidden_len);
-            Self::menu_key_down(event, visible_items, window, cx);
-        }
-    }
-
-    fn sync_breadcrumb_item_focus(&mut self, cx: &mut Context<Self>) {
-        let hidden_len = Self::visible_crumb_indices(self.crumbs().len()).1.len();
-        self.breadcrumbs_item_focus.truncate(hidden_len);
-        while self.breadcrumbs_item_focus.len() < hidden_len {
-            self.breadcrumbs_item_focus
-                .push(cx.focus_handle().tab_stop(true));
-        }
-    }
-
     fn route_changed(&mut self, cx: &mut Context<Self>) {
-        self.sync_breadcrumb_item_focus(cx);
         cx.notify();
     }
 
@@ -794,47 +730,6 @@ impl GpuiShell {
             .disabled(!enabled)
     }
 
-    /// The hand-drawn row behind the menus, until the menus themselves move to
-    /// the kit and take it with them.
-    ///
-    /// It cannot be a kit button yet: a menu keeps the arrow keys working by
-    /// tracking a focus handle per row, and a kit button owns its own.
-    fn menu_row(
-        id: impl Into<ElementId>,
-        label: impl Into<gpui::SharedString>,
-        accessible_name: String,
-        enabled: bool,
-        cx: &App,
-    ) -> Stateful<gpui::Div> {
-        let mut button = div()
-            .id(id)
-            .aria_label(accessible_name)
-            .h(px(26.))
-            .px_2()
-            .flex()
-            .items_center()
-            .flex_none()
-            .rounded(cx.theme().radius)
-            .focus_visible(focus_ring(cx))
-            .text_xs()
-            .child(label.into());
-        if enabled {
-            button = button
-                .role(Role::Button)
-                .focusable()
-                .tab_stop(true)
-                .cursor_pointer()
-                .text_color(cx.theme().foreground)
-                .hover(|style| style.bg(cx.theme().accent))
-                .active(|style| style.bg(cx.theme().secondary_active));
-        } else {
-            button = button
-                .tab_stop(false)
-                .text_color(cx.theme().muted_foreground);
-        }
-        button
-    }
-
     fn popup_action(
         owner: WeakEntity<GpuiShell>,
         label: impl Into<gpui::SharedString>,
@@ -846,44 +741,6 @@ impl GpuiShell {
                 cx.notify();
             });
         })
-    }
-
-    /// A row of the menu: what it does on the left, the keys that do the same
-    /// on the right.
-    ///
-    /// Two children rather than one string with a tab in it. GPUI lays out text
-    /// and a tab is nothing at all there, so the keys came out stuck to the word
-    /// -- "OpenEnter", "ViewF3". The keys are quieter than the name, because they are a way in
-    /// and not a second thing to read.
-    fn menu_item(
-        id: impl Into<ElementId>,
-        label: impl Into<gpui::SharedString>,
-        keys: &str,
-        accessible_name: String,
-        enabled: bool,
-        cx: &App,
-    ) -> Stateful<gpui::Div> {
-        // A menu item is a full-width row, not a button that happens to be in a
-        // menu: it takes the whole popover so the hover tint reaches both edges.
-        // The label goes in as a child of its own so it can take the room the
-        // keys do not.
-        let mut item = Self::menu_row(id, "", accessible_name, enabled, cx)
-            .w_full()
-            .gap_4()
-            .justify_start()
-            .child(div().flex_1().truncate().child(label.into()));
-        if !keys.is_empty() {
-            item = item.child(
-                div()
-                    .flex_none()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(keys.to_string()),
-            );
-        }
-        if enabled {
-            item = item.role(Role::MenuItem);
-        }
-        item
     }
 
     /// The answer a modal gets when it is dismissed rather than answered.
@@ -1010,30 +867,8 @@ impl GpuiShell {
         }
     }
 
-    fn trap_focus(
-        targets: &[FocusHandle],
-        reverse: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if targets.is_empty() {
-            cx.stop_propagation();
-            return;
-        }
-        let current = targets.iter().position(|target| target.is_focused(window));
-        if let Some(index) = focus_cycle_index(current, reverse, targets.len()) {
-            window.focus(&targets[index], cx);
-        }
-        cx.stop_propagation();
-    }
-
     fn remember_background_focus(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.modal_seen.is_none()
-            && self.modal_kind().is_none()
-            && self.dialog.is_none()
-            && !self.overflow_open
-            && !self.breadcrumbs_open
-        {
+        if self.modal_seen.is_none() && self.modal_kind().is_none() && self.dialog.is_none() {
             if let Some(focus) = window.focused(cx) {
                 self.dialog_return_focus = Some(focus);
             }
@@ -1793,11 +1628,7 @@ impl GpuiShell {
 
     /// The keys, and what each one does, in the two columns they are read in.
     fn background_idle(&self) -> bool {
-        !self.controller.state.busy
-            && self.modal_kind().is_none()
-            && self.dialog.is_none()
-            && !self.overflow_open
-            && !self.breadcrumbs_open
+        !self.controller.state.busy && self.modal_kind().is_none() && self.dialog.is_none()
     }
 
     fn menu_enabled(&self) -> bool {
@@ -2449,7 +2280,6 @@ impl Render for GpuiShell {
         let password_available = can_extract && self.controller.state.format == super::Format::Zip;
         let breadcrumbs = self.crumbs();
         let (shown, hidden) = Self::visible_crumb_indices(breadcrumbs.len());
-        self.sync_breadcrumb_item_focus(cx);
 
         let mut toolbar = div()
             .id("toolbar")
@@ -2900,25 +2730,43 @@ impl Render for GpuiShell {
                 nav = nav.child(div().text_color(cx.theme().muted_foreground).child("/"));
             }
             if position == 1 && !hidden.is_empty() {
-                // Still hand-drawn: it owns the menu below it, and that menu
-                // hands the focus back to this handle when it closes.
-                let more =
-                    Self::menu_row("crumb-more", "…", s.hidden_folders.to_string(), idle, cx)
-                        .track_focus(&self.breadcrumbs_trigger_focus)
-                        .aria_expanded(self.breadcrumbs_open);
-                nav = nav.child(more.on_click(cx.listener(|this, _, window, cx| {
-                    if !this.background_idle() {
-                        return;
-                    }
-                    this.sync_breadcrumb_item_focus(cx);
-                    this.breadcrumbs_open = !this.breadcrumbs_open;
-                    this.overflow_open = false;
-                    if this.breadcrumbs_open {
-                        let menu_focus = this.breadcrumbs_item_focus[0].clone();
-                        window.on_next_frame(move |window, cx| window.focus(&menu_focus, cx));
-                    }
-                    cx.notify();
-                })));
+                // The folders that did not fit, behind the same kind of menu as
+                // everything else. It carries its own copy of the names: the
+                // menu is built while the shell is still borrowed.
+                let folders: Vec<(String, String)> = hidden
+                    .iter()
+                    .map(|index| breadcrumbs[*index].clone())
+                    .collect();
+                let menu_owner = cx.entity().downgrade();
+                nav = nav.child(
+                    Button::new("crumb-more")
+                        .label("…")
+                        .accessibility_label(s.hidden_folders)
+                        .tooltip(s.hidden_folders)
+                        .ghost()
+                        .compact()
+                        .disabled(!idle)
+                        .dropdown_menu(move |menu, _, _| {
+                            let mut menu = menu;
+                            for (name, path) in &folders {
+                                let owner = menu_owner.clone();
+                                let path = path.clone();
+                                menu = menu.item(PopupMenuItem::new(name.clone()).on_click(
+                                    move |_, _, cx| {
+                                        let _ = owner.update(cx, |this, cx| {
+                                            if !this.background_idle() {
+                                                return;
+                                            }
+                                            this.controller
+                                                .dispatch(AppAction::Navigate(path.clone()));
+                                            this.route_changed(cx);
+                                        });
+                                    },
+                                ));
+                            }
+                            menu
+                        }),
+                );
                 nav = nav.child(div().text_color(cx.theme().muted_foreground).child("/"));
             }
             let (name, path) = &breadcrumbs[*index];
@@ -2937,60 +2785,9 @@ impl Render for GpuiShell {
                         return;
                     }
                     this.controller.dispatch(AppAction::Navigate(path.clone()));
-                    this.breadcrumbs_open = false;
                     this.route_changed(cx);
                 })));
             }
-        }
-
-        if self.breadcrumbs_open && !hidden.is_empty() {
-            let mut hidden_menu = div()
-                .id("hidden-breadcrumbs")
-                .role(Role::Menu)
-                .aria_label(s.hidden_folders)
-                .absolute()
-                .top(px(30.))
-                .left(px(70.))
-                .w(px(220.))
-                .flex()
-                .flex_col()
-                .gap_px()
-                .p_1()
-                .bg(cx.theme().popover)
-                .text_color(cx.theme().popover_foreground)
-                .border_1()
-                .border_color(cx.theme().border)
-                .rounded(cx.theme().radius_lg)
-                .shadow_lg()
-                .track_focus(&self.breadcrumbs_menu_focus)
-                .tab_group()
-                .focus_visible(focus_ring(cx))
-                .on_key_down(cx.listener(Self::breadcrumbs_key_down));
-            for (position, index) in hidden.into_iter().enumerate() {
-                let (name, path) = &breadcrumbs[index];
-                let path = path.clone();
-                let item_focus = self.breadcrumbs_item_focus[position].clone();
-                hidden_menu = hidden_menu.child(
-                    Self::menu_item(
-                        ("hidden-crumb", index),
-                        name,
-                        "",
-                        fill(s.open_folder, &[("name", name)]),
-                        true,
-                        cx,
-                    )
-                    .track_focus(&item_focus)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.background_idle() {
-                            return;
-                        }
-                        this.controller.dispatch(AppAction::Navigate(path.clone()));
-                        this.breadcrumbs_open = false;
-                        this.route_changed(cx);
-                    })),
-                );
-            }
-            nav = nav.child(hidden_menu);
         }
 
         let notice_color = if self.controller.state.error {
@@ -4884,30 +4681,6 @@ fn minmax(a: gpui::Pixels, b: gpui::Pixels) -> (f32, f32) {
     }
 }
 
-fn visible_menu_items<T>(items: &[T], rendered_len: usize) -> &[T] {
-    &items[..items.len().min(rendered_len)]
-}
-
-fn focus_cycle_index(current: Option<usize>, reverse: bool, len: usize) -> Option<usize> {
-    if len == 0 {
-        return None;
-    }
-    match (current, reverse) {
-        (None, false) => Some(0),
-        (None, true) => Some(len - 1),
-        (Some(index), false) => Some((index + 1) % len),
-        (Some(index), true) => Some(if index == 0 { len - 1 } else { index - 1 }),
-    }
-}
-
-fn menu_target(current: usize, key: &str, len: usize) -> Option<usize> {
-    match key {
-        "down" if current + 1 < len => Some(current + 1),
-        "up" if current > 0 => Some(current - 1),
-        _ => None,
-    }
-}
-
 fn background_event_allowed(modal: bool, native_picker: bool) -> bool {
     !modal && !native_picker
 }
@@ -5035,39 +4808,6 @@ mod tests {
             GpuiShell::visible_crumb_indices(6),
             (vec![0, 3, 4, 5], vec![1, 2])
         );
-    }
-
-    #[test]
-    fn breadcrumb_navigation_drops_stale_handles_when_route_shrinks() {
-        let route_with_several_hidden = GpuiShell::visible_crumb_indices(10).1.len();
-        let route_with_fewer_hidden = GpuiShell::visible_crumb_indices(6).1.len();
-        let handles: Vec<_> = (0..route_with_several_hidden).collect();
-        let visible = visible_menu_items(&handles, route_with_fewer_hidden);
-
-        assert_eq!(visible, &[0, 1]);
-        assert_eq!(menu_target(0, "down", visible.len()), Some(1));
-        assert_eq!(menu_target(1, "up", visible.len()), Some(0));
-        assert_eq!(menu_target(0, "up", visible.len()), None);
-        assert_eq!(menu_target(1, "down", visible.len()), None);
-    }
-
-    #[test]
-    fn menu_navigation_stays_within_the_menu() {
-        assert_eq!(menu_target(0, "down", 4), Some(1));
-        assert_eq!(menu_target(1, "up", 4), Some(0));
-        assert_eq!(menu_target(0, "up", 4), None);
-        assert_eq!(menu_target(3, "down", 4), None);
-    }
-
-    #[test]
-    fn focus_trap_wraps_in_both_directions_and_handles_no_focus() {
-        assert_eq!(focus_cycle_index(Some(0), false, 3), Some(1));
-        assert_eq!(focus_cycle_index(Some(2), false, 3), Some(0));
-        assert_eq!(focus_cycle_index(Some(0), true, 3), Some(2));
-        assert_eq!(focus_cycle_index(Some(2), true, 3), Some(1));
-        assert_eq!(focus_cycle_index(None, false, 3), Some(0));
-        assert_eq!(focus_cycle_index(None, true, 3), Some(2));
-        assert_eq!(focus_cycle_index(None, false, 0), None);
     }
 
     #[test]
