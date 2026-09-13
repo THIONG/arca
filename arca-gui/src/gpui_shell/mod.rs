@@ -24,15 +24,16 @@ use gpui::{
     UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::dialog::{Dialog, DialogAction, DialogClose, DialogFooter};
+use gpui_component::dialog::{Dialog, DialogAction, DialogClose, DialogDescription, DialogFooter};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::separator::Separator;
 use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_component::status_bar::StatusBar;
+use gpui_component::switch::Switch;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Icon, IconName};
-use gpui_component::{Disableable, Root, TitleBar, WindowExt, TITLE_BAR_HEIGHT};
+use gpui_component::{Disableable, Root, Selectable, TitleBar, WindowExt, TITLE_BAR_HEIGHT};
 use gpui_platform::application;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -110,20 +111,9 @@ struct GpuiShell {
     breadcrumbs_item_focus: Vec<FocusHandle>,
     dialog_return_focus: FocusHandle,
     modal_seen: Option<ModalKind>,
-    password_toggle_focus: FocusHandle,
     dialog_primary_focus: FocusHandle,
-    dialog_secondary_focus: FocusHandle,
-    dialog_tertiary_focus: FocusHandle,
-    dialog_quaternary_focus: FocusHandle,
-    dialog_rename_focus: FocusHandle,
-    dialog_rename_all_focus: FocusHandle,
     dialog_cancel_focus: FocusHandle,
-    add_format_focus: FocusHandle,
-    add_codec_focus: FocusHandle,
-    add_level_focus: FocusHandle,
-    add_password_toggle_focus: FocusHandle,
     add_start_focus: FocusHandle,
-    add_cancel_focus: FocusHandle,
     /// The eleven controls of the settings dialog, in the order they are drawn.
     /// One vector rather than eleven fields because every one of them is the
     /// same thing -- a row in a list of preferences -- and `SettingsControl`
@@ -448,20 +438,9 @@ impl GpuiShell {
             breadcrumbs_item_focus: Vec::new(),
             dialog_return_focus: cx.focus_handle(),
             modal_seen: None,
-            password_toggle_focus: cx.focus_handle().tab_stop(true),
             dialog_primary_focus: cx.focus_handle().tab_stop(true),
-            dialog_secondary_focus: cx.focus_handle().tab_stop(true),
-            dialog_tertiary_focus: cx.focus_handle().tab_stop(true),
-            dialog_quaternary_focus: cx.focus_handle().tab_stop(true),
-            dialog_rename_focus: cx.focus_handle().tab_stop(true),
-            dialog_rename_all_focus: cx.focus_handle().tab_stop(true),
             dialog_cancel_focus: cx.focus_handle().tab_stop(true),
-            add_format_focus: cx.focus_handle().tab_stop(true),
-            add_codec_focus: cx.focus_handle().tab_stop(true),
-            add_level_focus: cx.focus_handle().tab_stop(true),
-            add_password_toggle_focus: cx.focus_handle().tab_stop(true),
             add_start_focus: cx.focus_handle().tab_stop(true),
-            add_cancel_focus: cx.focus_handle().tab_stop(true),
             settings_focus: SettingsControl::ALL
                 .iter()
                 .map(|_| cx.focus_handle().tab_stop(true))
@@ -935,7 +914,37 @@ impl GpuiShell {
     /// render as overlays in `dialogs`, so the migration lands one kind at a
     /// time and never draws both for the same modal.
     fn kit_dialog(kind: ModalKind) -> bool {
-        matches!(kind, ModalKind::Delete)
+        matches!(
+            kind,
+            ModalKind::Delete
+                | ModalKind::Conflict
+                | ModalKind::Drop
+                | ModalKind::Shortcuts
+                | ModalKind::Password
+                | ModalKind::DefaultPassword
+                | ModalKind::NewFolder
+                | ModalKind::Rename
+                | ModalKind::Mask
+                | ModalKind::Settings
+                | ModalKind::Viewer
+                | ModalKind::Add
+        )
+    }
+
+    /// The field a dialog opens on, for the ones that ask for text.
+    ///
+    /// The kit focuses the dialog itself, which would leave the caret nowhere
+    /// and the first keystroke lost.
+    fn modal_text_field(&self, kind: ModalKind, cx: &App) -> Option<FocusHandle> {
+        match kind {
+            ModalKind::Password | ModalKind::DefaultPassword => {
+                Some(self.password.read(cx).focus_handle.clone())
+            }
+            ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask => {
+                Some(self.name_input.read(cx).focus_handle.clone())
+            }
+            _ => None,
+        }
     }
 
     /// Reconcile the derived modal with the kit's dialog stack.
@@ -958,6 +967,10 @@ impl GpuiShell {
                 };
                 build_dialog(kind, &shell, dialog, window, cx)
             });
+            // A frame later, so the field is in the tree to be focused.
+            if let Some(field) = self.modal_text_field(kind, cx) {
+                window.on_next_frame(move |window, cx| window.focus(&field, cx));
+            }
         }
         self.open_modal = want;
     }
@@ -990,68 +1003,6 @@ impl GpuiShell {
         } else {
             None
         }
-    }
-
-    fn modal_focus_targets(&self, kind: ModalKind, cx: &mut Context<Self>) -> Vec<FocusHandle> {
-        match kind {
-            ModalKind::Password => vec![
-                self.password.read(cx).focus_handle.clone(),
-                self.password_toggle_focus.clone(),
-                self.dialog_primary_focus.clone(),
-                self.dialog_cancel_focus.clone(),
-            ],
-            ModalKind::Conflict => vec![
-                self.dialog_primary_focus.clone(),
-                self.dialog_secondary_focus.clone(),
-                self.dialog_tertiary_focus.clone(),
-                self.dialog_quaternary_focus.clone(),
-                self.dialog_rename_focus.clone(),
-                self.dialog_rename_all_focus.clone(),
-                self.dialog_cancel_focus.clone(),
-            ],
-            ModalKind::Delete => vec![
-                self.dialog_primary_focus.clone(),
-                self.dialog_cancel_focus.clone(),
-            ],
-            ModalKind::Drop => vec![
-                self.dialog_primary_focus.clone(),
-                self.dialog_secondary_focus.clone(),
-                self.dialog_cancel_focus.clone(),
-            ],
-            ModalKind::Add => self.add_focus_targets(cx),
-            ModalKind::Viewer => self.viewer_focus.clone(),
-            ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask => vec![
-                self.name_input.read(cx).focus_handle.clone(),
-                self.dialog_primary_focus.clone(),
-                self.dialog_cancel_focus.clone(),
-            ],
-            ModalKind::DefaultPassword => vec![
-                self.password.read(cx).focus_handle.clone(),
-                self.password_toggle_focus.clone(),
-                self.dialog_primary_focus.clone(),
-                self.dialog_secondary_focus.clone(),
-                self.dialog_cancel_focus.clone(),
-            ],
-            ModalKind::Settings => self.settings_focus.clone(),
-            ModalKind::Shortcuts => vec![self.dialog_cancel_focus.clone()],
-        }
-    }
-
-    fn add_focus_targets(&self, cx: &mut Context<Self>) -> Vec<FocusHandle> {
-        let mut targets = vec![
-            self.output_name.read(cx).focus_handle.clone(),
-            self.add_format_focus.clone(),
-        ];
-        if self.controller.state.format == super::Format::Zip {
-            targets.push(self.add_codec_focus.clone());
-        }
-        targets.push(self.add_level_focus.clone());
-        if self.controller.state.format == super::Format::Zip {
-            targets.push(self.add_password.read(cx).focus_handle.clone());
-            targets.push(self.add_password_toggle_focus.clone());
-        }
-        targets.extend([self.add_start_focus.clone(), self.add_cancel_focus.clone()]);
-        targets
     }
 
     fn trap_focus(
@@ -1124,142 +1075,6 @@ impl GpuiShell {
     fn answer_conflict(&mut self, answer: Answer) {
         self.remember_conflict_focus();
         self.controller.dispatch(AppAction::AnswerConflict(answer));
-    }
-
-    fn modal_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let key = event.keystroke.key.as_str();
-        let Some(kind) = self.modal_kind() else {
-            return;
-        };
-        if key == "tab" {
-            let targets = self.modal_focus_targets(kind, cx);
-            Self::trap_focus(&targets, event.keystroke.modifiers.shift, window, cx);
-            return;
-        }
-        if key == "escape" {
-            self.cancel_modal(kind);
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        if key != "enter" {
-            return;
-        }
-        self.modal_enter(kind, window, cx);
-        cx.stop_propagation();
-        cx.notify();
-    }
-
-    fn modal_enter(&mut self, kind: ModalKind, window: &mut Window, cx: &mut Context<Self>) {
-        let focused = |handle: &FocusHandle| handle.is_focused(window);
-        match kind {
-            ModalKind::Password => {
-                if focused(&self.password_toggle_focus) {
-                    self.controller
-                        .dispatch(AppAction::TogglePasswordVisibility);
-                } else if focused(&self.dialog_cancel_focus) {
-                    self.controller.dispatch(AppAction::CancelPassword);
-                } else {
-                    let password = self.password.read(cx).content.clone();
-                    self.controller
-                        .dispatch(AppAction::SubmitPassword(password));
-                }
-            }
-            ModalKind::Conflict => {
-                let answer = if focused(&self.dialog_secondary_focus) {
-                    Answer::ReplaceAll
-                } else if focused(&self.dialog_tertiary_focus) {
-                    Answer::Skip
-                } else if focused(&self.dialog_quaternary_focus) {
-                    Answer::SkipAll
-                } else if focused(&self.dialog_rename_focus) {
-                    Answer::Rename
-                } else if focused(&self.dialog_rename_all_focus) {
-                    Answer::RenameAll
-                } else if focused(&self.dialog_cancel_focus) {
-                    Answer::Cancel
-                } else {
-                    Answer::Replace
-                };
-                self.answer_conflict(answer);
-            }
-            ModalKind::Delete => self.controller.dispatch(AppAction::ConfirmDelete(!focused(
-                &self.dialog_cancel_focus,
-            ))),
-            ModalKind::Drop => {
-                let choice = if focused(&self.dialog_secondary_focus) {
-                    DropChoice::Add
-                } else if focused(&self.dialog_cancel_focus) {
-                    DropChoice::Cancel
-                } else {
-                    DropChoice::Open
-                };
-                self.controller.dispatch(AppAction::AnswerDrop(choice));
-            }
-            ModalKind::Add => {
-                if focused(&self.add_cancel_focus) {
-                    self.controller.state.view = View::Browse;
-                } else if focused(&self.add_format_focus) {
-                    self.cycle_format();
-                } else if focused(&self.add_codec_focus) {
-                    self.cycle_codec();
-                } else if focused(&self.add_level_focus) {
-                    self.cycle_level();
-                } else if focused(&self.add_password_toggle_focus) {
-                    self.controller.state.show_password = !self.controller.state.show_password;
-                } else {
-                    self.start_add(cx);
-                }
-            }
-            ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask => {
-                if focused(&self.dialog_cancel_focus) {
-                    self.close_name();
-                } else {
-                    self.confirm_name(kind, cx);
-                }
-            }
-            ModalKind::DefaultPassword => {
-                if focused(&self.password_toggle_focus) {
-                    self.controller.state.show_password = !self.controller.state.show_password;
-                } else if focused(&self.dialog_secondary_focus) {
-                    self.forget_default_password();
-                } else if focused(&self.dialog_cancel_focus) {
-                    self.controller.state.asking_default_password = false;
-                    self.controller.state.password_input.clear();
-                } else {
-                    self.keep_default_password();
-                }
-            }
-            ModalKind::Viewer => {
-                if let Some(look) = [super::Look::Text, super::Look::Hex, super::Look::Picture]
-                    .into_iter()
-                    .enumerate()
-                    .find(|(index, _)| focused(&self.viewer_focus[*index]))
-                    .map(|(_, look)| look)
-                {
-                    if let Some(view) = &mut self.controller.state.viewing {
-                        view.look = look;
-                    }
-                } else {
-                    self.controller.state.viewing = None;
-                }
-            }
-            ModalKind::Shortcuts => self.controller.state.show_shortcuts = false,
-            ModalKind::Settings => {
-                if let Some(control) = SettingsControl::ALL
-                    .iter()
-                    .copied()
-                    .find(|control| focused(&self.settings_focus[*control as usize]))
-                {
-                    self.settings_activate(control, window, cx);
-                }
-            }
-        }
     }
 
     /// One place where a settings control does its work, so the click handler
@@ -1361,132 +1176,6 @@ impl GpuiShell {
     /// The text and the hex go through `uniform_list`, so only the lines on
     /// screen are laid out and a log of a million lines opens as fast as a
     /// note of three.
-    fn viewer_dialog(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
-        let s = self.controller.s();
-        let Some(view) = &self.controller.state.viewing else {
-            return div().id("viewer-missing");
-        };
-        let name = view.name.clone();
-        let size = human(view.bytes.len() as u64);
-        let look = view.look;
-        let picture = view.picture;
-        let bytes = view.bytes.clone();
-        let lines = view.lines.clone();
-
-        let mut tabs = div().flex().items_center().gap_2();
-        for (index, (candidate, label)) in [
-            (super::Look::Text, s.as_text),
-            (super::Look::Hex, s.as_hex),
-            (super::Look::Picture, s.as_picture),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            // Only where there is a picture to show. A tab that says "picture"
-            // over a text file is a tab that lies.
-            if candidate == super::Look::Picture && !picture {
-                continue;
-            }
-            tabs = tabs.child(
-                Self::dialog_button(
-                    ("viewer-tab", index),
-                    label,
-                    &self.viewer_focus[index],
-                    look == candidate,
-                    cx,
-                )
-                .aria_selected(look == candidate)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(view) = &mut this.controller.state.viewing {
-                        view.look = candidate;
-                    }
-                    cx.notify();
-                })),
-            );
-        }
-        tabs = tabs.child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(size),
-        );
-
-        let content = match look {
-            super::Look::Picture => {
-                let image = self.viewer_picture(&name, &bytes);
-                div()
-                    .id("viewer-picture")
-                    .flex_1()
-                    .min_h(px(1.))
-                    .overflow_scroll()
-                    .children(image.map(gpui::img))
-                    .into_any_element()
-            }
-            super::Look::Text => {
-                let total = lines.len();
-                uniform_list(
-                    "viewer-text",
-                    total,
-                    move |range: Range<usize>, _window, _cx| {
-                        range
-                            .map(|index| {
-                                div()
-                                    .font_family("monospace")
-                                    .text_xs()
-                                    .child(lines[index].clone())
-                            })
-                            .collect::<Vec<_>>()
-                    },
-                )
-                .track_scroll(&self.viewer_scroll)
-                .size_full()
-                .into_any_element()
-            }
-            super::Look::Hex => {
-                let total = bytes.len().div_ceil(16);
-                uniform_list(
-                    "viewer-hex",
-                    total,
-                    move |range: Range<usize>, _window, _cx| {
-                        range
-                            .map(|row| {
-                                let at = row * 16;
-                                let end = (at + 16).min(bytes.len());
-                                div()
-                                    .font_family("monospace")
-                                    .text_xs()
-                                    .child(super::hex_line(at, &bytes[at..end]))
-                            })
-                            .collect::<Vec<_>>()
-                    },
-                )
-                .track_scroll(&self.viewer_scroll)
-                .size_full()
-                .into_any_element()
-            }
-        };
-
-        let body = div()
-            .id("viewer-dialog-body")
-            .flex()
-            .flex_col()
-            .gap_3()
-            .w(px(760.))
-            .h(px(460.))
-            .child(tabs)
-            .child(Separator::horizontal())
-            .child(
-                div()
-                    .id("viewer-content")
-                    .flex_1()
-                    .min_h(px(1.))
-                    .overflow_hidden()
-                    .child(content),
-            );
-        self.dialog_overlay(ModalKind::Viewer, name, s.view_word, body, cx)
-    }
-
-    /// The decoded picture for the entry being looked at, decoded once.
     fn viewer_picture(
         &mut self,
         name: &str,
@@ -1612,409 +1301,6 @@ impl GpuiShell {
 
     /// The dialogs that are one text field and two buttons: a new folder, a
     /// new name, a mask.
-    fn name_dialog(&mut self, kind: ModalKind, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
-        let s = self.controller.s();
-        let (title, hint, confirm) = match kind {
-            ModalKind::NewFolder => (s.new_folder, s.folder_name, s.new_folder),
-            ModalKind::Rename => (s.rename_word, s.rename_word, s.rename_word),
-            _ => {
-                let adding = self.controller.state.picking_group.unwrap_or(true);
-                (
-                    if adding {
-                        s.select_group
-                    } else {
-                        s.deselect_group
-                    },
-                    s.mask_hint,
-                    s.start,
-                )
-            }
-        };
-        let ok = Self::dialog_button("name-ok", confirm, &self.dialog_primary_focus, true, cx)
-            .on_click(cx.listener(move |this, _, _, cx| this.confirm_name(kind, cx)));
-        let cancel = Self::dialog_button(
-            "name-cancel",
-            s.cancel,
-            &self.dialog_cancel_focus,
-            false,
-            cx,
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.close_name();
-            cx.notify();
-        }));
-        let body = div()
-            .id("name-dialog-body")
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(self.name_input.clone())
-            .child(div().flex().gap_2().child(ok).child(cancel));
-        self.dialog_overlay(kind, title, hint, body, cx)
-    }
-
-    fn default_password_dialog(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
-        let s = self.controller.s();
-        let show = !self.controller.state.show_password;
-        let toggle = Self::dialog_button(
-            "default-password-visibility",
-            if show { s.show_password } else { s.hide_word },
-            &self.password_toggle_focus,
-            false,
-            cx,
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.controller
-                .dispatch(AppAction::TogglePasswordVisibility);
-            cx.notify();
-        }));
-        let keep = Self::dialog_button(
-            "default-password-keep",
-            s.start,
-            &self.dialog_primary_focus,
-            true,
-            cx,
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.keep_default_password();
-            cx.notify();
-        }));
-        let forget = Self::dialog_button(
-            "default-password-forget",
-            s.remove_password,
-            &self.dialog_secondary_focus,
-            false,
-            cx,
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.forget_default_password();
-            cx.notify();
-        }));
-        let cancel = Self::dialog_button(
-            "default-password-cancel",
-            s.cancel,
-            &self.dialog_cancel_focus,
-            false,
-            cx,
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.controller.state.asking_default_password = false;
-            this.controller.state.password_input.clear();
-            cx.notify();
-        }));
-        let body = div()
-            .id("default-password-dialog-body")
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(self.password.clone())
-            .child(toggle)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(s.password_kept),
-            )
-            .child(div().flex().gap_2().child(keep).child(forget).child(cancel));
-        self.dialog_overlay(
-            ModalKind::DefaultPassword,
-            s.default_password,
-            s.password_hint,
-            body,
-            cx,
-        )
-    }
-
-    /// Language, theme, and the defaults a new archive is made with.
-    ///
-    /// Every choice is a row of buttons with the current one filled in, not a
-    /// dropdown: there are three of each at most, and a list that short costs
-    /// more to open than to read.
-    fn settings_dialog(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
-        let s = self.controller.s();
-        let lang = self.controller.state.settings.lang;
-        let theme = self.controller.state.settings.theme;
-        let is_zip = self.controller.state.format == super::Format::Zip;
-        let choice = |this: &Self,
-                      control: SettingsControl,
-                      label: &'static str,
-                      active: bool,
-                      enabled: bool,
-                      cx: &mut Context<Self>| {
-            let mut button = Self::dialog_button(
-                ("settings", control as usize),
-                label,
-                &this.settings_focus[control as usize],
-                active,
-                cx,
-            )
-            .aria_selected(active);
-            if enabled {
-                button = button.on_click(cx.listener(move |this, _, window, cx| {
-                    this.settings_activate(control, window, cx);
-                    cx.notify();
-                }));
-            }
-            button
-        };
-        let row = |label: &'static str, children: Vec<Stateful<gpui::Div>>| {
-            div()
-                .flex()
-                .items_center()
-                .flex_wrap()
-                .gap_2()
-                .child(div().w(px(110.)).flex_none().child(label))
-                .children(children)
-        };
-        let languages = row(
-            s.language,
-            vec![
-                choice(
-                    self,
-                    SettingsControl::LangSystem,
-                    s.theme_system,
-                    lang.is_none(),
-                    true,
-                    cx,
-                ),
-                choice(
-                    self,
-                    SettingsControl::LangEn,
-                    super::Lang::En.label(),
-                    lang == Some(super::Lang::En),
-                    true,
-                    cx,
-                ),
-                choice(
-                    self,
-                    SettingsControl::LangEs,
-                    super::Lang::Es.label(),
-                    lang == Some(super::Lang::Es),
-                    true,
-                    cx,
-                ),
-            ],
-        );
-        let themes = row(
-            s.theme,
-            vec![
-                choice(
-                    self,
-                    SettingsControl::ThemeSystem,
-                    s.theme_system,
-                    theme == super::ThemePreference::System,
-                    true,
-                    cx,
-                ),
-                choice(
-                    self,
-                    SettingsControl::ThemeLight,
-                    s.theme_light,
-                    theme == super::ThemePreference::Light,
-                    true,
-                    cx,
-                ),
-                choice(
-                    self,
-                    SettingsControl::ThemeDark,
-                    s.theme_dark,
-                    theme == super::ThemePreference::Dark,
-                    true,
-                    cx,
-                ),
-            ],
-        );
-        let defaults = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(s.defaults_title),
-            )
-            .child(row(
-                s.format,
-                vec![choice(
-                    self,
-                    SettingsControl::Format,
-                    self.controller.state.format.label(),
-                    false,
-                    true,
-                    cx,
-                )],
-            ))
-            .child(row(
-                s.compressor,
-                vec![choice(
-                    self,
-                    SettingsControl::Codec,
-                    self.controller.codec_name(self.controller.state.codec),
-                    false,
-                    is_zip,
-                    cx,
-                )],
-            ))
-            .child(row(
-                s.level,
-                vec![choice(
-                    self,
-                    SettingsControl::Level,
-                    self.controller.level_name(self.controller.state.level),
-                    false,
-                    true,
-                    cx,
-                )],
-            ));
-        let subfolder = choice(
-            self,
-            SettingsControl::Subfolder,
-            s.into_subfolder,
-            self.controller.state.into_subfolder,
-            true,
-            cx,
-        );
-        let page = arca_zip::pages::Page::ALL
-            .iter()
-            .find(|(page, _, _)| *page == self.controller.state.settings.page)
-            .map(|(_, _, label)| *label)
-            .unwrap_or("");
-        let name_page = row(
-            s.name_encoding,
-            vec![choice(
-                self,
-                SettingsControl::NamePage,
-                page,
-                false,
-                true,
-                cx,
-            )],
-        );
-        let close = choice(self, SettingsControl::Close, s.close, true, true, cx);
-        let body = div()
-            .id("settings-dialog-body")
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(languages)
-            .child(themes)
-            .child(name_page)
-            .child(Separator::horizontal())
-            .child(defaults)
-            .child(subfolder)
-            .child(div().flex().gap_2().child(close));
-        self.dialog_overlay(ModalKind::Settings, s.settings, s.defaults_title, body, cx)
-    }
-
-    fn dialog_button(
-        id: impl Into<ElementId>,
-        label: impl Into<gpui::SharedString>,
-        focus: &FocusHandle,
-        primary: bool,
-        cx: &App,
-    ) -> Stateful<gpui::Div> {
-        let label: gpui::SharedString = label.into();
-        let mut button = div()
-            .id(id)
-            .role(Role::Button)
-            .aria_label(label.clone())
-            .focusable()
-            .tab_stop(true)
-            .track_focus(focus)
-            .cursor_pointer()
-            .px_3()
-            .py_2()
-            .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(if primary {
-                cx.theme().primary
-            } else {
-                cx.theme().border
-            })
-            .focus_visible(focus_ring(cx));
-        if primary {
-            button = button
-                .bg(cx.theme().primary)
-                .text_color(cx.theme().primary_foreground)
-                .hover(|style| style.bg(cx.theme().primary_hover))
-                .active(|style| style.bg(cx.theme().primary_active));
-        } else {
-            button = button
-                .bg(cx.theme().button)
-                .text_color(cx.theme().button_foreground)
-                .hover(|style| style.bg(cx.theme().button_hover))
-                .active(|style| style.bg(cx.theme().button_active));
-        }
-        button.child(label)
-    }
-
-    fn dialog_overlay(
-        &mut self,
-        kind: ModalKind,
-        title: impl Into<gpui::SharedString>,
-        description: impl Into<gpui::SharedString>,
-        body: Stateful<gpui::Div>,
-        cx: &mut Context<Self>,
-    ) -> Stateful<gpui::Div> {
-        let title: gpui::SharedString = title.into();
-        let description: gpui::SharedString = description.into();
-        div()
-            .id(("gpui-dialog", kind as usize))
-            .absolute()
-            // Everything below the title bar. The three window buttons are not
-            // the background: a dialog that covered them would be a dialog you
-            // could not close the window behind.
-            .top(TITLE_BAR_HEIGHT)
-            .left_0()
-            .right_0()
-            .bottom_0()
-            .bg(cx.theme().overlay)
-            .role(Role::Dialog)
-            .aria_label(title.clone())
-            .aria_keyshortcuts("Escape Enter")
-            .occlude()
-            .on_mouse_down(gpui::MouseButton::Left, |_, _, _| {})
-            .capture_key_down(cx.listener(Self::modal_key_down))
-            .child(
-                div()
-                    .id(("gpui-dialog-card", kind as usize))
-                    .m_8()
-                    // Wide enough for the viewer, which is the only dialog that
-                    // holds content rather than a question. The rest are sized
-                    // by what is in them and never reach it.
-                    .max_w(px(920.))
-                    .p_5()
-                    .gap_3()
-                    .flex()
-                    .flex_col()
-                    .tab_group()
-                    .bg(cx.theme().popover)
-                    .text_color(cx.theme().popover_foreground)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .rounded(cx.theme().radius_lg)
-                    .shadow_lg()
-                    .child(
-                        div()
-                            .id(("dialog-title", kind as usize))
-                            .role(Role::Heading)
-                            .text_lg()
-                            .child(title.clone()),
-                    )
-                    .child(
-                        div()
-                            .id(("dialog-description", kind as usize))
-                            .role(Role::Note)
-                            .aria_label("Dialog description")
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(description),
-                    )
-                    .child(body),
-            )
-    }
-
     fn cycle_format(&mut self) {
         self.controller.state.format = match self.controller.state.format {
             super::Format::Zip => super::Format::Tar,
@@ -2067,429 +1353,6 @@ impl GpuiShell {
             .then(|| self.controller.state.add_password.clone()),
         }));
         cx.notify();
-    }
-
-    fn add_dialog(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
-        let s = self.controller.s();
-        let format = self.controller.state.format;
-        let is_zip = format == super::Format::Zip;
-        let format_button = Self::dialog_button(
-            "add-format",
-            format.label(),
-            &self.add_format_focus,
-            false,
-            cx,
-        )
-        .aria_label(s.format)
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.cycle_format();
-            cx.notify();
-        }));
-        let codec_button = Self::button(
-            "add-codec",
-            self.controller.codec_name(self.controller.state.codec),
-            s.compressor.to_string(),
-            is_zip,
-            cx,
-        )
-        .track_focus(&self.add_codec_focus)
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.cycle_codec();
-            cx.notify();
-        }));
-        let level_button = Self::dialog_button(
-            "add-level",
-            self.controller.level_name(self.controller.state.level),
-            &self.add_level_focus,
-            false,
-            cx,
-        )
-        .aria_label(s.level)
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.cycle_level();
-            cx.notify();
-        }));
-        let password = if is_zip {
-            let show = self.controller.state.show_password;
-            let toggle = Self::dialog_button(
-                "add-password-visibility",
-                if show { s.hide_word } else { s.show_password },
-                &self.add_password_toggle_focus,
-                false,
-                cx,
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.controller.state.show_password = !this.controller.state.show_password;
-                cx.notify();
-            }));
-            Some(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(self.add_password.clone())
-                    .child(toggle),
-            )
-        } else {
-            None
-        };
-        let start = Self::dialog_button("add-start", s.start, &self.add_start_focus, true, cx)
-            .on_click(cx.listener(|this, _, _, cx| this.start_add(cx)));
-        let cancel = Self::dialog_button("add-cancel", s.cancel, &self.add_cancel_focus, false, cx)
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.controller.state.view = View::Browse;
-                cx.notify();
-            }));
-        let count = self.controller.state.pending_inputs.len();
-        let options = div()
-            .flex()
-            .flex_wrap()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(s.format)
-                    .child(format_button),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(s.compressor)
-                    .child(codec_button),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(s.level)
-                    .child(level_button),
-            );
-        let mut body = div()
-            .id("add-dialog-body")
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(s.output_name)
-                    .child(self.output_name.clone()),
-            )
-            .child(options);
-        if let Some(password) = password {
-            body = body.child(password);
-        }
-        body = body
-            .child(format!("{count} {}", s.files_word))
-            .child(div().flex().gap_2().child(start).child(cancel));
-        self.dialog_overlay(ModalKind::Add, s.add_to_archive, s.defaults_title, body, cx)
-    }
-
-    fn dialogs(&mut self, cx: &mut Context<Self>) -> Option<Stateful<gpui::Div>> {
-        let s = self.controller.s();
-        if matches!(self.controller.state.view, View::Add) {
-            return Some(self.add_dialog(cx));
-        }
-        let kind = self.modal_kind()?;
-        // Already drawn by the kit's dialog layer.
-        if Self::kit_dialog(kind) {
-            return None;
-        }
-        match kind {
-            ModalKind::Password => {
-                let setting = matches!(
-                    self.controller.state.waiting_on_password,
-                    Some(Pending::CurrentPassword(_))
-                );
-                let title = if setting {
-                    s.set_password
-                } else {
-                    s.password_needed
-                };
-                let hint = if setting {
-                    s.new_password
-                } else {
-                    s.password_hint
-                };
-                let password = self.password.clone();
-                let show = !self.controller.state.show_password;
-                let toggle = Self::dialog_button(
-                    "password-visibility",
-                    if show { s.show_password } else { s.hide_word },
-                    &self.password_toggle_focus,
-                    false,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.controller
-                        .dispatch(AppAction::TogglePasswordVisibility);
-                    cx.notify();
-                }));
-                let submit = Self::dialog_button(
-                    "password-submit",
-                    if setting { s.set_password } else { s.start },
-                    &self.dialog_primary_focus,
-                    true,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let password = this.password.read(cx).content.clone();
-                    this.controller
-                        .dispatch(AppAction::SubmitPassword(password));
-                    cx.notify();
-                }));
-                let cancel = Self::dialog_button(
-                    "password-cancel",
-                    s.cancel,
-                    &self.dialog_cancel_focus,
-                    false,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.controller.dispatch(AppAction::CancelPassword);
-                    cx.notify();
-                }));
-                Some(
-                    self.dialog_overlay(
-                        ModalKind::Password,
-                        title,
-                        hint,
-                        div()
-                            .id("password-dialog-body")
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .child(password)
-                            .child(toggle)
-                            .child(div().flex().gap_2().child(submit).child(cancel)),
-                        cx,
-                    ),
-                )
-            }
-            ModalKind::Conflict => {
-                let path = self.controller.state.conflict.clone().unwrap_or_default();
-                let overwrite = Self::dialog_button(
-                    "conflict-replace",
-                    s.yes,
-                    &self.dialog_primary_focus,
-                    true,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.answer_conflict(Answer::Replace);
-                    cx.notify();
-                }));
-                let overwrite_all = Self::dialog_button(
-                    "conflict-replace-all",
-                    s.yes_all,
-                    &self.dialog_secondary_focus,
-                    false,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.answer_conflict(Answer::ReplaceAll);
-                    cx.notify();
-                }));
-                let skip = Self::dialog_button(
-                    "conflict-skip",
-                    s.no,
-                    &self.dialog_tertiary_focus,
-                    false,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.answer_conflict(Answer::Skip);
-                    cx.notify();
-                }));
-                let skip_all = Self::dialog_button(
-                    "conflict-skip-all",
-                    s.no_all,
-                    &self.dialog_quaternary_focus,
-                    false,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.answer_conflict(Answer::SkipAll);
-                    cx.notify();
-                }));
-                let keep = Self::dialog_button(
-                    "conflict-keep-both",
-                    s.rename,
-                    &self.dialog_rename_focus,
-                    false,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.answer_conflict(Answer::Rename);
-                    cx.notify();
-                }));
-                let rename_all = Self::dialog_button(
-                    "conflict-keep-both-all",
-                    s.rename_all,
-                    &self.dialog_rename_all_focus,
-                    false,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.answer_conflict(Answer::RenameAll);
-                    cx.notify();
-                }));
-                let cancel = Self::dialog_button(
-                    "conflict-cancel",
-                    s.cancel,
-                    &self.dialog_cancel_focus,
-                    false,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.answer_conflict(Answer::Cancel);
-                    cx.notify();
-                }));
-                Some(
-                    self.dialog_overlay(
-                        ModalKind::Conflict,
-                        s.conflict_title,
-                        format!("{} {path}", s.already_there),
-                        div()
-                            .id("conflict-dialog-body")
-                            .flex()
-                            .flex_wrap()
-                            .gap_2()
-                            .children([
-                                overwrite,
-                                overwrite_all,
-                                skip,
-                                skip_all,
-                                keep,
-                                rename_all,
-                                cancel,
-                            ]),
-                        cx,
-                    ),
-                )
-            }
-            ModalKind::Delete => {
-                let names = self
-                    .controller
-                    .state
-                    .confirm_delete
-                    .clone()
-                    .unwrap_or_default();
-                let confirm = Self::dialog_button(
-                    "delete-confirm",
-                    s.delete_word,
-                    &self.dialog_primary_focus,
-                    true,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.controller.dispatch(AppAction::ConfirmDelete(true));
-                    cx.notify();
-                }));
-                let cancel = Self::dialog_button(
-                    "delete-cancel",
-                    s.cancel,
-                    &self.dialog_cancel_focus,
-                    false,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.controller.dispatch(AppAction::ConfirmDelete(false));
-                    cx.notify();
-                }));
-                Some(
-                    self.dialog_overlay(
-                        ModalKind::Delete,
-                        s.delete_word,
-                        fill(s.confirm_delete, &[("n", &names.len().to_string())]),
-                        div()
-                            .id("delete-dialog-body")
-                            .flex()
-                            .gap_2()
-                            .children([confirm, cancel]),
-                        cx,
-                    ),
-                )
-            }
-            ModalKind::Drop => {
-                let paths = self
-                    .controller
-                    .state
-                    .confirm_drop
-                    .clone()
-                    .unwrap_or_default();
-                let open = Self::dialog_button(
-                    "drop-open",
-                    s.open_word,
-                    &self.dialog_primary_focus,
-                    true,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.controller
-                        .dispatch(AppAction::AnswerDrop(DropChoice::Open));
-                    cx.notify();
-                }));
-                let add = Self::dialog_button(
-                    "drop-add",
-                    s.add_to_archive,
-                    &self.dialog_secondary_focus,
-                    false,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.controller
-                        .dispatch(AppAction::AnswerDrop(DropChoice::Add));
-                    cx.notify();
-                }));
-                let cancel = Self::dialog_button(
-                    "drop-cancel",
-                    s.cancel,
-                    &self.dialog_cancel_focus,
-                    false,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.controller
-                        .dispatch(AppAction::AnswerDrop(DropChoice::Cancel));
-                    cx.notify();
-                }));
-                let names = paths
-                    .iter()
-                    .take(8)
-                    .filter_map(|path| path.file_name())
-                    .map(|name| name.to_string_lossy().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                Some(
-                    self.dialog_overlay(
-                        ModalKind::Drop,
-                        s.drop_title,
-                        format!("{} {names}", s.dropped_word),
-                        div()
-                            .id("drop-dialog-body")
-                            .flex()
-                            .gap_2()
-                            .children([open, add, cancel]),
-                        cx,
-                    ),
-                )
-            }
-            kind @ (ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask) => {
-                Some(self.name_dialog(kind, cx))
-            }
-            ModalKind::Viewer => Some(self.viewer_dialog(cx)),
-            ModalKind::DefaultPassword => Some(self.default_password_dialog(cx)),
-            ModalKind::Settings => Some(self.settings_dialog(cx)),
-            ModalKind::Shortcuts => Some(self.shortcuts_dialog(cx)),
-            ModalKind::Add => unreachable!("add dialog is rendered above"),
-        }
     }
 
     /// Runs what the row menu was asked for and shuts it.
@@ -2978,96 +1841,6 @@ impl GpuiShell {
     }
 
     /// The keys, and what each one does, in the two columns they are read in.
-    fn shortcuts_dialog(&mut self, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
-        let s = self.controller.s();
-        let left = [
-            ("Ctrl+O", s.open),
-            ("Ctrl+N", s.compress),
-            ("Ctrl+E", s.extract_all),
-            ("Alt+W", s.extract_here),
-            ("F3", s.view_word),
-            ("Ctrl+T", s.test_word),
-            ("F5", s.refresh_word),
-            ("Ctrl+F", s.find_word),
-            ("", ""),
-            ("Ctrl+Z", s.undo_word),
-            ("Ctrl+P", s.default_password),
-            ("Ctrl+A", s.select_all),
-            ("Ctrl+I", s.invert_selection),
-            ("Esc", s.clear_selection),
-            ("Space", s.toggle_word),
-            ("Num +  -", s.select_group),
-            ("F2", s.rename_word),
-            ("Supr", s.delete_word),
-            ("F1", s.shortcuts_title),
-        ];
-        let right = [
-            ("Ctrl+C", s.copy_word),
-            ("Ctrl+X", s.cut_word),
-            ("Ctrl+V", s.paste_word),
-            ("Ctrl+Shift+C", s.copy_names),
-            ("", ""),
-            ("Enter", s.open_word),
-            ("Backspace", s.up),
-            ("\u{2191} \u{2193}", s.move_word),
-            ("Home  End", s.move_word),
-            ("PageUp  PageDown", s.move_word),
-            ("Tab", s.jump_word),
-        ];
-        let column = |rows: &[(&str, &str)]| {
-            rows.iter().filter(|(key, _)| !key.is_empty()).fold(
-                div().flex().flex_col().gap_1(),
-                |column, (key, what)| {
-                    column.child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .text_sm()
-                            .child(
-                                div()
-                                    .w(px(130.))
-                                    .flex_none()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(key.to_string()),
-                            )
-                            .child(what.to_string()),
-                    )
-                },
-            )
-        };
-        let close = Self::dialog_button(
-            "shortcuts-close",
-            s.close,
-            &self.dialog_cancel_focus,
-            true,
-            cx,
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.controller.state.show_shortcuts = false;
-            cx.notify();
-        }));
-        let body = div()
-            .id("shortcuts-dialog-body")
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(
-                div()
-                    .flex()
-                    .gap_8()
-                    .child(column(&left))
-                    .child(column(&right)),
-            )
-            .child(close);
-        self.dialog_overlay(
-            ModalKind::Shortcuts,
-            s.shortcuts_title,
-            s.shortcuts_title,
-            body,
-            cx,
-        )
-    }
-
     fn background_idle(&self) -> bool {
         !self.controller.state.busy
             && self.modal_kind().is_none()
@@ -3919,6 +2692,20 @@ impl Render for GpuiShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_window_title(&self.controller.state.window_title);
         self.remember_background_focus(window, cx);
+        // Decoding writes to the cache, and the viewer's dialog body may only
+        // read the shell, so the picture has to be decoded here instead. Name
+        // and bytes only: `Viewed` holds the split lines and is not cloned per
+        // frame on purpose.
+        let to_decode = self
+            .controller
+            .state
+            .viewing
+            .as_ref()
+            .filter(|view| view.look == super::Look::Picture && view.picture)
+            .map(|view| (view.name.clone(), view.bytes.clone()));
+        if let Some((name, bytes)) = to_decode {
+            let _ = self.viewer_picture(&name, &bytes);
+        }
         let s = self.controller.s();
         let modal = self.modal_kind();
         let idle = self.background_idle();
@@ -5571,9 +4358,6 @@ impl Render for GpuiShell {
         if let Some((index, at)) = self.row_menu {
             root = root.child(self.row_menu_view(index, at, cx));
         }
-        if let Some(dialog) = self.dialogs(cx) {
-            root = root.child(dialog);
-        }
         // The kit's stack is imperative and this shell's modal is derived, so
         // they are reconciled after the frame rather than during it.
         if self.modal_kind().filter(|kind| Self::kit_dialog(*kind)) != self.open_modal {
@@ -5642,6 +4426,36 @@ fn build_dialog(
             });
         }
     });
+    // Same answer as the close button, for the people who reach for a labelled
+    // button instead of an X.
+    let cancel_button = |id: &'static str, label: &'static str| {
+        let weak = weak.clone();
+        Button::new(id)
+            .label(label)
+            .outline()
+            .on_click(move |_, _, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.cancel_modal(kind);
+                    cx.notify();
+                });
+            })
+    };
+    // Reveals what is being typed. Does not answer the dialog, so it never
+    // closes it.
+    let reveal_button = |id: &'static str| {
+        let weak = weak.clone();
+        let shown = shell.read(cx).controller.state.show_password;
+        Button::new(id)
+            .label(if shown { s.hide_word } else { s.show_password })
+            .ghost()
+            .on_click(move |_, _, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.controller
+                        .dispatch(AppAction::TogglePasswordVisibility);
+                    cx.notify();
+                });
+            })
+    };
     match kind {
         ModalKind::Delete => {
             let names = shell
@@ -5654,7 +4468,10 @@ fn build_dialog(
             let confirm = weak.clone();
             dialog
                 .title(s.delete_word)
-                .child(div().child(fill(s.confirm_delete, &[("n", &names.len().to_string())])))
+                .child(
+                    DialogDescription::new()
+                        .child(fill(s.confirm_delete, &[("n", &names.len().to_string())])),
+                )
                 // `button_props` alone draws nothing: the kit only renders
                 // action buttons when a footer asks for them. `DialogClose`
                 // and `DialogAction` are what route a press back into
@@ -5678,7 +4495,670 @@ fn build_dialog(
                     true
                 })
         }
-        _ => dialog,
+        ModalKind::Conflict => {
+            let path = shell
+                .read(cx)
+                .controller
+                .state
+                .conflict
+                .clone()
+                .unwrap_or_default();
+            // Every choice closes the dialog the same way: it answers, the
+            // controller drops the question and the next reconcile takes the
+            // dialog down. Nothing here has to close it by hand.
+            let choice = |id: &'static str, label: &'static str, answer: Answer| {
+                let weak = weak.clone();
+                Button::new(id).label(label).on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.answer_conflict(answer);
+                        cx.notify();
+                    });
+                })
+            };
+            let enter = weak.clone();
+            dialog
+                .title(s.conflict_title)
+                .w(px(560.))
+                .child(DialogDescription::new().child(format!("{} {path}", s.already_there)))
+                .footer(
+                    DialogFooter::new()
+                        .flex_wrap()
+                        .child(choice("conflict-replace", s.yes, Answer::Replace).primary())
+                        .child(choice(
+                            "conflict-replace-all",
+                            s.yes_all,
+                            Answer::ReplaceAll,
+                        ))
+                        .child(choice("conflict-skip", s.no, Answer::Skip))
+                        .child(choice("conflict-skip-all", s.no_all, Answer::SkipAll))
+                        .child(choice("conflict-keep-both", s.rename, Answer::Rename))
+                        .child(choice(
+                            "conflict-keep-both-all",
+                            s.rename_all,
+                            Answer::RenameAll,
+                        ))
+                        .child(choice("conflict-cancel", s.cancel, Answer::Cancel).outline()),
+                )
+                // Enter keeps answering what it answered before the migration.
+                .on_ok(move |_, _, cx| {
+                    let _ = enter.update(cx, |this, cx| {
+                        this.answer_conflict(Answer::Replace);
+                        cx.notify();
+                    });
+                    true
+                })
+        }
+        ModalKind::Drop => {
+            let paths = shell
+                .read(cx)
+                .controller
+                .state
+                .confirm_drop
+                .clone()
+                .unwrap_or_default();
+            let names = paths
+                .iter()
+                .take(8)
+                .filter_map(|path| path.file_name())
+                .map(|name| name.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let choice = |id: &'static str, label: &'static str, choice: DropChoice| {
+                let weak = weak.clone();
+                Button::new(id).label(label).on_click(move |_, _, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.controller.dispatch(AppAction::AnswerDrop(choice));
+                        cx.notify();
+                    });
+                })
+            };
+            let enter = weak.clone();
+            dialog
+                .title(s.drop_title)
+                .child(DialogDescription::new().child(format!("{} {names}", s.dropped_word)))
+                .footer(
+                    DialogFooter::new()
+                        .child(choice("drop-open", s.open_word, DropChoice::Open).primary())
+                        .child(choice("drop-add", s.add_to_archive, DropChoice::Add))
+                        .child(choice("drop-cancel", s.cancel, DropChoice::Cancel).outline()),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = enter.update(cx, |this, cx| {
+                        this.controller
+                            .dispatch(AppAction::AnswerDrop(DropChoice::Open));
+                        cx.notify();
+                    });
+                    true
+                })
+        }
+        ModalKind::Shortcuts => {
+            let left = [
+                ("Ctrl+O", s.open),
+                ("Ctrl+N", s.compress),
+                ("Ctrl+E", s.extract_all),
+                ("Alt+W", s.extract_here),
+                ("F3", s.view_word),
+                ("Ctrl+T", s.test_word),
+                ("F5", s.refresh_word),
+                ("Ctrl+F", s.find_word),
+                ("", ""),
+                ("Ctrl+Z", s.undo_word),
+                ("Ctrl+P", s.default_password),
+                ("Ctrl+A", s.select_all),
+                ("Ctrl+I", s.invert_selection),
+                ("Esc", s.clear_selection),
+                ("Space", s.toggle_word),
+                ("Num +  -", s.select_group),
+                ("F2", s.rename_word),
+                ("Supr", s.delete_word),
+                ("F1", s.shortcuts_title),
+            ];
+            let right = [
+                ("Ctrl+C", s.copy_word),
+                ("Ctrl+X", s.cut_word),
+                ("Ctrl+V", s.paste_word),
+                ("Ctrl+Shift+C", s.copy_names),
+                ("", ""),
+                ("Enter", s.open_word),
+                ("Backspace", s.up),
+                ("\u{2191} \u{2193}", s.move_word),
+                ("Home  End", s.move_word),
+                ("PageUp  PageDown", s.move_word),
+                ("Tab", s.jump_word),
+            ];
+            let muted = cx.theme().muted_foreground;
+            let column = |rows: &[(&str, &str)]| {
+                rows.iter().filter(|(key, _)| !key.is_empty()).fold(
+                    div().flex().flex_col().gap_1(),
+                    |column, (key, what)| {
+                        column.child(
+                            div()
+                                .flex()
+                                .gap_3()
+                                .text_sm()
+                                .child(
+                                    div()
+                                        .w(px(130.))
+                                        .flex_none()
+                                        .text_color(muted)
+                                        .child(key.to_string()),
+                                )
+                                .child(what.to_string()),
+                        )
+                    },
+                )
+            };
+            // No close button of its own: the kit's own close, escape and
+            // backdrop are the way out of every dialog now.
+            dialog.title(s.shortcuts_title).w(px(720.)).child(
+                div()
+                    .flex()
+                    .gap_8()
+                    .child(column(&left))
+                    .child(column(&right)),
+            )
+        }
+        ModalKind::Password => {
+            let setting = matches!(
+                shell.read(cx).controller.state.waiting_on_password,
+                Some(Pending::CurrentPassword(_))
+            );
+            let field = shell.read(cx).password.clone();
+            let submit = weak.clone();
+            let submit_label = if setting { s.set_password } else { s.start };
+            dialog
+                .title(if setting {
+                    s.set_password
+                } else {
+                    s.password_needed
+                })
+                .child(DialogDescription::new().child(if setting {
+                    s.new_password
+                } else {
+                    s.password_hint
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(field)
+                        .child(reveal_button("password-visibility")),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(cancel_button("password-cancel", s.cancel))
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("password-submit").label(submit_label).primary(),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = submit.update(cx, |this, cx| {
+                        let password = this.password.read(cx).content.clone();
+                        this.controller
+                            .dispatch(AppAction::SubmitPassword(password));
+                        cx.notify();
+                    });
+                    true
+                })
+        }
+        ModalKind::DefaultPassword => {
+            let field = shell.read(cx).password.clone();
+            let keep = weak.clone();
+            let forget = weak.clone();
+            let muted = cx.theme().muted_foreground;
+            dialog
+                .title(s.default_password)
+                .child(DialogDescription::new().child(s.password_hint))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(field)
+                        .child(reveal_button("default-password-visibility"))
+                        .child(div().text_xs().text_color(muted).child(s.password_kept)),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(cancel_button("default-password-cancel", s.cancel))
+                        .child(
+                            Button::new("default-password-forget")
+                                .label(s.remove_password)
+                                .on_click(move |_, _, cx| {
+                                    let _ = forget.update(cx, |this, cx| {
+                                        this.forget_default_password();
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .child(
+                            DialogAction::new().child(
+                                Button::new("default-password-keep")
+                                    .label(s.start)
+                                    .primary(),
+                            ),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = keep.update(cx, |this, cx| {
+                        this.keep_default_password();
+                        cx.notify();
+                    });
+                    true
+                })
+        }
+        ModalKind::Add => {
+            let format = shell.read(cx).controller.state.format;
+            let is_zip = format == super::Format::Zip;
+            let codec_label = {
+                let this = shell.read(cx);
+                this.controller.codec_name(this.controller.state.codec)
+            };
+            let level_label = {
+                let this = shell.read(cx);
+                this.controller.level_name(this.controller.state.level)
+            };
+            let count = shell.read(cx).controller.state.pending_inputs.len();
+            let output_name = shell.read(cx).output_name.clone();
+            let add_password = shell.read(cx).add_password.clone();
+            // The kit's `Button` names itself from its label, and the label
+            // beside it says which setting it belongs to.
+            let cycle =
+                |id: &'static str, label: &'static str, enabled: bool, step: fn(&mut GpuiShell)| {
+                    let weak = weak.clone();
+                    Button::new(id)
+                        .label(label)
+                        .disabled(!enabled)
+                        .on_click(move |_, _, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                step(this);
+                                cx.notify();
+                            });
+                        })
+                };
+            let labelled = |label: &'static str, control: Button| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(label)
+                    .child(control)
+            };
+            let start = weak.clone();
+            let mut body = div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(s.output_name)
+                        .child(output_name),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(labelled(
+                            s.format,
+                            cycle("add-format", format.label(), true, GpuiShell::cycle_format),
+                        ))
+                        .child(labelled(
+                            s.compressor,
+                            cycle("add-codec", codec_label, is_zip, GpuiShell::cycle_codec),
+                        ))
+                        .child(labelled(
+                            s.level,
+                            cycle("add-level", level_label, true, GpuiShell::cycle_level),
+                        )),
+                );
+            if is_zip {
+                body = body.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(add_password)
+                        .child(reveal_button("add-password-visibility")),
+                );
+            }
+            dialog
+                .title(s.add_to_archive)
+                .w(px(600.))
+                .child(DialogDescription::new().child(s.defaults_title))
+                .child(body.child(format!("{count} {}", s.files_word)))
+                .footer(
+                    DialogFooter::new()
+                        .child(cancel_button("add-cancel", s.cancel))
+                        .child(
+                            DialogAction::new()
+                                .child(Button::new("add-start").label(s.start).primary()),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = start.update(cx, |this, cx| this.start_add(cx));
+                    true
+                })
+        }
+        ModalKind::Viewer => {
+            // Field by field: `Viewed` is deliberately not `Clone`, because it
+            // carries the split lines of the whole file.
+            let Some((name, look, has_picture, bytes, lines)) = shell
+                .read(cx)
+                .controller
+                .state
+                .viewing
+                .as_ref()
+                .map(|view| {
+                    (
+                        view.name.clone(),
+                        view.look,
+                        view.picture,
+                        view.bytes.clone(),
+                        view.lines.clone(),
+                    )
+                })
+            else {
+                return dialog;
+            };
+            let scroll = shell.read(cx).viewer_scroll.clone();
+            let muted = cx.theme().muted_foreground;
+            let mut tabs = div().flex().items_center().gap_2();
+            for (index, (candidate, label)) in [
+                (super::Look::Text, s.as_text),
+                (super::Look::Hex, s.as_hex),
+                (super::Look::Picture, s.as_picture),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                // Only where there is a picture to show. A tab that says
+                // "picture" over a text file is a tab that lies.
+                if candidate == super::Look::Picture && !has_picture {
+                    continue;
+                }
+                let weak = weak.clone();
+                tabs = tabs.child(
+                    Button::new(("viewer-tab", index))
+                        .label(label)
+                        .selected(look == candidate)
+                        .on_click(move |_, _, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                if let Some(view) = &mut this.controller.state.viewing {
+                                    view.look = candidate;
+                                }
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            tabs = tabs.child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(human(bytes.len() as u64)),
+            );
+            let content = match look {
+                super::Look::Picture => {
+                    let image = shell
+                        .read(cx)
+                        .viewer_image
+                        .as_ref()
+                        .filter(|(cached, _)| cached == &name)
+                        .map(|(_, image)| image.clone());
+                    div()
+                        .id("viewer-picture")
+                        .flex_1()
+                        .min_h(px(1.))
+                        .overflow_scroll()
+                        .children(image.map(gpui::img))
+                        .into_any_element()
+                }
+                super::Look::Text => {
+                    let total = lines.len();
+                    uniform_list(
+                        "viewer-text",
+                        total,
+                        move |range: Range<usize>, _window, _cx| {
+                            range
+                                .map(|index| {
+                                    div()
+                                        .font_family("monospace")
+                                        .text_xs()
+                                        .child(lines[index].clone())
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    )
+                    .track_scroll(&scroll)
+                    .size_full()
+                    .into_any_element()
+                }
+                super::Look::Hex => {
+                    let total = bytes.len().div_ceil(16);
+                    uniform_list(
+                        "viewer-hex",
+                        total,
+                        move |range: Range<usize>, _window, _cx| {
+                            range
+                                .map(|row| {
+                                    let at = row * 16;
+                                    let end = (at + 16).min(bytes.len());
+                                    div()
+                                        .font_family("monospace")
+                                        .text_xs()
+                                        .child(super::hex_line(at, &bytes[at..end]))
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    )
+                    .track_scroll(&scroll)
+                    .size_full()
+                    .into_any_element()
+                }
+            };
+            dialog
+                .title(name)
+                .w(px(800.))
+                .child(DialogDescription::new().child(s.view_word))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .h(px(460.))
+                        .child(tabs)
+                        .child(Separator::horizontal())
+                        .child(
+                            div()
+                                .id("viewer-content")
+                                .flex_1()
+                                .min_h(px(1.))
+                                .overflow_hidden()
+                                .child(content),
+                        ),
+                )
+        }
+        ModalKind::Settings => {
+            let lang = shell.read(cx).controller.state.settings.lang;
+            let theme = shell.read(cx).controller.state.settings.theme;
+            let is_zip = shell.read(cx).controller.state.format == super::Format::Zip;
+            let format_label = shell.read(cx).controller.state.format.label();
+            let codec_label = {
+                let this = shell.read(cx);
+                this.controller.codec_name(this.controller.state.codec)
+            };
+            let level_label = {
+                let this = shell.read(cx);
+                this.controller.level_name(this.controller.state.level)
+            };
+            let page_label = {
+                let page = shell.read(cx).controller.state.settings.page;
+                arca_zip::pages::Page::ALL
+                    .iter()
+                    .find(|(candidate, _, _)| *candidate == page)
+                    .map(|(_, _, label)| *label)
+                    .unwrap_or("")
+            };
+            let subfolder_on = shell.read(cx).controller.state.into_subfolder;
+            let muted = cx.theme().muted_foreground;
+            let choice =
+                |control: SettingsControl, label: &'static str, active: bool, enabled: bool| {
+                    let weak = weak.clone();
+                    Button::new(("settings", control as usize))
+                        .label(label)
+                        .selected(active)
+                        .disabled(!enabled)
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.settings_activate(control, window, cx);
+                                cx.notify();
+                            });
+                        })
+                };
+            let row = |label: &'static str, children: Vec<Button>| {
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(div().w(px(110.)).flex_none().child(label))
+                    .children(children)
+            };
+            let subfolder = {
+                let weak = weak.clone();
+                Switch::new("settings-subfolder")
+                    .label(s.into_subfolder)
+                    .checked(subfolder_on)
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.settings_activate(SettingsControl::Subfolder, window, cx);
+                            cx.notify();
+                        });
+                    })
+            };
+            dialog
+                .title(s.settings)
+                .w(px(560.))
+                .child(DialogDescription::new().child(s.defaults_title))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(row(
+                            s.language,
+                            vec![
+                                choice(
+                                    SettingsControl::LangSystem,
+                                    s.theme_system,
+                                    lang.is_none(),
+                                    true,
+                                ),
+                                choice(
+                                    SettingsControl::LangEn,
+                                    super::Lang::En.label(),
+                                    lang == Some(super::Lang::En),
+                                    true,
+                                ),
+                                choice(
+                                    SettingsControl::LangEs,
+                                    super::Lang::Es.label(),
+                                    lang == Some(super::Lang::Es),
+                                    true,
+                                ),
+                            ],
+                        ))
+                        .child(row(
+                            s.theme,
+                            vec![
+                                choice(
+                                    SettingsControl::ThemeSystem,
+                                    s.theme_system,
+                                    theme == super::ThemePreference::System,
+                                    true,
+                                ),
+                                choice(
+                                    SettingsControl::ThemeLight,
+                                    s.theme_light,
+                                    theme == super::ThemePreference::Light,
+                                    true,
+                                ),
+                                choice(
+                                    SettingsControl::ThemeDark,
+                                    s.theme_dark,
+                                    theme == super::ThemePreference::Dark,
+                                    true,
+                                ),
+                            ],
+                        ))
+                        .child(row(
+                            s.name_encoding,
+                            vec![choice(SettingsControl::NamePage, page_label, false, true)],
+                        ))
+                        .child(Separator::horizontal())
+                        .child(div().text_sm().text_color(muted).child(s.defaults_title))
+                        .child(row(
+                            s.format,
+                            vec![choice(SettingsControl::Format, format_label, false, true)],
+                        ))
+                        .child(row(
+                            s.compressor,
+                            vec![choice(SettingsControl::Codec, codec_label, false, is_zip)],
+                        ))
+                        .child(row(
+                            s.level,
+                            vec![choice(SettingsControl::Level, level_label, false, true)],
+                        ))
+                        .child(subfolder),
+                )
+        }
+        ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask => {
+            let (title, hint, confirm) = match kind {
+                ModalKind::NewFolder => (s.new_folder, s.folder_name, s.new_folder),
+                ModalKind::Rename => (s.rename_word, s.rename_word, s.rename_word),
+                _ => {
+                    let adding = shell
+                        .read(cx)
+                        .controller
+                        .state
+                        .picking_group
+                        .unwrap_or(true);
+                    (
+                        if adding {
+                            s.select_group
+                        } else {
+                            s.deselect_group
+                        },
+                        s.mask_hint,
+                        s.start,
+                    )
+                }
+            };
+            let field = shell.read(cx).name_input.clone();
+            let ok = weak.clone();
+            dialog
+                .title(title)
+                .child(DialogDescription::new().child(hint))
+                .child(field)
+                .footer(
+                    DialogFooter::new()
+                        .child(cancel_button("name-cancel", s.cancel))
+                        .child(
+                            DialogAction::new()
+                                .child(Button::new("name-ok").label(confirm).primary()),
+                        ),
+                )
+                .on_ok(move |_, _, cx| {
+                    let _ = ok.update(cx, |this, cx| this.confirm_name(kind, cx));
+                    true
+                })
+        }
     }
 }
 
@@ -6211,9 +5691,9 @@ mod tests {
 
     #[test]
     fn every_settings_control_has_its_own_slot_in_draw_order() {
-        // The dialog indexes `settings_focus` by `control as usize`, so a
-        // control added out of order would silently take another one's focus
-        // handle and Enter would activate the wrong preference.
+        // The dialog builds each control's element id from `control as
+        // usize`, so a control added out of order would silently share an
+        // id with another one.
         for (index, control) in SettingsControl::ALL.iter().enumerate() {
             assert_eq!(*control as usize, index);
         }
