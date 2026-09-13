@@ -36,6 +36,7 @@ ya trae. El recuento de partida en `gpui_shell/mod.rs` (6067 líneas) era de 95
 | Campo de renombrado en la fila | `Input` (hecho) |
 | `button` e `icon_button` | `Button` (hecho) |
 | Menú del botón derecho | `ContextMenu` (hecho) |
+| Tabla, cabecera y anchos | `DataTable` y `TableState` (hecho) |
 | Árbol de carpetas sobre `SidebarMenuItem` | `tree` |
 
 ## Decisiones tomadas
@@ -70,6 +71,23 @@ código. Saltárselas aborta el proceso, no da un error de compilación.
 La tercera es la que sostiene el cierre estándar del kit: descartar un diálogo
 cancela la operación de verdad en lugar de dejar al worker esperando una
 respuesta que no llega.
+
+## Lo que el kit no sabe de una lista de ficheros
+
+La tabla del kit selecciona una fila. Esta marca muchas, las barre con una
+banda y las arrastra fuera de la ventana. Nada de eso desaparece al migrar,
+pero tampoco lo pone el kit:
+
+- El marcado sigue siendo del shell. `render_tr` pinta el fondo y engancha el
+  clic, que pasa por `select_row` con sus modificadores.
+- La banda no cuelga de las filas sino de la ventana, así que sigue igual: lo
+  único que necesitaba era la geometría de la lista, y el handle de scroll del
+  kit es del mismo tipo que el que ya se usaba.
+- La cebra se dibuja fila a fila en vez de con `stripe`, que raya el panel
+  entero y hace pasar por filas lo que no lo es.
+- Los roles de accesibilidad se ponen a mano en el delegate. Sin ellos la
+  tabla desaparece del árbol: es lo primero que hay que volver a mirar si
+  alguna vez se cambia cómo se dibuja una fila.
 
 ## El tema se pinta dos veces
 
@@ -112,7 +130,14 @@ modo que el árbol queda utilizable después de cada fase.
    ningún sitio. Se fueron con él sus cuatrocientas líneas, tres manejos de
    foco, `overflow_key_down`, `recent_shown`, dos constantes de posición y una
    cadena de i18n.
-5. Tabla de ficheros, con sus gestos reconstruidos.
+5. **Hecha.** La tabla es la del kit. El delegate `FileTable` guarda su propia
+   copia de lo que dibuja un fotograma, porque corre dentro del render del
+   shell y leer el shell desde ahí lo tomaría prestado dos veces; `sync_table`
+   la refresca justo antes de entregar la tabla. La banda sobrevivió intacta
+   compartiendo un mismo `UniformListScrollHandle` con el kit. Lo que el kit no
+   trae y se reconstruyó encima: marcar muchas filas a la vez, la cebra sólo
+   bajo las filas que existen, los roles y descripciones de accesibilidad, y
+   ordenar pulsando el nombre de la columna y no sólo su flechita.
 6. Migas de pan, progreso, atajos, controles de ajustes y campos de texto. El
    menú de carpetas ocultas de las migas es el último que queda dibujado a
    mano, y con él se van `menu_row` y `menu_key_down`.

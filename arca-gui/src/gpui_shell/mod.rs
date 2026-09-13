@@ -26,11 +26,12 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::dialog::{Dialog, DialogAction, DialogClose, DialogDescription, DialogFooter};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::separator::Separator;
 use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_component::status_bar::StatusBar;
 use gpui_component::switch::Switch;
+use gpui_component::table::{Column, ColumnSort, DataTable, TableDelegate, TableEvent, TableState};
 use gpui_component::{ActiveTheme, Icon, IconName};
 use gpui_component::{Disableable, Root, Selectable, TitleBar, WindowExt};
 use gpui_platform::application;
@@ -83,7 +84,11 @@ struct GpuiShell {
     name_input: Entity<FilterInput>,
     focus_handle: FocusHandle,
     list_focus: FocusHandle,
+    /// The same handle the kit's table scrolls with. The band needs the list's
+    /// geometry and reads it from here, so both must be looking at one handle.
     list_scroll: UniformListScrollHandle,
+    /// The kit's table, and the copy of the frame it draws from.
+    table: Entity<TableState<FileTable>>,
     dialog: Option<Receiver<DialogResult>>,
     /// Which modal the kit's dialog stack currently holds. The shell derives
     /// its modal from controller state, the kit opens and closes one
@@ -294,6 +299,77 @@ impl GpuiShell {
         })
         .detach();
         let rename_input = cx.new(|cx| InputState::new(window, cx).context_menu(false));
+        let list_scroll = UniformListScrollHandle::new();
+        let table = cx.new(|cx| {
+            TableState::new(
+                FileTable {
+                    shell: owner.clone(),
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                    widths: Settings::default_widths(),
+                    checked: Vec::new(),
+                    muted: Vec::new(),
+                    cursor: None,
+                    renaming: None,
+                    rename_input: rename_input.clone(),
+                    order: (SortColumn::Name, true),
+                    strings,
+                    idle: true,
+                    writable: false,
+                },
+                window,
+                cx,
+            )
+            // One row at a time is the kit's idea of a selection; this list
+            // marks many, and keeps that count itself.
+            .row_selectable(true)
+            .col_selectable(false)
+            .col_movable(false)
+        });
+        // The band measures the list through this handle, so it has to be the
+        // one the table actually scrolls.
+        table.update(cx, |state, _| {
+            state.vertical_scroll_handle = list_scroll.clone();
+        });
+        cx.subscribe_in(
+            &table,
+            window,
+            |shell, _, event: &TableEvent, window, cx| {
+                match event {
+                    // The kit moves its own selected row with the arrows and the
+                    // mouse; the shell's cursor follows it, and the marking stays
+                    // the shell's business.
+                    TableEvent::SelectRow(row) => {
+                        shell.controller.state.cursor = Some(*row);
+                        cx.notify();
+                    }
+                    // Right clicking something that is not picked picks it, which
+                    // is what every file list does; right clicking inside a
+                    // selection leaves the selection alone.
+                    TableEvent::RightClickedRow(Some(row)) => {
+                        if let Some(target) = shell.controller.visible_rows().get(*row).cloned() {
+                            if !shell.controller.is_checked(&target) {
+                                shell.controller.dispatch(AppAction::SetChecked {
+                                    row: target,
+                                    value: true,
+                                });
+                            }
+                        }
+                        shell.controller.state.cursor = Some(*row);
+                        cx.notify();
+                    }
+                    TableEvent::DoubleClickedRow(row) => shell.open_row(*row, cx),
+                    // Written when the kit says the pull is over, so dragging an
+                    // edge across the window is not a stream of writes to disk.
+                    TableEvent::ColumnWidthsChanged(widths) => {
+                        shell.remember_widths(widths, cx);
+                    }
+                    _ => {}
+                }
+                let _ = window;
+            },
+        )
+        .detach();
         cx.subscribe_in(&rename_input, window, |shell, _, event, window, cx| {
             match event {
                 InputEvent::PressEnter { .. } => shell.commit_rename(window, cx),
@@ -412,7 +488,8 @@ impl GpuiShell {
             name_input,
             focus_handle: cx.focus_handle(),
             list_focus: cx.focus_handle(),
-            list_scroll: UniformListScrollHandle::new(),
+            list_scroll,
+            table,
             dialog: None,
             open_modal: None,
             overflow_open: false,
@@ -1899,124 +1976,94 @@ impl GpuiShell {
             .map_or(0, |index| index + 1)
     }
 
-    fn column_width(&self, column: SortColumn) -> f32 {
-        let slot = Self::column_slot(column);
-        self.controller
-            .state
-            .settings
-            .widths
-            .get(slot)
-            .copied()
-            .unwrap_or_else(|| Settings::default_widths()[slot])
+    /// Opening what a row stands for: a folder is walked into, a file is handed
+    /// to whatever opens it.
+    fn open_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.background_idle() {
+            return;
+        }
+        let Some(row) = self.controller.visible_rows().get(index).cloned() else {
+            return;
+        };
+        if row.is_dir {
+            self.controller.dispatch(AppAction::Navigate(row.path));
+            self.route_changed(cx);
+        } else if let Some(entry) = row.entry {
+            self.controller.dispatch(AppAction::OpenFile(entry));
+        }
+        cx.notify();
     }
 
-    /// What a column would have to be to hold what is in it.
+    /// The widths the kit ended a pull with, kept where the rest of the window
+    /// settings live so they survive the window.
+    fn remember_widths(&mut self, widths: &[gpui::Pixels], cx: &mut Context<Self>) {
+        for (column, width) in self.shown_columns().into_iter().zip(widths.iter()) {
+            let slot = Self::column_slot(column);
+            self.set_column_width(slot, f32::from(*width));
+        }
+        self.controller.state.settings.save();
+        cx.notify();
+    }
+
+    /// Hand the table the frame it is about to draw.
     ///
-    /// ponytail: counted in characters against a nominal advance rather than
-    /// shaped through the text system, which is not reachable from a mouse
-    /// handler. Fit the real shaped width if a proportional face ever makes
-    /// this visibly wrong.
-    fn natural_width(&self, column: SortColumn, rows: &[super::Row]) -> f32 {
-        let head = Columns::label(column, self.controller.s()).chars().count();
-        let widest = rows
+    /// The delegate cannot read the shell while the shell is rendering, so what
+    /// it needs is copied across first.
+    fn sync_table(&mut self, rows: &[super::Row], cx: &mut Context<Self>) {
+        let columns = self.shown_columns();
+        let checked: Vec<bool> = rows
             .iter()
-            .map(|row| self.column_text(row, column).chars().count())
-            .max()
-            .unwrap_or(0);
-        let slot = Self::column_slot(column);
-        (widest.max(head) as f32 * 7.2 + 24.0).clamp(Settings::least(slot), 640.0)
-    }
-
-    fn column_header(
-        &self,
-        column: SortColumn,
-        label: &'static str,
-        enabled: bool,
-        cx: &mut Context<Self>,
-    ) -> Stateful<gpui::Div> {
-        let s = self.controller.s();
-        let active = self.controller.state.order.0 == column;
-        let ascending = self.controller.state.order.1;
-        let direction = if ascending { s.ascending } else { s.descending };
-        let text = if active {
-            format!("{} {}", label, if ascending { "↑" } else { "↓" })
-        } else {
-            label.to_string()
-        };
-        let accessible = if active {
-            format!("{} {label} ({direction})", s.sort_by)
-        } else {
-            format!("{} {label}", s.sort_by)
-        };
-        let mut cell = div()
-            .id(label)
-            .aria_label(accessible)
-            .aria_keyshortcuts("Enter")
-            .tab_stop(enabled)
-            .focus_visible(focus_ring(cx))
-            .px_2()
-            .items_center()
-            .flex()
-            .text_sm()
-            .text_color(if active {
-                cx.theme().foreground
-            } else {
-                cx.theme().table_head_foreground
+            .map(|row| self.controller.is_checked(row))
+            .collect();
+        let muted: Vec<bool> = rows
+            .iter()
+            .map(|row| {
+                row.entry.is_some_and(|entry| {
+                    self.controller
+                        .state
+                        .cut_names
+                        .contains(&self.controller.state.entries[entry].name)
+                })
             })
-            .child(text);
-        if enabled {
-            cell = cell.role(Role::Button).focusable();
-        }
-        if column == SortColumn::Name {
-            cell = cell.flex_1();
-        } else {
-            cell = cell.w(px(self.column_width(column))).flex_none();
-        }
-        if enabled {
-            cell = cell.on_click(cx.listener(move |this, _, _, cx| {
-                if this.background_idle() {
-                    this.controller.dispatch(AppAction::Sort(column));
-                    cx.notify();
-                }
-            }));
-        }
-        cell
-    }
-
-    /// The grab strip down the right edge of a header cell.
-    ///
-    /// Absolute inside the cell rather than an element of its own in the flex
-    /// row: a divider with a width would push every header a few pixels off
-    /// the column it names.
-    fn column_edge(&self, column: SortColumn, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
-        let slot = Self::column_slot(column);
-        let width = self.column_width(column);
-        div()
-            .id(("column-edge", column as usize))
-            .absolute()
-            .top_0()
-            .bottom_0()
-            .right(px(-3.))
-            .w(px(6.))
-            .cursor(gpui::CursorStyle::ResizeLeftRight)
-            .hover(|style| style.bg(cx.theme().ring))
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    if event.click_count >= 2 {
-                        // Fitting the column to what is in it, which is what the
-                        // same gesture does in WinRAR and in the Explorer.
-                        let rows = this.controller.visible_rows();
-                        let fitted = this.natural_width(column, &rows);
-                        this.set_column_width(slot, fitted);
-                        this.controller.state.settings.save();
-                    } else {
-                        this.resizing = Some((slot, f32::from(event.position.x), width));
-                    }
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
+            .collect();
+        let renaming = self
+            .controller
+            .state
+            .renaming
+            .as_ref()
+            .and_then(|(path, _)| rows.iter().position(|row| row.path == *path));
+        let widths = (0..Settings::default_widths().len())
+            .map(|slot| {
+                self.controller
+                    .state
+                    .settings
+                    .widths
+                    .get(slot)
+                    .copied()
+                    .unwrap_or_else(|| Settings::default_widths()[slot])
+            })
+            .collect();
+        let cursor = self.controller.state.cursor;
+        let order = self.controller.state.order;
+        let strings = self.controller.s();
+        let idle = self.background_idle();
+        let writable = self.controller.state.format == super::Format::Zip;
+        let rows = rows.to_vec();
+        self.table.update(cx, |state, cx| {
+            let delegate = state.delegate_mut();
+            delegate.rows = rows;
+            delegate.columns = columns;
+            delegate.widths = widths;
+            delegate.checked = checked;
+            delegate.muted = muted;
+            delegate.cursor = cursor;
+            delegate.renaming = renaming;
+            delegate.order = order;
+            delegate.strings = strings;
+            delegate.idle = idle;
+            delegate.writable = writable;
+            state.refresh(cx);
+        });
     }
 
     fn set_column_width(&mut self, slot: usize, width: f32) {
@@ -2037,38 +2084,21 @@ impl GpuiShell {
             Kind::Other => "□",
         }
     }
+}
 
-    fn text_cell(
-        text: impl Into<gpui::SharedString>,
-        column: SortColumn,
-        width: f32,
-        index: usize,
-        column_index: usize,
-        accessible: bool,
-    ) -> Stateful<gpui::Div> {
-        let mut cell = div()
-            .id(("file-cell", index * 10 + column as usize))
-            .w(px(width))
-            .flex_none()
-            .px_2()
-            .items_center()
-            .flex()
-            .text_sm()
-            .child(text.into());
-        if accessible {
-            cell = cell.role(Role::Cell).aria_column_index(column_index);
-        }
-        cell
-    }
-
-    fn column_text(&self, row: &super::Row, column: SortColumn) -> String {
+/// What a row says under a column.
+///
+/// A free function rather than a method: the table's delegate draws the cells
+/// and it has the strings but not the shell.
+fn column_text(row: &super::Row, column: SortColumn, s: &'static Strings) -> String {
+    {
         match column {
             SortColumn::Name => row.label.clone(),
             SortColumn::Size => human(row.size),
             SortColumn::Packed => human(row.packed),
             SortColumn::Method => {
                 if row.is_dir {
-                    format!("{} {}", row.count, self.controller.s().items_word)
+                    format!("{} {}", row.count, s.items_word)
                 } else if row.encrypted {
                     format!("AES-256 {}", row.method)
                 } else {
@@ -2091,262 +2121,9 @@ impl GpuiShell {
             SortColumn::Path => super::folder_of(&row.path).to_string(),
         }
     }
+}
 
-    fn file_row(
-        &self,
-        index: usize,
-        row: &super::Row,
-        columns: &[SortColumn],
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let selected = self.controller.is_checked(row);
-        let cursor = self.controller.state.cursor == Some(index);
-        let muted = row.entry.is_some_and(|entry| {
-            self.controller
-                .state
-                .cut_names
-                .contains(&self.controller.state.entries[entry].name)
-        });
-        let s = self.controller.s();
-        let mut description = format!("{} {}", s.col_name, row.label);
-        for column in columns.iter().copied().skip(1) {
-            let label = Columns::label(column, s);
-            description.push_str(&format!("; {label} {}", self.column_text(row, column)));
-        }
-        description.push_str("; ");
-        description.push_str(if selected { s.checked } else { s.not_checked });
-        let accessible = self.background_idle();
-        // A cut entry is still there until it lands somewhere; it is drawn in
-        // the muted ink so it reads as "about to leave" rather than as gone.
-        let name_color = if muted {
-            cx.theme().muted_foreground
-        } else {
-            cx.theme().foreground
-        };
-        let mut name = div()
-            .id(("file-name-cell", index))
-            .flex_1()
-            .px_2()
-            .items_center()
-            .flex()
-            .gap_2()
-            .min_w(px(140.))
-            .text_sm()
-            .text_color(name_color)
-            .child(
-                div()
-                    .w(px(18.))
-                    .flex_none()
-                    // The type mark is the one place a folder is allowed to
-                    // out-shout a file, and in a monochrome window that is done
-                    // with weight, not hue: full ink for a folder, muted for
-                    // everything else.
-                    .text_color(if row.is_dir {
-                        name_color
-                    } else {
-                        cx.theme().muted_foreground
-                    })
-                    .child(Self::kind_mark(row.kind)),
-            )
-            .child(
-                // Renaming happens here rather than in a dialog, so the name
-                // being typed stays where the name is.
-                if self
-                    .controller
-                    .state
-                    .renaming
-                    .as_ref()
-                    .is_some_and(|(path, _)| *path == row.path)
-                {
-                    div()
-                        .flex_1()
-                        .id(("rename-field", index))
-                        // Escape has to be caught here: the field keeps the
-                        // keystroke to itself, so the list never sees it.
-                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                            if event.keystroke.key == "escape" {
-                                this.cancel_rename(cx);
-                                cx.stop_propagation();
-                            }
-                        }))
-                        .child(Input::new(&self.rename_input))
-                        .into_any_element()
-                } else {
-                    div()
-                        .flex_1()
-                        .truncate()
-                        .child(row.label.clone())
-                        .into_any_element()
-                },
-            );
-        if accessible {
-            name = name.role(Role::Cell).aria_column_index(1);
-        }
-
-        let mut item = div()
-            .id(("file-row", index))
-            .aria_label(description)
-            .aria_selected(selected)
-            .aria_row_index(index + 2)
-            .h(px(26.))
-            .w_full()
-            .px_1()
-            .flex()
-            .items_center()
-            // Where the keyboard is and what is picked are two different
-            // things, so they get two strengths of the same ink rather than two
-            // colours: moving the cursor onto a picked row has to leave both
-            // still visible.
-            .border_1()
-            .border_color(if cursor {
-                cx.theme().table_active_border
-            } else {
-                cx.theme().table_row_border
-            })
-            .bg(if selected {
-                cx.theme().table_active
-            } else if index % 2 == 1 {
-                cx.theme().table_even
-            } else {
-                cx.theme().table
-            })
-            .hover(|style| style.bg(cx.theme().table_hover))
-            .tab_stop(false)
-            .focus_visible(focus_ring(cx))
-            .child(name);
-        if accessible {
-            item = item.role(Role::Row).focusable();
-            if cursor {
-                item = item.aria_active_descendant();
-            }
-        }
-        for (offset, column) in columns.iter().copied().skip(1).enumerate() {
-            item = item.child(Self::text_cell(
-                self.column_text(row, column),
-                column,
-                self.column_width(column),
-                index,
-                offset + 2,
-                accessible,
-            ));
-        }
-        if accessible {
-            item = item.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                this.select_row(index, event, window, cx);
-            }));
-
-            // Right clicking something that is not picked picks it, which is
-            // what every file list does; right clicking inside a selection
-            // leaves the selection alone.
-            // The menu itself belongs to the kit; this only picks the row
-            // under the pointer first, and must let the event through so the
-            // kit still sees the press that opens it.
-            item = item.on_mouse_down(
-                gpui::MouseButton::Right,
-                cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
-                    if !this.background_idle() {
-                        return;
-                    }
-                    if !selected {
-                        if let Some(row) = this.controller.visible_rows().get(index) {
-                            this.controller.dispatch(AppAction::SetChecked {
-                                row: row.clone(),
-                                value: true,
-                            });
-                        }
-                    }
-                    this.controller.state.cursor = Some(index);
-                    cx.notify();
-                }),
-            );
-
-            // A folder takes what is dropped on it and the entries move there,
-            // which is a rewrite of the archive and not a copy out of it.
-            // Dropping a folder into itself is not a move, so it is refused.
-            if row.is_dir {
-                let target = row.path.clone();
-                item = item.on_drop(cx.listener(
-                    move |this: &mut Self, _: &DraggedRows, _window, cx| {
-                        let carried = this.controller.selected_roots();
-                        let into_itself = carried.iter().any(|carried| {
-                            carried.trim_end_matches('/') == target.trim_end_matches('/')
-                        });
-                        if !carried.is_empty() && !into_itself {
-                            this.controller.move_into(&carried, &target);
-                        }
-                        cx.notify();
-                    },
-                ));
-            }
-
-            // GPUI owns the threshold and the gesture's lifetime. Where the
-            // drag is going is not decided here: a folder of this archive takes
-            // it as a move, and leaving the list hands it to arca-drag's lazy
-            // IDataObject, so no archive bytes are extracted merely to begin a
-            // drag. That second half is watched on the window rather than on
-            // the row -- the pointer leaves the row it started on as soon as it
-            // reaches the next one, which is not leaving the list.
-            if selected {
-                let shell = cx.entity();
-                item = item.on_drag(DraggedRows, move |_, _, _window, app| {
-                    shell.update(app, |shell, _| shell.carrying = true);
-                    app.new(|_| gpui::Empty)
-                });
-            }
-        }
-        if !accessible {
-            return item.into_any_element();
-        }
-        // The right button's menu, drawn and steered by the kit: it opens where
-        // the pointer is, walks with the arrows and closes on escape or on a
-        // click outside, none of which this shell has to keep working.
-        let writable = self.controller.state.format == super::Format::Zip;
-        let is_file = row.entry.is_some();
-        let owner = cx.entity().downgrade();
-        item.context_menu(move |menu, _, _| {
-            let mut menu = menu;
-            let mut drawn = false;
-            for action in RowAction::ALL.into_iter().filter(|action| {
-                action.offered()
-                    && (*action != RowAction::Rename || writable)
-                    && (*action != RowAction::View || is_file)
-            }) {
-                // Never as the first thing in the menu: a rule with nothing
-                // above it is a line, not a grouping.
-                if action.starts_group() && drawn {
-                    menu = menu.item(PopupMenuItem::separator());
-                }
-                drawn = true;
-                let (label, keys) = action.label(s);
-                let owner = owner.clone();
-                menu = menu.item(
-                    PopupMenuItem::element(move |_, cx| {
-                        // Two children rather than one string with a tab in it:
-                        // GPUI lays out text and a tab is nothing at all there.
-                        let mut row = div().flex().w_full().gap_4().items_center();
-                        row = row.child(div().flex_1().truncate().child(label));
-                        if !keys.is_empty() {
-                            row = row.child(
-                                div()
-                                    .flex_none()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(keys),
-                            );
-                        }
-                        row
-                    })
-                    .on_click(move |_, window, cx| {
-                        let _ = owner.update(cx, |this, cx| {
-                            this.row_action(action, index, window, cx);
-                        });
-                    }),
-                );
-            }
-            menu
-        })
-        .into_any_element()
-    }
-
+impl GpuiShell {
     fn select_row(
         &mut self,
         index: usize,
@@ -2519,73 +2296,22 @@ impl GpuiShell {
         cx.notify();
     }
 
-    fn file_table(&self, rows: Vec<super::Row>, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
+    /// The archive, as the kit's table.
+    ///
+    /// The header, the column widths, the sorting arrows, the scrolling and the
+    /// right button's menu are the kit's. What stays here is what the kit has
+    /// no notion of: many rows marked at once, the band that sweeps them and a
+    /// drag that leaves the window.
+    fn file_table(&mut self, rows: Vec<super::Row>, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
         let enabled = self.background_idle();
-        let columns = self.shown_columns();
         let strings = self.controller.s();
-        let labels: Vec<(&'static str, SortColumn)> = columns
-            .iter()
-            .map(|column| (Columns::label(*column, strings), *column))
-            .collect();
-        let mut header = labels.iter().enumerate().fold(
-            div()
-                .id("file-header")
-                .aria_row_index(1)
-                .h(px(32.))
-                .w_full()
-                .flex()
-                .items_center()
-                .px_1()
-                .bg(cx.theme().table_head)
-                .border_b_1()
-                .border_color(cx.theme().border),
-            |header, (position, (label, column))| {
-                let mut cell = div()
-                    .id(("header-cell", *column as usize))
-                    .aria_label(*label)
-                    .aria_column_index(position + 1)
-                    .h_full();
-                if *column == SortColumn::Name {
-                    cell = cell.flex_1();
-                } else {
-                    cell = cell.w(px(self.column_width(*column))).flex_none();
-                    // The rule that pulls the column wider, sitting in the gap
-                    // between two cells rather than taking a place in the row,
-                    // so the header and the rows below it stay lined up.
-                    cell = cell.relative().child(self.column_edge(*column, cx));
-                }
-                if enabled {
-                    cell = cell
-                        .role(Role::ColumnHeader)
-                        .aria_label(*label)
-                        .aria_column_index(position + 1);
-                }
-                header.child(cell.child(self.column_header(*column, label, enabled, cx)))
-            },
-        );
-        if enabled {
-            header = header.role(Role::Row).aria_row_index(1);
-        }
-        let total = rows.len();
-        let column_count = columns.len();
-        let row_data = rows;
-        let row_columns = columns;
-        let list = uniform_list(
-            "file-rows",
-            total,
-            cx.processor(move |this, range: Range<usize>, _window, row_cx| {
-                range
-                    .map(|index| this.file_row(index, &row_data[index], &row_columns, row_cx))
-                    .collect::<Vec<_>>()
-            }),
-        )
-        .track_scroll(&self.list_scroll)
-        .size_full();
+        self.sync_table(&rows, cx);
         let mut table = div()
             .id("file-table")
+            .role(Role::Table)
             .aria_label(strings.archive_contents)
-            .aria_row_count(total + 1)
-            .aria_column_count(column_count)
+            .aria_row_count(rows.len() + 1)
+            .aria_column_count(self.shown_columns().len())
             .track_focus(&self.list_focus)
             .tab_stop(enabled)
             .focus_visible(focus_ring(cx))
@@ -2596,8 +2322,7 @@ impl GpuiShell {
             .min_h(px(1.))
             .flex()
             .flex_col()
-            .child(header)
-            .child(div().id("file-list").flex_1().min_h(px(1.)).child(list))
+            .child(DataTable::new(&self.table).stripe(false).bordered(false))
             .child(
                 div()
                     .id("delete-trigger-focus")
@@ -2606,7 +2331,6 @@ impl GpuiShell {
             );
         if enabled {
             table = table
-                .role(Role::Table)
                 .focusable()
                 .on_key_down(cx.listener(Self::list_key_down));
         }
@@ -4731,6 +4455,339 @@ const DRAG_SLOP: f32 = 10.0;
 /// themselves: what is carried is whatever is picked when it lands, and the
 /// selection cannot change while the button is down.
 struct DraggedRows;
+
+/// What the kit's table needs to draw a frame of the archive.
+///
+/// It keeps its own copy rather than reading the shell, because the table is
+/// drawn from inside the shell's own render and reading the shell there would
+/// borrow it while it is already borrowed. The copy is refreshed once a frame,
+/// just before the table is handed out.
+struct FileTable {
+    shell: WeakEntity<GpuiShell>,
+    rows: Vec<super::Row>,
+    columns: Vec<SortColumn>,
+    widths: Vec<f32>,
+    checked: Vec<bool>,
+    /// Rows waiting to be moved by the clipboard, drawn in the muted ink.
+    muted: Vec<bool>,
+    cursor: Option<usize>,
+    renaming: Option<usize>,
+    rename_input: Entity<InputState>,
+    order: (SortColumn, bool),
+    strings: &'static Strings,
+    idle: bool,
+    writable: bool,
+}
+
+impl FileTable {
+    fn row_is_checked(&self, index: usize) -> bool {
+        self.checked.get(index).copied().unwrap_or(false)
+    }
+}
+
+impl TableDelegate for FileTable {
+    fn columns_count(&self, _: &App) -> usize {
+        self.columns.len()
+    }
+
+    fn rows_count(&self, _: &App) -> usize {
+        self.rows.len()
+    }
+
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        let column = self.columns[col_ix];
+        let slot = GpuiShell::column_slot(column);
+        let mut definition = Column::new(
+            gpui::SharedString::from(format!("{}", column as usize)),
+            Columns::label(column, self.strings),
+        )
+        .sortable()
+        .resizable(true)
+        .min_width(px(Settings::least(slot)));
+        // The name runs to the edge of the window: it is the column anybody
+        // widens the window for, and a fixed one would leave a gutter.
+        definition = if column == SortColumn::Name {
+            definition.width(px(self.widths.get(slot).copied().unwrap_or(240.)))
+        } else {
+            definition.width(px(self.widths.get(slot).copied().unwrap_or(96.)))
+        };
+        if self.order.0 == column {
+            definition = if self.order.1 {
+                definition.ascending()
+            } else {
+                definition.descending()
+            };
+        }
+        definition
+    }
+
+    fn perform_sort(
+        &mut self,
+        col_ix: usize,
+        _: ColumnSort,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        let Some(column) = self.columns.get(col_ix).copied() else {
+            return;
+        };
+        let _ = self.shell.update(cx, |shell, cx| {
+            if shell.background_idle() {
+                shell.controller.dispatch(AppAction::Sort(column));
+                cx.notify();
+            }
+        });
+    }
+
+    /// The header cell, named the way a header that sorts has to be named: the
+    /// kit draws the arrow, but only the shell knows to say which way it points.
+    ///
+    /// The whole cell sorts, not just the kit's little arrow: pressing the name
+    /// of a column is how a file list has sorted since before any of this.
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let Some(column) = self.columns.get(col_ix).copied() else {
+            return div().id("header-cell");
+        };
+        let s = self.strings;
+        let label = Columns::label(column, s);
+        let role = Role::ColumnHeader;
+        let accessible = if self.order.0 == column {
+            let direction = if self.order.1 {
+                s.ascending
+            } else {
+                s.descending
+            };
+            format!("{} {label} ({direction})", s.sort_by)
+        } else {
+            format!("{} {label}", s.sort_by)
+        };
+        div()
+            .id(("header-cell", col_ix))
+            .role(role)
+            .aria_column_index(col_ix + 1)
+            .aria_keyshortcuts("Enter")
+            .size_full()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .aria_label(accessible)
+            .on_click(cx.listener(move |table, _, window, cx| {
+                table
+                    .delegate_mut()
+                    .perform_sort(col_ix, ColumnSort::Default, window, cx);
+            }))
+            .child(label)
+    }
+
+    fn render_td(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let cell = || div().id(("file-cell", row_ix * 16 + col_ix));
+        let Some(row) = self.rows.get(row_ix) else {
+            return cell();
+        };
+        let Some(column) = self.columns.get(col_ix).copied() else {
+            return cell();
+        };
+        let muted = self.muted.get(row_ix).copied().unwrap_or(false);
+        let ink = if muted {
+            cx.theme().muted_foreground
+        } else {
+            cx.theme().foreground
+        };
+        if column != SortColumn::Name {
+            return cell()
+                .role(Role::Cell)
+                .aria_column_index(col_ix + 1)
+                .text_sm()
+                .text_color(ink)
+                .child(column_text(row, column, self.strings));
+        }
+        // Renaming happens here rather than in a dialog, so the name being
+        // typed stays where the name is.
+        if self.renaming == Some(row_ix) {
+            return cell().child(Input::new(&self.rename_input));
+        }
+        cell()
+            .role(Role::Cell)
+            .aria_column_index(1)
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_sm()
+            .text_color(ink)
+            .child(
+                // The type mark is the one place a folder is allowed to
+                // out-shout a file, and in a monochrome window that is done
+                // with weight, not hue.
+                div()
+                    .w(px(18.))
+                    .flex_none()
+                    .text_color(if row.is_dir {
+                        ink
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .child(GpuiShell::kind_mark(row.kind)),
+            )
+            .child(div().flex_1().truncate().child(row.label.clone()))
+    }
+
+    fn render_tr(
+        &mut self,
+        row_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> Stateful<gpui::Div> {
+        let checked = self.row_is_checked(row_ix);
+        // The banding is drawn here rather than by the kit, which stripes the
+        // whole pane: rows that do not exist should not be drawn as rows.
+        let mut item = div().id(("file-row", row_ix)).bg(if checked {
+            cx.theme().table_active
+        } else if row_ix % 2 == 1 {
+            cx.theme().table_even
+        } else {
+            cx.theme().table
+        });
+        if self.cursor == Some(row_ix) {
+            item = item.border_1().border_color(cx.theme().table_active_border);
+        }
+        let Some(row) = self.rows.get(row_ix).cloned() else {
+            return item;
+        };
+        // Whether the row is marked is half of what this list is about, so it
+        // is said out loud rather than left to the colour of the background.
+        let s = self.strings;
+        let mut description = format!("{} {}", s.col_name, row.label);
+        for column in self.columns.iter().copied().skip(1) {
+            let label = Columns::label(column, s);
+            description.push_str(&format!("; {label} {}", column_text(&row, column, s)));
+        }
+        description.push_str("; ");
+        description.push_str(if checked { s.checked } else { s.not_checked });
+        item = item
+            .aria_label(description)
+            .role(Role::Row)
+            // The header is row one, so the rows below it start at two.
+            .aria_row_index(row_ix + 2);
+        if self.idle {
+            item = item.focusable();
+            if self.cursor == Some(row_ix) {
+                item = item.aria_active_descendant();
+            }
+        }
+        // One row at a time is the kit's idea of a click; control, shift and a
+        // plain click each mean something different to a file list, and that
+        // stays the shell's to decide.
+        if self.idle {
+            let shell = self.shell.clone();
+            item = item.on_click(move |event: &ClickEvent, window, cx| {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.select_row(row_ix, event, window, cx);
+                });
+            });
+        }
+        // A folder takes what is dropped on it and the entries move there,
+        // which is a rewrite of the archive and not a copy out of it. Dropping
+        // a folder into itself is not a move, so it is refused.
+        if row.is_dir && self.idle {
+            let target = row.path.clone();
+            let shell = self.shell.clone();
+            item = item.on_drop(move |_: &DraggedRows, _, cx| {
+                let _ = shell.update(cx, |shell, cx| {
+                    let carried = shell.controller.selected_roots();
+                    let into_itself = carried.iter().any(|carried| {
+                        carried.trim_end_matches('/') == target.trim_end_matches('/')
+                    });
+                    if !carried.is_empty() && !into_itself {
+                        shell.controller.move_into(&carried, &target);
+                    }
+                    cx.notify();
+                });
+            });
+        }
+        // GPUI owns the threshold and the gesture's lifetime. Where the drag is
+        // going is not decided here: a folder of this archive takes it as a
+        // move, and leaving the list hands it to arca-drag's lazy IDataObject,
+        // so no archive bytes are extracted merely to begin a drag.
+        if checked && self.idle {
+            let shell = self.shell.clone();
+            item = item.on_drag(DraggedRows, move |_, _, _, app| {
+                let _ = shell.update(app, |shell, _| shell.carrying = true);
+                app.new(|_| gpui::Empty)
+            });
+        }
+        item
+    }
+
+    fn context_menu(
+        &mut self,
+        row_ix: usize,
+        menu: PopupMenu,
+        _: &mut Window,
+        _: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        let is_file = self.rows.get(row_ix).is_some_and(|row| row.entry.is_some());
+        let writable = self.writable;
+        let strings = self.strings;
+        let shell = self.shell.clone();
+        let mut menu = menu;
+        let mut drawn = false;
+        for action in RowAction::ALL.into_iter().filter(|action| {
+            action.offered()
+                && (*action != RowAction::Rename || writable)
+                && (*action != RowAction::View || is_file)
+        }) {
+            // Never as the first thing in the menu: a rule with nothing above
+            // it is a line, not a grouping.
+            if action.starts_group() && drawn {
+                menu = menu.item(PopupMenuItem::separator());
+            }
+            drawn = true;
+            let (label, keys) = action.label(strings);
+            let shell = shell.clone();
+            menu = menu.item(
+                PopupMenuItem::element(move |_, cx| {
+                    // Two children rather than one string with a tab in it:
+                    // GPUI lays out text and a tab is nothing at all there.
+                    let mut row = div().flex().w_full().gap_4().items_center();
+                    row = row.child(div().flex_1().truncate().child(label));
+                    if !keys.is_empty() {
+                        row = row.child(
+                            div()
+                                .flex_none()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(keys),
+                        );
+                    }
+                    row
+                })
+                .on_click(move |_, window, cx| {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.row_action(action, row_ix, window, cx);
+                    });
+                }),
+            );
+        }
+        menu
+    }
+
+    fn cell_text(&self, row_ix: usize, col_ix: usize, _: &App) -> String {
+        match (self.rows.get(row_ix), self.columns.get(col_ix).copied()) {
+            (Some(row), Some(column)) => column_text(row, column, self.strings),
+            _ => String::new(),
+        }
+    }
+}
 
 /// What a key press means to the window, as opposed to the list.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
