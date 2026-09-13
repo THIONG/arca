@@ -31,7 +31,6 @@ use gpui_component::separator::Separator;
 use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_component::status_bar::StatusBar;
 use gpui_component::switch::Switch;
-use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Icon, IconName};
 use gpui_component::{Disableable, Root, Selectable, TitleBar, WindowExt, TITLE_BAR_HEIGHT};
 use gpui_platform::application;
@@ -101,11 +100,6 @@ struct GpuiShell {
     breadcrumbs_open: bool,
     overflow_trigger_focus: FocusHandle,
     breadcrumbs_trigger_focus: FocusHandle,
-    open_trigger_focus: FocusHandle,
-    compress_trigger_focus: FocusHandle,
-    extract_all_trigger_focus: FocusHandle,
-    extract_selected_trigger_focus: FocusHandle,
-    password_trigger_focus: FocusHandle,
     delete_trigger_focus: FocusHandle,
     drop_trigger_focus: FocusHandle,
     conflict_trigger_focus: FocusHandle,
@@ -113,7 +107,10 @@ struct GpuiShell {
     breadcrumbs_menu_focus: FocusHandle,
     overflow_item_focus: Vec<FocusHandle>,
     breadcrumbs_item_focus: Vec<FocusHandle>,
-    dialog_return_focus: FocusHandle,
+    /// Where the keyboard goes when a dialog closes, when somebody asked for
+    /// it. None means leave it alone: a kit button holds its own focus and
+    /// still has it when a native file dialog closes on top of it.
+    dialog_return_focus: Option<FocusHandle>,
     modal_seen: Option<ModalKind>,
     dialog_primary_focus: FocusHandle,
     dialog_cancel_focus: FocusHandle,
@@ -435,11 +432,6 @@ impl GpuiShell {
             breadcrumbs_open: false,
             overflow_trigger_focus: cx.focus_handle(),
             breadcrumbs_trigger_focus: cx.focus_handle(),
-            open_trigger_focus: cx.focus_handle().tab_stop(true),
-            compress_trigger_focus: cx.focus_handle().tab_stop(true),
-            extract_all_trigger_focus: cx.focus_handle().tab_stop(true),
-            extract_selected_trigger_focus: cx.focus_handle().tab_stop(true),
-            password_trigger_focus: cx.focus_handle().tab_stop(true),
             delete_trigger_focus: cx.focus_handle(),
             drop_trigger_focus: cx.focus_handle(),
             conflict_trigger_focus: cx.focus_handle(),
@@ -452,7 +444,7 @@ impl GpuiShell {
                 .map(|_| cx.focus_handle().tab_stop(true))
                 .collect(),
             breadcrumbs_item_focus: Vec::new(),
-            dialog_return_focus: cx.focus_handle(),
+            dialog_return_focus: None,
             modal_seen: None,
             dialog_primary_focus: cx.focus_handle().tab_stop(true),
             dialog_cancel_focus: cx.focus_handle().tab_stop(true),
@@ -644,8 +636,9 @@ impl GpuiShell {
             }
             _ => {}
         }
-        let return_focus = self.dialog_return_focus.clone();
-        window.on_next_frame(move |window, cx| window.focus(&return_focus, cx));
+        if let Some(return_focus) = self.dialog_return_focus.take() {
+            window.on_next_frame(move |window, cx| window.focus(&return_focus, cx));
+        }
         cx.notify();
     }
 
@@ -766,18 +759,59 @@ impl GpuiShell {
         cx.notify();
     }
 
+    /// A word that can be pressed.
+    ///
+    /// Ghost rather than outlined: a row of outlined boxes reads as seven
+    /// competing things, and the same row without outlines reads as one
+    /// toolbar. The kit's own hover and disabled treatment says the rest.
     fn button(
+        id: impl Into<ElementId>,
+        label: impl Into<gpui::SharedString>,
+        accessible_name: String,
+        enabled: bool,
+    ) -> Button {
+        Button::new(id)
+            .label(label)
+            .accessibility_label(accessible_name)
+            .ghost()
+            .compact()
+            .text_xs()
+            .disabled(!enabled)
+    }
+
+    /// A square button carrying one of the kit's icons instead of a word.
+    ///
+    /// Only for the controls whose meaning is a direction -- back, forward, up.
+    /// A named action stays a word, because an icon that needs a tooltip to be
+    /// understood has cost a word and bought nothing. The accessible name is
+    /// still the word, so nothing changes for a screen reader.
+    fn icon_button(
+        id: impl Into<ElementId>,
+        icon: IconName,
+        accessible_name: String,
+        enabled: bool,
+    ) -> Button {
+        Button::new(id)
+            .icon(Icon::new(icon).size_4())
+            .accessibility_label(accessible_name.clone())
+            .tooltip(accessible_name)
+            .ghost()
+            .compact()
+            .disabled(!enabled)
+    }
+
+    /// The hand-drawn row behind the menus, until the menus themselves move to
+    /// the kit and take it with them.
+    ///
+    /// It cannot be a kit button yet: a menu keeps the arrow keys working by
+    /// tracking a focus handle per row, and a kit button owns its own.
+    fn menu_row(
         id: impl Into<ElementId>,
         label: impl Into<gpui::SharedString>,
         accessible_name: String,
         enabled: bool,
         cx: &App,
     ) -> Stateful<gpui::Div> {
-        // Borderless, with the ground only appearing under the pointer. A row
-        // of outlined boxes reads as seven competing things; the same row
-        // without outlines reads as one toolbar, and the hover tint says which
-        // one you are about to press. Disabled loses the ink, not the space,
-        // so nothing shifts when an action becomes available.
         let mut button = div()
             .id(id)
             .aria_label(accessible_name)
@@ -803,49 +837,6 @@ impl GpuiShell {
             button = button
                 .tab_stop(false)
                 .text_color(cx.theme().muted_foreground);
-        }
-        button
-    }
-
-    /// A square button carrying one of the kit's icons instead of a word.
-    ///
-    /// Only for the controls whose meaning is a direction — back, forward, up.
-    /// A named action stays a word, because an icon that needs a tooltip to be
-    /// understood has cost a word and bought nothing. The accessible name is
-    /// still the word, so nothing changes for a screen reader.
-    fn icon_button(
-        id: impl Into<ElementId>,
-        icon: IconName,
-        accessible_name: String,
-        enabled: bool,
-        cx: &App,
-    ) -> Stateful<gpui::Div> {
-        let tooltip = accessible_name.clone();
-        let mut button = div()
-            .id(id)
-            .aria_label(accessible_name)
-            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-            .size(px(26.))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(cx.theme().radius)
-            .focus_visible(focus_ring(cx))
-            .child(Icon::new(icon).size_4().text_color(if enabled {
-                cx.theme().foreground
-            } else {
-                cx.theme().muted_foreground
-            }));
-        if enabled {
-            button = button
-                .role(Role::Button)
-                .focusable()
-                .tab_stop(true)
-                .cursor_pointer()
-                .hover(|style| style.bg(cx.theme().accent));
-        } else {
-            button = button.tab_stop(false);
         }
         button
     }
@@ -882,7 +873,7 @@ impl GpuiShell {
         // menu: it takes the whole popover so the hover tint reaches both edges.
         // The label goes in as a child of its own so it can take the room the
         // keys do not.
-        let mut item = Self::button(id, "", accessible_name, enabled, cx)
+        let mut item = Self::menu_row(id, "", accessible_name, enabled, cx)
             .w_full()
             .gap_4()
             .justify_start()
@@ -1050,13 +1041,13 @@ impl GpuiShell {
             && !self.breadcrumbs_open
         {
             if let Some(focus) = window.focused(cx) {
-                self.dialog_return_focus = focus;
+                self.dialog_return_focus = Some(focus);
             }
         }
     }
 
     fn remember_conflict_focus(&mut self) {
-        self.dialog_return_focus = self.conflict_trigger_focus.clone();
+        self.dialog_return_focus = Some(self.conflict_trigger_focus.clone());
     }
 
     fn sync_modal_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1087,7 +1078,10 @@ impl GpuiShell {
             Some(ModalKind::DefaultPassword) => self.password.read(cx).focus_handle.clone(),
             Some(ModalKind::Settings) => self.settings_focus[0].clone(),
             Some(ModalKind::Shortcuts) => self.dialog_cancel_focus.clone(),
-            None => self.dialog_return_focus.clone(),
+            None => match self.dialog_return_focus.clone() {
+                Some(focus) => focus,
+                None => return,
+            },
         };
         window.on_next_frame(move |window, cx| window.focus(&target, cx));
     }
@@ -1382,7 +1376,7 @@ impl GpuiShell {
         let Some(first) = self.controller.state.pending_inputs.first() else {
             return;
         };
-        self.dialog_return_focus = self.add_start_focus.clone();
+        self.dialog_return_focus = Some(self.add_start_focus.clone());
         let dir = first.parent().map(PathBuf::from).unwrap_or_default();
         let name = {
             let name = self.controller.state.output_name.trim();
@@ -1458,7 +1452,7 @@ impl GpuiShell {
                 }
             }
             RowAction::Delete => {
-                self.dialog_return_focus = self.delete_trigger_focus.clone();
+                self.dialog_return_focus = Some(self.delete_trigger_focus.clone());
                 self.controller.dispatch(AppAction::RequestDelete);
             }
             RowAction::Copy => self.dispatch_clipboard(false, window, cx),
@@ -2549,7 +2543,7 @@ impl GpuiShell {
         let modifiers = event.keystroke.modifiers;
         let key = event.keystroke.key.to_ascii_lowercase();
         if key == "delete" {
-            self.dialog_return_focus = self.delete_trigger_focus.clone();
+            self.dialog_return_focus = Some(self.delete_trigger_focus.clone());
             window.focus(&self.delete_trigger_focus, cx);
             self.controller.dispatch(AppAction::RequestDelete);
             cx.stop_propagation();
@@ -2871,15 +2865,10 @@ impl Render for GpuiShell {
             IconName::FolderOpen,
             format!("{} (Ctrl+O)", s.open),
             idle,
-            cx,
-        )
-        .aria_keyshortcuts("Control+O")
-        .track_focus(&self.open_trigger_focus);
-        toolbar = toolbar.child(open.on_click(cx.listener(|this, _, window, cx| {
+        );
+        toolbar = toolbar.child(open.on_click(cx.listener(|this, _, _, cx| {
             if this.background_idle() {
-                this.dialog_return_focus = this.open_trigger_focus.clone();
                 this.begin_dialog(DialogKind::Open, cx);
-                window.focus(&this.open_trigger_focus, cx);
             }
         })));
         let compress = Self::icon_button(
@@ -2887,15 +2876,10 @@ impl Render for GpuiShell {
             IconName::Inbox,
             format!("{} (Ctrl+N)", s.compress),
             idle,
-            cx,
-        )
-        .aria_keyshortcuts("Control+N")
-        .track_focus(&self.compress_trigger_focus);
-        toolbar = toolbar.child(compress.on_click(cx.listener(|this, _, window, cx| {
+        );
+        toolbar = toolbar.child(compress.on_click(cx.listener(|this, _, _, cx| {
             if this.background_idle() {
-                this.dialog_return_focus = this.compress_trigger_focus.clone();
                 this.begin_dialog(DialogKind::Compress, cx);
-                window.focus(&this.compress_trigger_focus, cx);
             }
         })));
         toolbar = toolbar.child(div().px_1().child(Separator::vertical().h(px(16.))));
@@ -2905,16 +2889,11 @@ impl Render for GpuiShell {
             IconName::PanelBottomOpen,
             format!("{} (Ctrl+E)", s.extract_all),
             can_extract,
-            cx,
-        )
-        .aria_keyshortcuts("Control+E")
-        .track_focus(&self.extract_all_trigger_focus);
-        toolbar = toolbar.child(extract_all.on_click(cx.listener(|this, _, window, cx| {
+        );
+        toolbar = toolbar.child(extract_all.on_click(cx.listener(|this, _, _, cx| {
             if !this.background_idle() {
                 return;
             }
-            this.dialog_return_focus = this.extract_all_trigger_focus.clone();
-            window.focus(&this.extract_all_trigger_focus, cx);
             this.begin_dialog(
                 DialogKind::Extract {
                     only_checked: false,
@@ -2927,31 +2906,21 @@ impl Render for GpuiShell {
             IconName::File,
             s.extract_selected.to_string(),
             can_extract_selected,
-            cx,
-        )
-        .track_focus(&self.extract_selected_trigger_focus);
-        toolbar = toolbar.child(
-            extract_selected.on_click(cx.listener(|this, _, window, cx| {
-                if !this.background_idle() {
-                    return;
-                }
-                this.dialog_return_focus = this.extract_selected_trigger_focus.clone();
-                window.focus(&this.extract_selected_trigger_focus, cx);
-                this.begin_dialog(DialogKind::Extract { only_checked: true }, cx);
-            })),
         );
+        toolbar = toolbar.child(extract_selected.on_click(cx.listener(|this, _, _, cx| {
+            if !this.background_idle() {
+                return;
+            }
+            this.begin_dialog(DialogKind::Extract { only_checked: true }, cx);
+        })));
         let password = Self::icon_button(
             "password",
             IconName::EyeOff,
             format!("{} / {}", s.set_password, s.remove_password),
             password_available,
-            cx,
-        )
-        .track_focus(&self.password_trigger_focus);
-        toolbar = toolbar.child(password.on_click(cx.listener(|this, _, window, cx| {
+        );
+        toolbar = toolbar.child(password.on_click(cx.listener(|this, _, _, cx| {
             if this.background_idle() {
-                this.dialog_return_focus = this.password_trigger_focus.clone();
-                window.focus(&this.password_trigger_focus, cx);
                 this.controller.dispatch(AppAction::BeginPasswordChange);
                 cx.notify();
             }
@@ -3292,7 +3261,6 @@ impl Render for GpuiShell {
             IconName::ArrowLeft,
             s.back.to_string(),
             idle && self.controller.can_go_back(),
-            cx,
         );
         nav = nav.child(back.on_click(cx.listener(|this, _, _, cx| {
             if this.background_idle() && this.controller.can_go_back() {
@@ -3305,7 +3273,6 @@ impl Render for GpuiShell {
             IconName::ArrowRight,
             s.forward.to_string(),
             idle && self.controller.can_go_forward(),
-            cx,
         );
         nav = nav.child(forward.on_click(cx.listener(|this, _, _, cx| {
             if this.background_idle() && this.controller.can_go_forward() {
@@ -3313,13 +3280,7 @@ impl Render for GpuiShell {
                 this.route_changed(cx);
             }
         })));
-        let up = Self::icon_button(
-            "up",
-            IconName::ArrowUp,
-            s.up.to_string(),
-            idle && !at_root,
-            cx,
-        );
+        let up = Self::icon_button("up", IconName::ArrowUp, s.up.to_string(), idle && !at_root);
         nav = nav.child(up.on_click(cx.listener(|this, _, _, cx| {
             if this.background_idle() && !this.controller.state.current_dir.is_empty() {
                 let parent = parent_of(&this.controller.state.current_dir);
@@ -3337,9 +3298,12 @@ impl Render for GpuiShell {
                 nav = nav.child(div().text_color(cx.theme().muted_foreground).child("/"));
             }
             if position == 1 && !hidden.is_empty() {
-                let more = Self::button("crumb-more", "…", s.hidden_folders.to_string(), idle, cx)
-                    .track_focus(&self.breadcrumbs_trigger_focus)
-                    .aria_expanded(self.breadcrumbs_open);
+                // Still hand-drawn: it owns the menu below it, and that menu
+                // hands the focus back to this handle when it closes.
+                let more =
+                    Self::menu_row("crumb-more", "…", s.hidden_folders.to_string(), idle, cx)
+                        .track_focus(&self.breadcrumbs_trigger_focus)
+                        .aria_expanded(self.breadcrumbs_open);
                 nav = nav.child(more.on_click(cx.listener(|this, _, window, cx| {
                     if !this.background_idle() {
                         return;
@@ -3365,7 +3329,6 @@ impl Render for GpuiShell {
                     name,
                     fill(s.open_folder, &[("name", name)]),
                     idle,
-                    cx,
                 );
                 nav = nav.child(crumb.on_click(cx.listener(move |this, _, _, cx| {
                     if !this.background_idle() {
@@ -3553,7 +3516,7 @@ impl Render for GpuiShell {
                                     // will move into confirmation and return
                                     // here when it is answered.
                                     if let Some(focus) = current_focus {
-                                        shell.dialog_return_focus = focus;
+                                        shell.dialog_return_focus = Some(focus);
                                     }
                                     shell.controller.dispatch(AppAction::Drop(paths));
                                     cx.notify();
@@ -3775,7 +3738,6 @@ impl Render for GpuiShell {
                 if held { s.resume_word } else { s.pause_word },
                 if held { s.resume_word } else { s.pause_word }.to_string(),
                 !self.background_blocked() && !asked,
-                cx,
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 if !this.background_blocked() {
@@ -3788,7 +3750,6 @@ impl Render for GpuiShell {
                 s.cancel,
                 format!("{} · {}", s.cancel, s.progress_region),
                 !self.background_blocked() && !asked,
-                cx,
             )
             .on_click(cx.listener(|this, _, _, cx| {
                 if !this.background_blocked() {

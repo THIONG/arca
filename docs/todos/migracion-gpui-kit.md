@@ -34,6 +34,7 @@ ya trae. El recuento de partida en `gpui_shell/mod.rs` (6067 líneas) era de 95
 | Controles del panel de ajustes | `switch`, `radio`, `select`, `setting` |
 | `uniform_list` del visor | `list` y `virtual_list` |
 | Campo de renombrado en la fila | `Input` (hecho) |
+| `button` e `icon_button` | `Button` (hecho) |
 | Árbol de carpetas sobre `SidebarMenuItem` | `tree` |
 
 ## Decisiones tomadas
@@ -95,8 +96,14 @@ modo que el árbol queda utilizable después de cada fase.
    `modal_enter`, `modal_focus_targets`, once manejadores de foco y la cadena
    `close`, que ya no tiene botón que la use. Renombrar dejó de ser un diálogo
    y se edita en la propia fila, así que `ModalKind::Rename` ya no existe.
-3. Botones: `button`, `icon_button`, `dialog_button` y `menu_item`.
-4. Menú contextual de fila.
+3. **Hecha.** `button` e `icon_button` devuelven el `Button` del kit, y con
+   ellos migran la barra, las flechas de navegación, las migas y los botones de
+   la barra de progreso. `menu_item` se quedó dibujado a mano a propósito, bajo
+   el nombre `menu_row`: un menú mantiene vivas las flechas guardando un manejo
+   de foco por fila y el botón del kit se guarda el suyo, así que migrarlo
+   ahora sería hacerlo dos veces. Por lo mismo se queda el botón `…` de las
+   migas, que sostiene su propio menú.
+4. Menú contextual de fila, y con él `menu_row` y el botón de las migas.
 5. Tabla de ficheros, con sus gestos reconstruidos.
 6. Migas de pan, progreso, atajos, controles de ajustes y campos de texto.
 7. Retirar `gpui_shell/input.rs` y el resto de andamiaje que quede sin uso.
@@ -116,8 +123,9 @@ estado y el ZIP con cero entradas en disco.
 
 ## Avisos para quien automatice la interfaz
 
-- Ni la acción `press` de accesibilidad ni un clic sintético activan los botones
-  del kit. Hay que validar con el teclado.
+- Ni la acción `press` de accesibilidad ni un clic sintético por referencia
+  activan los botones del kit. Con el teclado sí, y con un clic por coordenadas
+  también.
 - Borrar trabaja sobre las filas marcadas, no sobre la fila enfocada: hace falta
   `Ctrl+A` antes de `Supr`.
 - Las teclas de función solo llegan con el foco dentro de la lista, y el arnés
