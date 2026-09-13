@@ -33,6 +33,7 @@ ya trae. El recuento de partida en `gpui_shell/mod.rs` (6067 líneas) era de 95
 | Atajos como texto plano | `kbd` |
 | Controles del panel de ajustes | `switch`, `radio`, `select`, `setting` |
 | `uniform_list` del visor | `list` y `virtual_list` |
+| Campo de renombrado en la fila | `Input` (hecho) |
 | Árbol de carpetas sobre `SidebarMenuItem` | `tree` |
 
 ## Decisiones tomadas
@@ -68,6 +69,16 @@ La tercera es la que sostiene el cierre estándar del kit: descartar un diálogo
 cancela la operación de verdad en lugar de dejar al worker esperando una
 respuesta que no llega.
 
+## El tema se pinta dos veces
+
+`Theme` lleva la paleta por duplicado: los colores planos en `theme.colors`, que
+es lo que lee el shell, y la copia resuelta en `theme.tokens`, que es lo que
+leen los componentes del kit. `gpui_theme::paint` solo escribía la primera, así
+que un diálogo del kit salía negro sobre negro con el botón primario blanco
+mientras la ventana alrededor era gris. Al final de `paint` los tokens se
+regeneran desde la paleta recién pintada; cualquier color nuevo tiene que
+quedar por encima de esa línea.
+
 ## Cómo se reconcilian los dos modelos
 
 El shell deriva su modal del estado del controlador y el kit mantiene una pila
@@ -79,10 +90,11 @@ modo que el árbol queda utilizable después de cada fase.
 ## Fases
 
 1. **Hecha.** `Root` como vista raíz y capas del kit en `Frame`.
-2. **Hecha.** Los doce diálogos salen del kit. Con ellos se fueron
+2. **Hecha.** Los diálogos salen del kit. Con ellos se fueron
    `dialog_overlay`, `dialog_button`, `dialogs`, `modal_key_down`,
    `modal_enter`, `modal_focus_targets`, once manejadores de foco y la cadena
-   `close`, que ya no tiene botón que la use.
+   `close`, que ya no tiene botón que la use. Renombrar dejó de ser un diálogo
+   y se edita en la propia fila, así que `ModalKind::Rename` ya no existe.
 3. Botones: `button`, `icon_button`, `dialog_button` y `menu_item`.
 4. Menú contextual de fila.
 5. Tabla de ficheros, con sus gestos reconstruidos.

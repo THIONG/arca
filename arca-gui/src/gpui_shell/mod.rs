@@ -81,6 +81,10 @@ actions!(
 struct GpuiShell {
     controller: AppController,
     filter: Entity<InputState>,
+    /// The field that replaces a row's name while it is being renamed. Renaming
+    /// happens in the row, the way every file manager does it, so there is no
+    /// dialog for it.
+    rename_input: Entity<InputState>,
     password: Entity<FilterInput>,
     output_name: Entity<FilterInput>,
     add_password: Entity<FilterInput>,
@@ -281,7 +285,6 @@ enum ModalKind {
     Add,
     Viewer,
     NewFolder,
-    Rename,
     Mask,
     DefaultPassword,
     Settings,
@@ -303,6 +306,18 @@ impl GpuiShell {
                     .controller
                     .dispatch(AppAction::SetFilter(state.read(cx).value().to_string()));
                 cx.notify();
+            }
+        })
+        .detach();
+        let rename_input = cx.new(|cx| InputState::new(window, cx).context_menu(false));
+        cx.subscribe_in(&rename_input, window, |shell, _, event, window, cx| {
+            match event {
+                InputEvent::PressEnter { .. } => shell.commit_rename(window, cx),
+                // Clicking away is how a file manager abandons a rename. It
+                // cancels rather than commits: a name changed by accident in an
+                // archive costs a full rewrite to undo.
+                InputEvent::Blur => shell.cancel_rename(cx),
+                _ => {}
             }
         })
         .detach();
@@ -406,6 +421,7 @@ impl GpuiShell {
         Self {
             controller,
             filter,
+            rename_input,
             password,
             output_name,
             add_password,
@@ -900,7 +916,7 @@ impl GpuiShell {
                 .dispatch(AppAction::AnswerDrop(DropChoice::Cancel)),
             ModalKind::Add => self.controller.state.view = View::Browse,
             ModalKind::Viewer => self.controller.state.viewing = None,
-            ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask => self.close_name(),
+            ModalKind::NewFolder | ModalKind::Mask => self.close_name(),
             ModalKind::DefaultPassword => {
                 self.controller.state.asking_default_password = false;
                 self.controller.state.password_input.clear();
@@ -923,7 +939,6 @@ impl GpuiShell {
                 | ModalKind::Password
                 | ModalKind::DefaultPassword
                 | ModalKind::NewFolder
-                | ModalKind::Rename
                 | ModalKind::Mask
                 | ModalKind::Settings
                 | ModalKind::Viewer
@@ -940,7 +955,7 @@ impl GpuiShell {
             ModalKind::Password | ModalKind::DefaultPassword => {
                 Some(self.password.read(cx).focus_handle.clone())
             }
-            ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask => {
+            ModalKind::NewFolder | ModalKind::Mask => {
                 Some(self.name_input.read(cx).focus_handle.clone())
             }
             _ => None,
@@ -997,8 +1012,6 @@ impl GpuiShell {
             Some(ModalKind::Viewer)
         } else if self.controller.state.asking_folder {
             Some(ModalKind::NewFolder)
-        } else if self.controller.state.renaming.is_some() {
-            Some(ModalKind::Rename)
         } else if self.controller.state.picking_group.is_some() {
             Some(ModalKind::Mask)
         } else if self.controller.state.asking_default_password {
@@ -1068,7 +1081,7 @@ impl GpuiShell {
             }
             Some(ModalKind::Add) => self.output_name.read(cx).focus_handle.clone(),
             Some(ModalKind::Viewer) => self.viewer_focus[0].clone(),
-            Some(ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask) => {
+            Some(ModalKind::NewFolder | ModalKind::Mask) => {
                 self.name_input.read(cx).focus_handle.clone()
             }
             Some(ModalKind::DefaultPassword) => self.password.read(cx).focus_handle.clone(),
@@ -1216,6 +1229,45 @@ impl GpuiShell {
         self.name_value.clear();
     }
 
+    /// Start renaming a row in place.
+    ///
+    /// One entry point for the shortcut and the row menu, so the field can
+    /// never be shown without the state that says which row it belongs to.
+    fn begin_rename(&mut self, row: &super::Row, window: &mut Window, cx: &mut Context<Self>) {
+        if self.controller.state.format != super::Format::Zip {
+            return;
+        }
+        let label = row.label.clone();
+        self.controller.state.renaming = Some((row.path.clone(), label.clone()));
+        self.rename_input.update(cx, |state, cx| {
+            state.set_value(label, window, cx);
+        });
+        let field = self.rename_input.read(cx).focus_handle(cx);
+        window.focus(&field, cx);
+        cx.notify();
+    }
+
+    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, _)) = self.controller.state.renaming.clone() else {
+            return;
+        };
+        let name = self.rename_input.read(cx).value().trim().to_string();
+        let rows = self.controller.visible_rows();
+        self.controller.state.renaming = None;
+        // Back to the list, or the keyboard would be left on a field that is
+        // no longer drawn.
+        let list = self.list_focus.clone();
+        window.focus(&list, cx);
+        self.controller.rename_to(&rows, &path, &name);
+        cx.notify();
+    }
+
+    fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        if self.controller.state.renaming.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// Acts on what the shared text field holds, according to which dialog
     /// asked for it.
     fn confirm_name(&mut self, kind: ModalKind, cx: &mut Context<Self>) {
@@ -1253,15 +1305,6 @@ impl GpuiShell {
                     name: full,
                     password: self.controller.state.archive_password.clone(),
                 }));
-            }
-            ModalKind::Rename => {
-                let Some((path, _)) = self.controller.state.renaming.clone() else {
-                    self.close_name();
-                    return;
-                };
-                let rows = self.controller.visible_rows();
-                self.close_name();
-                self.controller.rename_to(&rows, &path, name.trim());
             }
             ModalKind::Mask => {
                 // WinRAR's keypad plus and minus: a mask picks or drops every
@@ -1411,10 +1454,7 @@ impl GpuiShell {
             // left out rather than offered and refused.
             RowAction::Rename => {
                 if let Some(row) = row {
-                    if self.controller.state.format == super::Format::Zip {
-                        self.name_value = row.label.clone();
-                        self.controller.state.renaming = Some((row.path, row.label));
-                    }
+                    self.begin_rename(&row, window, cx);
                 }
             }
             RowAction::Delete => {
@@ -1715,6 +1755,11 @@ impl GpuiShell {
     /// aside while one has the focus.
     fn typing(&self, window: &Window, cx: &App) -> bool {
         self.filter.read(cx).focus_handle(cx).is_focused(window)
+            || self
+                .rename_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
             || [&self.password, &self.output_name, &self.add_password]
                 .iter()
                 .any(|input| input.read(cx).focus_handle.is_focused(window))
@@ -1812,13 +1857,9 @@ impl GpuiShell {
             Shortcut::Rename if archive.is_some() => {
                 let cursor = self.controller.state.cursor;
                 let rows = self.controller.visible_rows();
-                match cursor.and_then(|index| rows.get(index)) {
-                    Some(row) if self.controller.state.format == super::Format::Zip => {
-                        self.name_value = row.label.clone();
-                        self.controller.state.renaming =
-                            Some((row.path.clone(), row.label.clone()));
-                    }
-                    _ => return,
+                match cursor.and_then(|index| rows.get(index)).cloned() {
+                    Some(row) => self.begin_rename(&row, window, cx),
+                    None => return,
                 }
             }
             Shortcut::PickGroup(adding) if archive.is_some() => {
@@ -2285,7 +2326,37 @@ impl GpuiShell {
                     })
                     .child(Self::kind_mark(row.kind)),
             )
-            .child(div().flex_1().truncate().child(row.label.clone()));
+            .child(
+                // Renaming happens here rather than in a dialog, so the name
+                // being typed stays where the name is.
+                if self
+                    .controller
+                    .state
+                    .renaming
+                    .as_ref()
+                    .is_some_and(|(path, _)| *path == row.path)
+                {
+                    div()
+                        .flex_1()
+                        .id(("rename-field", index))
+                        // Escape has to be caught here: the field keeps the
+                        // keystroke to itself, so the list never sees it.
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                            if event.keystroke.key == "escape" {
+                                this.cancel_rename(cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .child(Input::new(&self.rename_input))
+                        .into_any_element()
+                } else {
+                    div()
+                        .flex_1()
+                        .truncate()
+                        .child(row.label.clone())
+                        .into_any_element()
+                },
+            );
         if accessible {
             name = name.role(Role::Cell).aria_column_index(1);
         }
@@ -2734,7 +2805,6 @@ impl Render for GpuiShell {
         });
         // The shared text field takes the name of whichever dialog is asking.
         let name_label = match modal {
-            Some(ModalKind::Rename) => s.rename_word,
             Some(ModalKind::Mask) => s.mask_hint,
             _ => s.folder_name,
         };
@@ -2742,10 +2812,7 @@ impl Render for GpuiShell {
         self.name_input.update(cx, |input, _| {
             input.strings = s;
             input.label = name_label;
-            input.enabled = matches!(
-                modal,
-                Some(ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask)
-            );
+            input.enabled = matches!(modal, Some(ModalKind::NewFolder | ModalKind::Mask));
             if input.content != name_value {
                 input.sync_from_state(&name_value);
             }
@@ -5125,10 +5192,9 @@ fn build_dialog(
                         .child(subfolder),
                 )
         }
-        ModalKind::NewFolder | ModalKind::Rename | ModalKind::Mask => {
+        ModalKind::NewFolder | ModalKind::Mask => {
             let (title, hint, confirm) = match kind {
                 ModalKind::NewFolder => (s.new_folder, s.folder_name, s.new_folder),
-                ModalKind::Rename => (s.rename_word, s.rename_word, s.rename_word),
                 _ => {
                     let adding = shell
                         .read(cx)
