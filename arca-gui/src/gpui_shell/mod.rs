@@ -26,13 +26,13 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::dialog::{Dialog, DialogAction, DialogClose, DialogDescription, DialogFooter};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::separator::Separator;
 use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_component::status_bar::StatusBar;
 use gpui_component::switch::Switch;
 use gpui_component::{ActiveTheme, Icon, IconName};
-use gpui_component::{Disableable, Root, Selectable, TitleBar, WindowExt, TITLE_BAR_HEIGHT};
+use gpui_component::{Disableable, Root, Selectable, TitleBar, WindowExt};
 use gpui_platform::application;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -54,16 +54,9 @@ const COMPACT_SIZE: (f32, f32) = (560.0, 300.0);
 const NORMAL_SIZE: (f32, f32) = (1000.0, 660.0);
 const MINIMUM_SIZE: (f32, f32) = (720.0, 320.0);
 
-/// Where the recently opened archives start in `overflow_item_focus`, and how
-/// many of them the menu keeps room for. Ten is about as many as anybody scans
-/// before giving up and going to the folder instead.
-const RECENT_SLOT: usize = 12;
+/// How many recently opened archives the menu keeps room for. Ten is about as
+/// many as anybody scans before giving up and going to the folder instead.
 const RECENT_MAX: usize = 10;
-
-/// The offer of a newer Arca, which is only drawn when there is one. Parked
-/// past the columns rather than at the front, so that adding it does not move
-/// every other slot along.
-const RELEASE_SLOT: usize = RECENT_SLOT + RECENT_MAX + 4 + Columns::ALL.len();
 
 actions!(
     arca_gpui,
@@ -98,14 +91,11 @@ struct GpuiShell {
     open_modal: Option<ModalKind>,
     overflow_open: bool,
     breadcrumbs_open: bool,
-    overflow_trigger_focus: FocusHandle,
     breadcrumbs_trigger_focus: FocusHandle,
     delete_trigger_focus: FocusHandle,
     drop_trigger_focus: FocusHandle,
     conflict_trigger_focus: FocusHandle,
-    overflow_menu_focus: FocusHandle,
     breadcrumbs_menu_focus: FocusHandle,
-    overflow_item_focus: Vec<FocusHandle>,
     breadcrumbs_item_focus: Vec<FocusHandle>,
     /// Where the keyboard goes when a dialog closes, when somebody asked for
     /// it. None means leave it alone: a kit button holds its own focus and
@@ -145,9 +135,6 @@ struct GpuiShell {
     /// Kept as the state at the grab rather than as a running delta, so a
     /// dropped mouse-move event cannot make the column drift.
     resizing: Option<(usize, f32, f32)>,
-    row_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
-    row_menu_focus: FocusHandle,
-    row_menu_item_focus: Vec<FocusHandle>,
     /// What the shared `Name` field currently holds. The controller has no
     /// business knowing about a half-typed folder name, so it stays here until
     /// the dialog is answered.
@@ -430,19 +417,11 @@ impl GpuiShell {
             open_modal: None,
             overflow_open: false,
             breadcrumbs_open: false,
-            overflow_trigger_focus: cx.focus_handle(),
             breadcrumbs_trigger_focus: cx.focus_handle(),
             delete_trigger_focus: cx.focus_handle(),
             drop_trigger_focus: cx.focus_handle(),
             conflict_trigger_focus: cx.focus_handle(),
-            overflow_menu_focus: cx.focus_handle(),
             breadcrumbs_menu_focus: cx.focus_handle(),
-            // Test/select/invert/clear, copy/cut/paste, the five that change
-            // the archive, the recent list and its broom, flat view,
-            // shortcuts, settings, then the columns.
-            overflow_item_focus: (0..(RELEASE_SLOT + 1))
-                .map(|_| cx.focus_handle().tab_stop(true))
-                .collect(),
             breadcrumbs_item_focus: Vec::new(),
             dialog_return_focus: None,
             modal_seen: None,
@@ -459,12 +438,6 @@ impl GpuiShell {
             carrying: false,
             row_count: 0,
             resizing: None,
-            row_menu: None,
-            row_menu_focus: cx.focus_handle(),
-            row_menu_item_focus: RowAction::ALL
-                .iter()
-                .map(|_| cx.focus_handle().tab_stop(true))
-                .collect(),
             name_value: String::new(),
             viewer_focus: (0..3).map(|_| cx.focus_handle().tab_stop(true)).collect(),
             viewer_scroll: UniformListScrollHandle::new(),
@@ -679,52 +652,6 @@ impl GpuiShell {
         };
         items[next].focus(window, cx);
         cx.stop_propagation();
-    }
-
-    fn overflow_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if event.keystroke.key == "escape" {
-            self.overflow_open = false;
-            self.overflow_trigger_focus.focus(window, cx);
-            cx.stop_propagation();
-            cx.notify();
-        } else {
-            let mut items = Vec::new();
-            if self.controller.state.archive.is_some() && self.menu_enabled() {
-                items.extend(self.overflow_item_focus[..4].iter().cloned());
-                if self.can_copy_files() {
-                    items.push(self.overflow_item_focus[4].clone());
-                    items.push(self.overflow_item_focus[5].clone());
-                }
-            }
-            if self.can_paste_files() {
-                items.push(self.overflow_item_focus[6].clone());
-            }
-            if self.menu_enabled() {
-                items.extend(self.overflow_item_focus[7..RECENT_SLOT].iter().cloned());
-                // Only the recent slots that have an archive behind them: an
-                // empty slot is a stop on the way down that lands on nothing.
-                let recent = self.recent_shown();
-                items.extend(
-                    self.overflow_item_focus[RECENT_SLOT..RECENT_SLOT + recent]
-                        .iter()
-                        .cloned(),
-                );
-                items.extend(
-                    self.overflow_item_focus[RECENT_SLOT + RECENT_MAX..RELEASE_SLOT]
-                        .iter()
-                        .cloned(),
-                );
-                if self.controller.state.update.is_some() {
-                    items.push(self.overflow_item_focus[RELEASE_SLOT].clone());
-                }
-            }
-            Self::menu_key_down(event, &items, window, cx);
-        }
     }
 
     fn breadcrumbs_key_down(
@@ -1407,7 +1334,6 @@ impl GpuiShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.row_menu = None;
         if !self.background_idle() {
             return;
         }
@@ -1467,98 +1393,6 @@ impl GpuiShell {
             RowAction::SelectAll => self.controller.dispatch(AppAction::SelectAllVisible),
         }
         cx.notify();
-    }
-
-    fn row_menu_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if event.keystroke.key == "escape" {
-            self.row_menu = None;
-            self.list_focus.focus(window, cx);
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        let writable = self.controller.state.format == super::Format::Zip;
-        let items: Vec<FocusHandle> = RowAction::ALL
-            .iter()
-            .filter(|action| action.offered() && (**action != RowAction::Rename || writable))
-            .map(|action| self.row_menu_item_focus[*action as usize].clone())
-            .collect();
-        Self::menu_key_down(event, &items, window, cx);
-    }
-
-    /// The menu the right button opens on a row, floating where the pointer is.
-    fn row_menu_view(
-        &mut self,
-        index: usize,
-        at: gpui::Point<gpui::Pixels>,
-        cx: &mut Context<Self>,
-    ) -> Stateful<gpui::Div> {
-        let s = self.controller.s();
-        let mut menu = div()
-            .id("row-menu")
-            .role(Role::Menu)
-            .aria_label(s.archive_contents)
-            .absolute()
-            .left(at.x)
-            .top(at.y)
-            .w(px(240.))
-            .flex()
-            .flex_col()
-            .gap_px()
-            .p_1()
-            .bg(cx.theme().popover)
-            .text_color(cx.theme().popover_foreground)
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded(cx.theme().radius_lg)
-            .shadow_lg()
-            .occlude()
-            .track_focus(&self.row_menu_focus)
-            .tab_group()
-            .focus_visible(focus_ring(cx))
-            .on_key_down(cx.listener(Self::row_menu_key_down));
-        let writable = self.controller.state.format == super::Format::Zip;
-        // Only a file has anything to look at, so a folder is not offered a
-        // viewer it would refuse.
-        let is_file = self
-            .controller
-            .visible_rows()
-            .get(index)
-            .is_some_and(|row| row.entry.is_some());
-        let mut drawn = false;
-        for action in RowAction::ALL.into_iter().filter(|a| {
-            a.offered()
-                && (*a != RowAction::Rename || writable)
-                && (*a != RowAction::View || is_file)
-        }) {
-            // Never as the first thing in the menu: a rule with nothing above
-            // it is a line, not a grouping.
-            if action.starts_group() && drawn {
-                menu = menu.child(div().py_1().child(Separator::horizontal()));
-            }
-            drawn = true;
-            let (label, keys) = action.label(s);
-            let item_focus = self.row_menu_item_focus[action as usize].clone();
-            let item = Self::menu_item(
-                ("row-menu-item", action as usize),
-                label,
-                keys,
-                label.to_string(),
-                true,
-                cx,
-            )
-            .track_focus(&item_focus)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.row_action(action, index, window, cx);
-            }));
-            menu = menu.child(item);
-        }
-        menu
     }
 
     /// The list's geometry, or nothing before it has been laid out once.
@@ -1889,12 +1723,6 @@ impl GpuiShell {
             && self.dialog.is_none()
             && !self.overflow_open
             && !self.breadcrumbs_open
-            && self.row_menu.is_none()
-    }
-
-    /// How many of the recent archives the menu actually draws.
-    fn recent_shown(&self) -> usize {
-        self.controller.state.settings.recent.len().min(RECENT_MAX)
     }
 
     fn menu_enabled(&self) -> bool {
@@ -2270,7 +2098,7 @@ impl GpuiShell {
         row: &super::Row,
         columns: &[SortColumn],
         cx: &mut Context<Self>,
-    ) -> Stateful<gpui::Div> {
+    ) -> gpui::AnyElement {
         let selected = self.controller.is_checked(row);
         let cursor = self.controller.state.cursor == Some(index);
         let muted = row.entry.is_some_and(|entry| {
@@ -2410,9 +2238,12 @@ impl GpuiShell {
             // Right clicking something that is not picked picks it, which is
             // what every file list does; right clicking inside a selection
             // leaves the selection alone.
+            // The menu itself belongs to the kit; this only picks the row
+            // under the pointer first, and must let the event through so the
+            // kit still sees the press that opens it.
             item = item.on_mouse_down(
                 gpui::MouseButton::Right,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
                     if !this.background_idle() {
                         return;
                     }
@@ -2425,10 +2256,6 @@ impl GpuiShell {
                         }
                     }
                     this.controller.state.cursor = Some(index);
-                    this.row_menu = Some((index, event.position));
-                    let menu_focus = this.row_menu_item_focus[0].clone();
-                    window.on_next_frame(move |window, cx| window.focus(&menu_focus, cx));
-                    cx.stop_propagation();
                     cx.notify();
                 }),
             );
@@ -2467,7 +2294,57 @@ impl GpuiShell {
                 });
             }
         }
-        item
+        if !accessible {
+            return item.into_any_element();
+        }
+        // The right button's menu, drawn and steered by the kit: it opens where
+        // the pointer is, walks with the arrows and closes on escape or on a
+        // click outside, none of which this shell has to keep working.
+        let writable = self.controller.state.format == super::Format::Zip;
+        let is_file = row.entry.is_some();
+        let owner = cx.entity().downgrade();
+        item.context_menu(move |menu, _, _| {
+            let mut menu = menu;
+            let mut drawn = false;
+            for action in RowAction::ALL.into_iter().filter(|action| {
+                action.offered()
+                    && (*action != RowAction::Rename || writable)
+                    && (*action != RowAction::View || is_file)
+            }) {
+                // Never as the first thing in the menu: a rule with nothing
+                // above it is a line, not a grouping.
+                if action.starts_group() && drawn {
+                    menu = menu.item(PopupMenuItem::separator());
+                }
+                drawn = true;
+                let (label, keys) = action.label(s);
+                let owner = owner.clone();
+                menu = menu.item(
+                    PopupMenuItem::element(move |_, cx| {
+                        // Two children rather than one string with a tab in it:
+                        // GPUI lays out text and a tab is nothing at all there.
+                        let mut row = div().flex().w_full().gap_4().items_center();
+                        row = row.child(div().flex_1().truncate().child(label));
+                        if !keys.is_empty() {
+                            row = row.child(
+                                div()
+                                    .flex_none()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(keys),
+                            );
+                        }
+                        row
+                    })
+                    .on_click(move |_, window, cx| {
+                        let _ = owner.update(cx, |this, cx| {
+                            this.row_action(action, index, window, cx);
+                        });
+                    }),
+                );
+            }
+            menu
+        })
+        .into_any_element()
     }
 
     fn select_row(
@@ -3476,16 +3353,6 @@ impl Render for GpuiShell {
         let mut root = div()
             .id("arca-gpui-background")
             .on_action(cx.listener(Self::focus_filter))
-            // Pressing anywhere that is not the menu shuts the menu. The menus
-            // themselves are `occlude`d, so their own clicks never arrive here.
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    if this.row_menu.take().is_some() {
-                        cx.notify();
-                    }
-                }),
-            )
             .size_full()
             .flex()
             .flex_col()
@@ -3929,408 +3796,6 @@ impl Render for GpuiShell {
             .text_color(cx.theme().foreground)
             .child(background);
 
-        if self.overflow_open && !self.background_blocked() {
-            let menu_enabled = self.menu_enabled();
-            let has = has_archive && menu_enabled;
-            // Floating under the button that opened it, instead of being laid
-            // out in the column and shoving the whole window down half a page,
-            // which is what a menu in the flow did.
-            let mut menu = div()
-                .id("overflow-menu")
-                .role(Role::Menu)
-                .aria_label(s.more_word)
-                .absolute()
-                // Under the button that opened it. Measured from the top of the
-                // window, so the title bar counts.
-                .top(TITLE_BAR_HEIGHT + px(38.))
-                .right(px(232.))
-                .w(px(210.))
-                .max_h(px(420.))
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .gap_px()
-                .p_1()
-                .bg(cx.theme().popover)
-                .text_color(cx.theme().popover_foreground)
-                .border_1()
-                .border_color(cx.theme().border)
-                .rounded(cx.theme().radius_lg)
-                .shadow_lg()
-                .track_focus(&self.overflow_menu_focus)
-                .tab_group()
-                .focus_visible(focus_ring(cx))
-                .on_key_down(cx.listener(Self::overflow_key_down));
-            let test_focus = self.overflow_item_focus[0].clone().tab_stop(has);
-            let test = Self::menu_item(
-                "test",
-                s.test_word,
-                "Ctrl+T",
-                s.test_word.to_string(),
-                has,
-                cx,
-            )
-            .track_focus(&test_focus);
-            menu = menu.child(test.on_click(cx.listener(|this, _, _, cx| {
-                if this.menu_enabled() {
-                    if let Some(archive) = this.controller.state.archive.clone() {
-                        this.controller.dispatch(AppAction::Run(Job::Test {
-                            archive,
-                            only: None,
-                        }));
-                    }
-                }
-                this.overflow_open = false;
-                cx.notify();
-            })));
-            let select_focus = self.overflow_item_focus[1].clone().tab_stop(has);
-            let select = Self::menu_item(
-                "select-all",
-                s.select_all,
-                "Ctrl+A",
-                s.select_all.to_string(),
-                has,
-                cx,
-            )
-            .track_focus(&select_focus);
-            menu = menu.child(select.on_click(cx.listener(|this, _, _, cx| {
-                if this.menu_enabled() && this.controller.state.archive.is_some() {
-                    this.controller.dispatch(AppAction::SelectAllVisible);
-                }
-                this.overflow_open = false;
-                cx.notify();
-            })));
-            let invert_focus = self.overflow_item_focus[2].clone().tab_stop(has);
-            let invert = Self::menu_item(
-                "invert",
-                s.invert_selection,
-                "Ctrl+I",
-                s.invert_selection.to_string(),
-                has,
-                cx,
-            )
-            .track_focus(&invert_focus);
-            menu = menu.child(invert.on_click(cx.listener(|this, _, _, cx| {
-                if this.menu_enabled() && this.controller.state.archive.is_some() {
-                    this.controller.dispatch(AppAction::InvertVisible);
-                }
-                this.overflow_open = false;
-                cx.notify();
-            })));
-            let clear_focus = self.overflow_item_focus[3].clone().tab_stop(has);
-            let clear = Self::menu_item(
-                "clear",
-                s.clear_selection,
-                "Esc",
-                s.clear_selection.to_string(),
-                has,
-                cx,
-            )
-            .track_focus(&clear_focus);
-            menu = menu.child(clear.on_click(cx.listener(|this, _, _, cx| {
-                if this.menu_enabled() && this.controller.state.archive.is_some() {
-                    this.controller.dispatch(AppAction::ClearSelection);
-                }
-                this.overflow_open = false;
-                cx.notify();
-            })));
-            let copy_enabled = self.can_copy_files();
-            let copy_focus = self.overflow_item_focus[4].clone().tab_stop(copy_enabled);
-            let copy = Self::menu_item(
-                "copy-files",
-                s.copy_word,
-                "Ctrl+C",
-                s.copy_word.to_string(),
-                copy_enabled,
-                cx,
-            )
-            .aria_keyshortcuts("Control+C Meta+C")
-            .track_focus(&copy_focus);
-            menu = menu.child(copy.on_click(cx.listener(|this, _, window, cx| {
-                if this.can_copy_files() {
-                    this.dispatch_clipboard(false, window, cx);
-                }
-                this.overflow_open = false;
-                cx.notify();
-            })));
-
-            let cut_focus = self.overflow_item_focus[5].clone().tab_stop(copy_enabled);
-            let cut = Self::menu_item(
-                "cut-files",
-                s.cut_word,
-                "Ctrl+X",
-                s.cut_word.to_string(),
-                copy_enabled,
-                cx,
-            )
-            .aria_keyshortcuts("Control+X Meta+X")
-            .track_focus(&cut_focus);
-            menu = menu.child(cut.on_click(cx.listener(|this, _, window, cx| {
-                if this.can_copy_files() {
-                    this.dispatch_clipboard(true, window, cx);
-                }
-                this.overflow_open = false;
-                cx.notify();
-            })));
-
-            let paste_enabled = self.can_paste_files();
-            let paste_focus = self.overflow_item_focus[6].clone().tab_stop(paste_enabled);
-            let paste = Self::menu_item(
-                "paste-files",
-                s.paste_word,
-                "Ctrl+V",
-                s.paste_word.to_string(),
-                paste_enabled,
-                cx,
-            )
-            .aria_keyshortcuts("Control+V Meta+V")
-            .track_focus(&paste_focus);
-            menu = menu.child(paste.on_click(cx.listener(|this, _, window, cx| {
-                if this.can_paste_files() {
-                    this.dispatch_paste(window, cx);
-                }
-                this.overflow_open = false;
-                cx.notify();
-            })));
-
-            // Only when there is one, and at the top, where something that was
-            // not there yesterday belongs.
-            if let Some(release) = self.controller.state.update.clone() {
-                let release_focus = self.overflow_item_focus[RELEASE_SLOT]
-                    .clone()
-                    .tab_stop(menu_enabled);
-                let label = fill(s.update_ready, &[("version", &release.tag)]);
-                let item = Self::menu_item("release", label.clone(), "", label, menu_enabled, cx)
-                    .track_focus(&release_focus);
-                menu = menu.child(item.on_click(cx.listener(|this, _, _, cx| {
-                    if this.menu_enabled() {
-                        this.overflow_action(OverflowAction::Release, cx);
-                    }
-                    this.overflow_open = false;
-                    cx.notify();
-                })));
-            }
-
-            let writable = has && self.controller.state.format == super::Format::Zip;
-            let can_undo = has && self.controller.state.undo.is_some();
-            for (slot, id, label, keys, enabled, action) in [
-                (
-                    7usize,
-                    "add-files",
-                    s.add_to_archive,
-                    "",
-                    writable,
-                    OverflowAction::AddFiles,
-                ),
-                (
-                    8,
-                    "new-folder",
-                    s.new_folder,
-                    "",
-                    writable,
-                    OverflowAction::NewFolder,
-                ),
-                (
-                    9,
-                    "undo",
-                    s.undo_word,
-                    "Ctrl+Z",
-                    can_undo,
-                    OverflowAction::Undo,
-                ),
-                (
-                    10,
-                    "save-copy",
-                    s.save_copy,
-                    "",
-                    has,
-                    OverflowAction::SaveCopy,
-                ),
-                (
-                    11,
-                    "default-password",
-                    s.default_password,
-                    "Ctrl+P",
-                    menu_enabled,
-                    OverflowAction::DefaultPassword,
-                ),
-            ] {
-                let item_focus = self.overflow_item_focus[slot].clone().tab_stop(enabled);
-                let item = Self::menu_item(id, label, keys, label.to_string(), enabled, cx)
-                    .track_focus(&item_focus);
-                menu = menu.child(item.on_click(cx.listener(move |this, _, _, cx| {
-                    if this.menu_enabled() {
-                        this.overflow_action(action, cx);
-                    }
-                    this.overflow_open = false;
-                    cx.notify();
-                })));
-            }
-
-            // The archives opened lately, newest first, by path rather than by
-            // name so that two called the same thing are told apart.
-            let recent: Vec<String> = self
-                .controller
-                .state
-                .settings
-                .recent
-                .iter()
-                .take(RECENT_MAX)
-                .cloned()
-                .collect();
-            for (position, path) in recent.iter().enumerate() {
-                let leaf = std::path::Path::new(path)
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path.clone());
-                let item_focus = self.overflow_item_focus[RECENT_SLOT + position]
-                    .clone()
-                    .tab_stop(menu_enabled);
-                let target = PathBuf::from(path);
-                let item = Self::menu_item(
-                    ("recent", position),
-                    leaf,
-                    "",
-                    format!("{} {path}", s.recent_word),
-                    menu_enabled,
-                    cx,
-                )
-                .track_focus(&item_focus);
-                menu = menu.child(item.on_click(cx.listener(move |this, _, _, cx| {
-                    if this.menu_enabled() {
-                        this.controller.dispatch(AppAction::Open(target.clone()));
-                    }
-                    this.overflow_open = false;
-                    cx.notify();
-                })));
-            }
-            let clear_history_enabled = menu_enabled && !recent.is_empty();
-            let clear_history_focus = self.overflow_item_focus[RECENT_SLOT + RECENT_MAX]
-                .clone()
-                .tab_stop(clear_history_enabled);
-            let clear_history = Self::menu_item(
-                "clear-history",
-                s.clear_history,
-                "",
-                s.clear_history.to_string(),
-                clear_history_enabled,
-                cx,
-            )
-            .track_focus(&clear_history_focus);
-            menu = menu.child(clear_history.on_click(cx.listener(|this, _, _, cx| {
-                if this.menu_enabled() {
-                    this.controller.state.settings.recent.clear();
-                    this.controller.state.settings.save();
-                }
-                this.overflow_open = false;
-                cx.notify();
-            })));
-
-            let flat = self.controller.state.settings.flat;
-            let flat_focus = self.overflow_item_focus[RECENT_SLOT + RECENT_MAX + 1]
-                .clone()
-                .tab_stop(has);
-            let flat_item = Self::menu_item(
-                "flat-view",
-                if flat {
-                    format!("{} ✓", s.flat_view)
-                } else {
-                    s.flat_view.to_string()
-                },
-                "",
-                s.flat_view.to_string(),
-                has,
-                cx,
-            )
-            .aria_selected(flat)
-            .track_focus(&flat_focus);
-            menu = menu.child(flat_item.on_click(cx.listener(|this, _, _, cx| {
-                if this.menu_enabled() && this.controller.state.archive.is_some() {
-                    let settings = &mut this.controller.state.settings;
-                    settings.flat = !settings.flat;
-                    // A flat list is a list of names with no folder over them,
-                    // so the folder each one came from has to go somewhere. It
-                    // is left on afterwards: turning the view off and on again
-                    // should not keep undoing a column since arranged by hand.
-                    if settings.flat && !settings.columns.on(SortColumn::Path) {
-                        settings.columns.set(SortColumn::Path, true);
-                    }
-                    settings.save();
-                    this.controller.dispatch(AppAction::ClearSelection);
-                }
-                this.overflow_open = false;
-                cx.notify();
-            })));
-
-            let shortcuts_focus = self.overflow_item_focus[RECENT_SLOT + RECENT_MAX + 2]
-                .clone()
-                .tab_stop(menu_enabled);
-            let shortcuts_item = Self::menu_item(
-                "shortcuts",
-                s.shortcuts_title,
-                "F1",
-                s.shortcuts_title.to_string(),
-                menu_enabled,
-                cx,
-            )
-            .aria_keyshortcuts("F1")
-            .track_focus(&shortcuts_focus);
-            menu = menu.child(shortcuts_item.on_click(cx.listener(|this, _, _, cx| {
-                if this.menu_enabled() {
-                    this.controller.state.show_shortcuts = true;
-                }
-                this.overflow_open = false;
-                cx.notify();
-            })));
-
-            let settings_focus = self.overflow_item_focus[RECENT_SLOT + RECENT_MAX + 3]
-                .clone()
-                .tab_stop(menu_enabled);
-            let settings_item = Self::menu_item(
-                "settings",
-                s.settings,
-                "",
-                s.settings.to_string(),
-                menu_enabled,
-                cx,
-            )
-            .track_focus(&settings_focus);
-            menu = menu.child(settings_item.on_click(cx.listener(|this, _, _, cx| {
-                if this.menu_enabled() {
-                    this.controller.state.show_settings = true;
-                }
-                this.overflow_open = false;
-                cx.notify();
-            })));
-
-            let columns_available = menu_enabled;
-            for (position, (column, _)) in Columns::ALL.iter().enumerate() {
-                let column = *column;
-                let label = Columns::label(column, s);
-                let shown = self.controller.state.settings.columns.on(column);
-                let action = if shown { s.hide_word } else { s.show_word };
-                let item_focus = self.overflow_item_focus[position + RECENT_SLOT + RECENT_MAX + 4]
-                    .clone()
-                    .tab_stop(columns_available);
-                let item = Self::menu_item(
-                    ("column", position),
-                    format!("{action} {label}"),
-                    "",
-                    format!("{action} {label}"),
-                    columns_available,
-                    cx,
-                )
-                .track_focus(&item_focus);
-                menu = menu.child(item.on_click(cx.listener(move |this, _, _, cx| {
-                    if this.menu_enabled() {
-                        this.controller.dispatch(AppAction::ToggleColumn(column));
-                    }
-                    this.overflow_open = false;
-                    cx.notify();
-                })));
-            }
-            root = root.child(menu);
-        }
         // The band, and the anchor the wheel dropped. Both are drawn over
         // everything rather than inside the list, because the hand is free to
         // wander off it while either gesture runs and a mark that vanished at
@@ -4389,9 +3854,6 @@ impl Render for GpuiShell {
                             .bg(cx.theme().muted_foreground),
                     ),
             );
-        }
-        if let Some((index, at)) = self.row_menu {
-            root = root.child(self.row_menu_view(index, at, cx));
         }
         // The kit's stack is imperative and this shell's modal is derived, so
         // they are reconciled after the frame rather than during it.
@@ -5670,8 +5132,8 @@ mod tests {
         }
         assert!(offered[RowAction::Open as usize]);
         assert!(offered[RowAction::Delete as usize]);
-        // Same index contract as the settings dialog: the focus vector is
-        // indexed by `action as usize`.
+        // The element id of each menu row is built from `action as usize`, so
+        // an action added out of order would silently share an id.
         for (index, action) in RowAction::ALL.iter().enumerate() {
             assert_eq!(*action as usize, index);
         }

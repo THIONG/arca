@@ -35,6 +35,7 @@ ya trae. El recuento de partida en `gpui_shell/mod.rs` (6067 líneas) era de 95
 | `uniform_list` del visor | `list` y `virtual_list` |
 | Campo de renombrado en la fila | `Input` (hecho) |
 | `button` e `icon_button` | `Button` (hecho) |
+| Menú del botón derecho | `ContextMenu` (hecho) |
 | Árbol de carpetas sobre `SidebarMenuItem` | `tree` |
 
 ## Decisiones tomadas
@@ -103,9 +104,18 @@ modo que el árbol queda utilizable después de cada fase.
    de foco por fila y el botón del kit se guarda el suyo, así que migrarlo
    ahora sería hacerlo dos veces. Por lo mismo se queda el botón `…` de las
    migas, que sostiene su propio menú.
-4. Menú contextual de fila, y con él `menu_row` y el botón de las migas.
+4. **Hecha.** El menú del botón derecho es el `ContextMenu` del kit: se abre
+   donde está el puntero, anda con las flechas, cierra con escape o con un
+   clic fuera y devuelve el foco, todo sin código nuestro. Al migrarlo salió a
+   la luz que el menú de `…` dibujado a mano llevaba muerto desde que ese
+   botón pasó al kit en la fase 3: `overflow_open` no se ponía a `true` en
+   ningún sitio. Se fueron con él sus cuatrocientas líneas, tres manejos de
+   foco, `overflow_key_down`, `recent_shown`, dos constantes de posición y una
+   cadena de i18n.
 5. Tabla de ficheros, con sus gestos reconstruidos.
-6. Migas de pan, progreso, atajos, controles de ajustes y campos de texto.
+6. Migas de pan, progreso, atajos, controles de ajustes y campos de texto. El
+   menú de carpetas ocultas de las migas es el último que queda dibujado a
+   mano, y con él se van `menu_row` y `menu_key_down`.
 7. Retirar `gpui_shell/input.rs` y el resto de andamiaje que quede sin uso.
 
 ## Comprobación de cada fase
