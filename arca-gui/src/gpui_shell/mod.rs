@@ -38,6 +38,7 @@ use gpui_component::{h_resizable, resizable_panel, ResizableState};
 use gpui_component::{ActiveTheme, Icon, IconName};
 use gpui_component::{Disableable, Root, Selectable, Sizable as _, TitleBar, WindowExt};
 use gpui_platform::application;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
@@ -163,7 +164,7 @@ struct GpuiShell {
     /// branches are open, so they are grown once per archive and the key says
     /// when that archive stopped being the same one.
     folders: Entity<TreeState>,
-    folders_key: Option<(Option<PathBuf>, usize)>,
+    folders_key: Option<(Option<PathBuf>, usize, u64)>,
     /// How the sidebar and the file list divide the window between them.
     sidebar_state: Entity<ResizableState>,
     drop_paths: Vec<PathBuf>,
@@ -552,15 +553,21 @@ impl GpuiShell {
     /// Grow the kit's tree from the archive's folders, and put the mark on the
     /// folder the list is showing.
     ///
-    /// The items are only rebuilt when the archive is a different one: they
-    /// carry which branches are open, and handing the tree a fresh set every
-    /// frame would shut the lot on every repaint. Revealing the current folder
-    /// opens the branch that leads to it, so an archive opened three levels
-    /// down does not present a closed tree to re-walk by hand.
+    /// The items are only rebuilt when the archive contents change: they carry
+    /// which branches are open, and handing the tree a fresh set every frame
+    /// would shut the lot on every repaint. Revealing the current folder opens
+    /// the branch that leads to it, so an archive opened three levels down does
+    /// not present a closed tree to re-walk by hand.
     fn sync_folders(&mut self, cx: &mut Context<Self>) {
+        let mut folder_hash = std::collections::hash_map::DefaultHasher::new();
+        for entry in &self.controller.state.entries {
+            entry.name.hash(&mut folder_hash);
+            entry.is_dir.hash(&mut folder_hash);
+        }
         let key = (
             self.controller.state.archive.clone(),
             self.controller.state.entries.len(),
+            folder_hash.finish(),
         );
         if self.folders_key.as_ref() != Some(&key) {
             self.folders_key = Some(key);
@@ -2113,6 +2120,11 @@ impl GpuiShell {
     fn list_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.background_blocked() {
             cx.stop_propagation();
+            return;
+        }
+        // The table owns Space/Delete for row actions, but never while an input
+        // inside a row has focus. Let the editor receive literal spaces and edits.
+        if self.typing(window, cx) {
             return;
         }
         let modifiers = event.keystroke.modifiers;
@@ -4690,10 +4702,36 @@ impl TableDelegate for FileTable {
                 .text_color(ink)
                 .child(column_text(row, column, self.strings));
         }
-        // Renaming happens here rather than in a dialog, so the name being
-        // typed stays where the name is.
+        let (icon, color) = GpuiShell::kind_icon(row.kind);
+        let icon = div()
+            .w(px(18.))
+            .flex_none()
+            .child(Icon::new(icon).size(px(16.)).text_color(gpui::rgb(color)));
+        // Keep the editor in the name column instead of turning the whole row
+        // into a form. Its width follows the current name, like Explorer.
         if self.renaming == Some(row_ix) {
-            return cell().child(Input::new(&self.rename_input));
+            let width = (row.label.chars().count() as f32 * 8.0 + 20.0).clamp(96.0, 280.0);
+            return cell()
+                .role(Role::Cell)
+                .aria_column_index(1)
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_sm()
+                .text_color(ink)
+                .child(icon)
+                .child(
+                    div()
+                        .w(px(width))
+                        .h(px(24.))
+                        .flex_none()
+                        .items_center()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().background)
+                        .px_1()
+                        .child(Input::new(&self.rename_input).small().appearance(false)),
+                );
         }
         cell()
             .role(Role::Cell)
@@ -4703,13 +4741,7 @@ impl TableDelegate for FileTable {
             .gap_2()
             .text_sm()
             .text_color(ink)
-            .child({
-                let (icon, color) = GpuiShell::kind_icon(row.kind);
-                div()
-                    .w(px(18.))
-                    .flex_none()
-                    .child(Icon::new(icon).size(px(16.)).text_color(gpui::rgb(color)))
-            })
+            .child(icon)
             .child(div().flex_1().truncate().child(row.label.clone()))
     }
 

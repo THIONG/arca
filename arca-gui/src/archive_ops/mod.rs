@@ -97,6 +97,27 @@ pub(crate) enum Job {
     },
 }
 
+fn rename_entry_name(name: &str, from: &str, to: &str, folder: bool) -> String {
+    let from = from.trim_end_matches('/');
+    let to = to.trim_end_matches('/');
+    if !folder {
+        return if name == from {
+            to.to_string()
+        } else {
+            name.to_string()
+        };
+    }
+    let under = format!("{from}/");
+    let moved = format!("{to}/");
+    if name == from || name == under {
+        moved
+    } else if let Some(rest) = name.strip_prefix(&under) {
+        format!("{moved}{rest}")
+    } else {
+        name.to_string()
+    }
+}
+
 pub(crate) enum Startup {
     Browse(Option<PathBuf>),
     Run(Job),
@@ -454,26 +475,7 @@ pub(crate) fn run_job_blocking(
             // A folder answers to two spellings: some tools file an entry for
             // the folder itself with a slash on the end, others only file what
             // is inside it. Both have to move, and neither can be assumed.
-            let under = format!("{from}/");
-            let moved = format!("{to}/");
-            let rename = |name: &str| -> String {
-                if !folder {
-                    return if name == from {
-                        to.clone()
-                    } else {
-                        name.to_string()
-                    };
-                }
-                if name == from {
-                    to.clone()
-                } else if name == under {
-                    moved.clone()
-                } else if let Some(rest) = name.strip_prefix(&under) {
-                    format!("{moved}{rest}")
-                } else {
-                    name.to_string()
-                }
-            };
+            let rename = |name: &str| rename_entry_name(name, &from, &to, folder);
             let done = arca_zip::rename_entries(
                 &archive,
                 &temp,
@@ -646,5 +648,39 @@ pub(crate) fn run_job_blocking(
             // already is.
             Ok(String::new())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rename_entry_name;
+
+    #[test]
+    fn folder_rename_handles_the_row_path_trailing_slash() {
+        assert_eq!(
+            rename_entry_name(
+                "Big Ambitions/Big Ambitions_Data/file",
+                "Big Ambitions/",
+                "Renamed",
+                true
+            ),
+            "Renamed/Big Ambitions_Data/file"
+        );
+        assert_eq!(
+            rename_entry_name("Big Ambitions/", "Big Ambitions/", "Renamed", true),
+            "Renamed/"
+        );
+    }
+
+    #[test]
+    fn file_rename_only_changes_the_exact_entry() {
+        assert_eq!(
+            rename_entry_name("folder/file.txt", "folder/file.txt", "new.txt", false),
+            "new.txt"
+        );
+        assert_eq!(
+            rename_entry_name("folder/file.txt.bak", "folder/file.txt", "new.txt", false),
+            "folder/file.txt.bak"
+        );
     }
 }

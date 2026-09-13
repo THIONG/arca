@@ -27,6 +27,14 @@ pub(crate) struct AppController {
     pub(crate) state: AppState,
 }
 
+fn rename_destination(path: &str, name: &str) -> String {
+    let path = path.trim_end_matches('/');
+    match path.rsplit_once('/') {
+        Some((parent, _)) => format!("{parent}/{name}"),
+        None => name.to_string(),
+    }
+}
+
 impl AppController {
     pub(crate) fn dispatch(&mut self, action: AppAction) {
         match action {
@@ -1271,10 +1279,7 @@ impl AppController {
             self.state.error = true;
             return;
         }
-        let to = match path.rsplit_once('/') {
-            Some((parent, _)) => format!("{parent}/{name}"),
-            None => name.to_string(),
-        };
+        let to = rename_destination(path, name);
         let Some(archive) = self.state.archive.clone() else {
             return;
         };
@@ -1654,5 +1659,15 @@ mod reread_tests {
             only: None,
         };
         assert!(reread_target(&job).is_none());
+    }
+
+    #[test]
+    fn folder_rename_destination_is_a_sibling_not_a_child() {
+        assert_eq!(rename_destination("Big Ambitions/", "Renamed"), "Renamed");
+        assert_eq!(
+            rename_destination("Projects/Big Ambitions/", "Renamed"),
+            "Projects/Renamed"
+        );
+        assert_eq!(rename_destination("file.txt", "new.txt"), "new.txt");
     }
 }
