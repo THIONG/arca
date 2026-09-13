@@ -27,6 +27,7 @@ use gpui_component::kbd::Kbd;
 use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::progress::Progress;
 use gpui_component::radio::RadioGroup;
+use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::separator::Separator;
 use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_component::status_bar::StatusBar;
@@ -4048,12 +4049,17 @@ fn build_dialog(
                         .child(tabs)
                         .child(Separator::horizontal())
                         .child(
+                            // The bar hangs off the list's own scroll handle, so
+                            // a file of a million lines says how far down it is
+                            // instead of only answering the wheel.
                             div()
                                 .id("viewer-content")
+                                .relative()
                                 .flex_1()
                                 .min_h(px(1.))
                                 .overflow_hidden()
-                                .child(content),
+                                .child(content)
+                                .vertical_scrollbar(&scroll),
                         ),
                 )
         }
