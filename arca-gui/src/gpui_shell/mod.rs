@@ -23,6 +23,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::dialog::{Dialog, DialogAction, DialogClose, DialogDescription, DialogFooter};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::kbd::Kbd;
 use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::progress::Progress;
 use gpui_component::separator::Separator;
@@ -3621,61 +3622,64 @@ fn build_dialog(
                 })
         }
         ModalKind::Shortcuts => {
-            let left = [
-                ("Ctrl+O", s.open),
-                ("Ctrl+N", s.compress),
-                ("Ctrl+E", s.extract_all),
-                ("Alt+W", s.extract_here),
-                ("F3", s.view_word),
-                ("Ctrl+T", s.test_word),
-                ("F5", s.refresh_word),
-                ("Ctrl+F", s.find_word),
-                ("", ""),
-                ("Ctrl+Z", s.undo_word),
-                ("Ctrl+P", s.default_password),
-                ("Ctrl+A", s.select_all),
-                ("Ctrl+I", s.invert_selection),
-                ("Esc", s.clear_selection),
-                ("Space", s.toggle_word),
-                ("Num +  -", s.select_group),
-                ("F2", s.rename_word),
-                ("Supr", s.delete_word),
-                ("F1", s.shortcuts_title),
+            // Keystrokes, not printed key names: the kit spells each one the
+            // way the platform does, so the window stops claiming Supr on a
+            // keyboard whose key says Delete.
+            let left: [(&[&str], &str); 17] = [
+                (&["ctrl-o"], s.open),
+                (&["ctrl-n"], s.compress),
+                (&["ctrl-e"], s.extract_all),
+                (&["alt-w"], s.extract_here),
+                (&["f3"], s.view_word),
+                (&["ctrl-t"], s.test_word),
+                (&["f5"], s.refresh_word),
+                (&["ctrl-f"], s.find_word),
+                (&["ctrl-z"], s.undo_word),
+                (&["ctrl-p"], s.default_password),
+                (&["ctrl-a"], s.select_all),
+                (&["ctrl-i"], s.invert_selection),
+                (&["escape"], s.clear_selection),
+                (&["space"], s.toggle_word),
+                (&["+", "-"], s.select_group),
+                (&["f2"], s.rename_word),
+                (&["delete"], s.delete_word),
             ];
-            let right = [
-                ("Ctrl+C", s.copy_word),
-                ("Ctrl+X", s.cut_word),
-                ("Ctrl+V", s.paste_word),
-                ("Ctrl+Shift+C", s.copy_names),
-                ("", ""),
-                ("Enter", s.open_word),
-                ("Backspace", s.up),
-                ("\u{2191} \u{2193}", s.move_word),
-                ("Home  End", s.move_word),
-                ("PageUp  PageDown", s.move_word),
-                ("Tab", s.jump_word),
+            let right: [(&[&str], &str); 11] = [
+                (&["f1"], s.shortcuts_title),
+                (&["ctrl-c"], s.copy_word),
+                (&["ctrl-x"], s.cut_word),
+                (&["ctrl-v"], s.paste_word),
+                (&["ctrl-shift-c"], s.copy_names),
+                (&["enter"], s.open_word),
+                (&["backspace"], s.up),
+                (&["up", "down"], s.move_word),
+                (&["home", "end"], s.move_word),
+                (&["pageup", "pagedown"], s.move_word),
+                (&["tab"], s.jump_word),
             ];
-            let muted = cx.theme().muted_foreground;
-            let column = |rows: &[(&str, &str)]| {
-                rows.iter().filter(|(key, _)| !key.is_empty()).fold(
-                    div().flex().flex_col().gap_1(),
-                    |column, (key, what)| {
+            let column = |rows: &[(&[&str], &str)]| {
+                rows.iter()
+                    .fold(div().flex().flex_col().gap_1(), |column, (keys, what)| {
                         column.child(
                             div()
                                 .flex()
+                                .items_center()
                                 .gap_3()
                                 .text_sm()
                                 .child(
                                     div()
                                         .w(px(130.))
                                         .flex_none()
-                                        .text_color(muted)
-                                        .child(key.to_string()),
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .children(keys.iter().filter_map(|key| {
+                                            gpui::Keystroke::parse(key).ok().map(Kbd::new)
+                                        })),
                                 )
                                 .child(what.to_string()),
                         )
-                    },
-                )
+                    })
             };
             // No close button of its own: the kit's own close, escape and
             // backdrop are the way out of every dialog now.
