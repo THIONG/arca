@@ -282,7 +282,7 @@ impl AppController {
                 show_password: false,
                 add_password: String::new(),
                 archive_password: None,
-                after_password: None,
+                reread_after: None,
                 history: vec![String::new()],
                 here: 0,
                 cursor: None,
@@ -1095,7 +1095,7 @@ impl AppController {
         // with the password it now carries, so the browse view shows the new
         // state and does not ask for a password it was just handed.
         if finished_ok {
-            if let Some((path, pw)) = self.state.after_password.take() {
+            if let Some((path, pw)) = self.state.reread_after.take() {
                 let notice = std::mem::take(&mut self.state.notice);
                 self.open(path);
                 self.state.archive_password = pw;
@@ -1470,27 +1470,13 @@ impl AppController {
                 | Job::Add { .. }
         );
         // The file on disk is about to change, so the listing has to be redone.
-        if let Job::Password { archive, new, .. } = &job {
-            self.state.after_password = Some((archive.clone(), new.clone()));
-        }
-        if let Job::Delete {
-            archive, password, ..
-        } = &job
-        {
-            self.state.after_password = Some((archive.clone(), password.clone()));
-        }
-        if let Job::Add {
-            archive, password, ..
-        } = &job
-        {
-            self.state.after_password = Some((archive.clone(), password.clone()));
-        }
-        if let Job::Rename {
-            archive, password, ..
-        } = &job
-        {
-            self.state.after_password = Some((archive.clone(), password.clone()));
-        }
+        //
+        // One match rather than a copy of the same `if let` per job: written as
+        // copies, a new folder and a move were left out, and the window went on
+        // showing a listing the archive no longer matched until it was reopened
+        // by hand. This list is the jobs that rebuild the file, and it is the
+        // same one the undo entry below is built from.
+        self.state.reread_after = reread_target(&job);
         // The ones that build the archive again leave the old one beside it.
         // What is kept here is the word for the change, so that offering to
         // take it back can say what it would be taking back.
@@ -1560,5 +1546,113 @@ impl AppController {
                 !under.is_empty() && under.iter().all(|&i| self.state.checked[i])
             }
         }
+    }
+}
+
+/// Where to look again once `job` has finished, and the password the archive
+/// carries by then.
+///
+/// A job that rebuilds the archive leaves the window listing a file that is no
+/// longer there. Every one of them belongs here; the jobs that only read
+/// (testing, extracting) or write somewhere else (compressing to a new archive,
+/// copying, downloading) do not.
+fn reread_target(job: &Job) -> Option<(PathBuf, Option<String>)> {
+    match job {
+        Job::Password { archive, new, .. } => Some((archive.clone(), new.clone())),
+        Job::Delete {
+            archive, password, ..
+        }
+        | Job::Add {
+            archive, password, ..
+        }
+        | Job::Rename {
+            archive, password, ..
+        }
+        | Job::Move {
+            archive, password, ..
+        }
+        | Job::NewFolder {
+            archive, password, ..
+        } => Some((archive.clone(), password.clone())),
+        Job::Extract { .. }
+        | Job::Test { .. }
+        | Job::CopyTo { .. }
+        | Job::Compress { .. }
+        | Job::Update { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod reread_tests {
+    use super::*;
+
+    fn archive() -> PathBuf {
+        PathBuf::from("a.zip")
+    }
+
+    /// Every job that rebuilds the archive has to ask for a reread. This is
+    /// written against the job list rather than against one case, because the
+    /// bug it is here for was a job quietly missing from the list.
+    #[test]
+    fn jobs_that_rewrite_the_archive_are_reread() {
+        let rewrites = [
+            Job::NewFolder {
+                archive: archive(),
+                name: "f/".into(),
+                password: None,
+            },
+            Job::Move {
+                archive: archive(),
+                moves: vec![("a".into(), "b/a".into())],
+                password: None,
+            },
+            Job::Delete {
+                archive: archive(),
+                names: vec!["a".into()],
+                password: None,
+            },
+            Job::Rename {
+                archive: archive(),
+                from: "a".into(),
+                to: "b".into(),
+                folder: false,
+                password: None,
+            },
+        ];
+        // Named by position rather than by value: `Job` carries passwords in
+        // the clear and must not learn to print itself.
+        for (ix, job) in rewrites.iter().enumerate() {
+            assert_eq!(
+                reread_target(job).map(|(path, _)| path),
+                Some(archive()),
+                "job {ix} rewrites the archive and must be reread"
+            );
+        }
+    }
+
+    /// The password the archive carries afterwards is the new one, not the one
+    /// it was opened with, or the reread would ask for a password that no
+    /// longer opens it.
+    #[test]
+    fn a_password_job_is_reread_with_the_new_password() {
+        let job = Job::Password {
+            archive: archive(),
+            current: Some("old".into()),
+            new: Some("new".into()),
+        };
+        assert_eq!(
+            reread_target(&job),
+            Some((archive(), Some("new".to_string())))
+        );
+    }
+
+    /// Reading an archive, or writing a different one, leaves the listing alone.
+    #[test]
+    fn jobs_that_leave_the_archive_alone_are_not_reread() {
+        let job = Job::Test {
+            archive: archive(),
+            only: None,
+        };
+        assert!(reread_target(&job).is_none());
     }
 }

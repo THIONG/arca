@@ -50,9 +50,11 @@ pub(crate) struct AppState {
     // Held for the archive currently open in the window, so extracting from it
     // does not ask again for every button press.
     pub(crate) archive_password: Option<String>,
-    // Where to look again once a password job has rewritten the archive, and the
-    // password it now carries.
-    pub(crate) after_password: Option<(PathBuf, Option<String>)>,
+    // Where to look again once a job has rewritten the archive, and the password
+    // it now carries. Set by every job that rebuilds the file, not just the one
+    // that changes its password: a rewrite the window does not reread leaves a
+    // list that disagrees with the disk.
+    pub(crate) reread_after: Option<(PathBuf, Option<String>)>,
     // Where the window has been, so the mouse back and forward buttons have
     // somewhere to go. `here` indexes into it; going somewhere new throws away
     // whatever was ahead, the way a browser does.
