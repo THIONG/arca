@@ -1883,6 +1883,10 @@ impl GpuiShell {
         let rows = rows.to_vec();
         self.table.update(cx, |state, cx| {
             let delegate = state.delegate_mut();
+            // `refresh` rebuilds the table's live column groups. Doing that on
+            // every shell render overwrites a resize drag with the last saved
+            // widths, so only rebuild when the column layout actually changed.
+            let layout_changed = delegate.columns != columns || delegate.widths != widths;
             delegate.rows = rows;
             delegate.columns = columns;
             delegate.widths = widths;
@@ -1894,7 +1898,9 @@ impl GpuiShell {
             delegate.strings = strings;
             delegate.idle = idle;
             delegate.writable = writable;
-            state.refresh(cx);
+            if layout_changed {
+                state.refresh(cx);
+            }
         });
     }
 
