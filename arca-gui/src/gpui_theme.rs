@@ -7,10 +7,9 @@
 //! those tokens are*, once, for light and for dark, and that is the whole file.
 //!
 //! The palette is monochrome by design, not by omission. There are six greys
-//! and they are the same six greys inverted between the two modes. They are not
-//! neutral: they carry a few percent of the night blue from `brand/BRAND.md`
-//! (hue 225), which is the difference between a quiet window and a screenshot
-//! of a terminal.
+//! and they are the same six greys inverted between the two modes. They are
+//! strictly neutral -- zero chroma -- in the Vercel/Geist manner: black ground
+//! in dark, white ground in light, and every step between them a pure grey.
 //!
 //! There is no accent colour. Selection, the keyboard cursor and the focus ring
 //! are all the *text* colour at different strengths, so contrast is guaranteed
@@ -51,30 +50,30 @@ struct Palette {
     warning: u32,
 }
 
-/// Night, with the brand hue held at about 10% saturation.
+/// True black ground, the way Geist paints a dark surface.
 const DARK: Palette = Palette {
-    background: 0x0E1014,
-    surface: 0x14161B,
-    raised: 0x1B1E25,
-    border: 0x262A33,
-    text: 0xE4E6EB,
-    muted: 0x8B909C,
-    danger: 0xE5787C,
-    warning: 0xD9A441,
+    background: 0x000000,
+    surface: 0x0A0A0A,
+    raised: 0x171717,
+    border: 0x2E2E2E,
+    text: 0xEDEDED,
+    muted: 0xA1A1A1,
+    danger: 0xE5484D,
+    warning: 0xF5A623,
 };
 
 /// The same palette turned over. Not `Visuals::light()` inverted by formula:
 /// a light window needs its steps closer together or the chrome starts to
 /// stripe.
 const LIGHT: Palette = Palette {
-    background: 0xFAFAFB,
-    surface: 0xFFFFFF,
-    raised: 0xF3F4F6,
-    border: 0xE3E5EA,
-    text: 0x14161B,
-    muted: 0x666B76,
-    danger: 0xB3262B,
-    warning: 0x8A5A00,
+    background: 0xFFFFFF,
+    surface: 0xFAFAFA,
+    raised: 0xF2F2F2,
+    border: 0xE0E0E0,
+    text: 0x171717,
+    muted: 0x666666,
+    danger: 0xC50E1F,
+    warning: 0xA15C00,
 };
 
 /// A hex literal as GPUI sees colours.
