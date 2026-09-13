@@ -24,6 +24,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::dialog::{Dialog, DialogAction, DialogClose, DialogDescription, DialogFooter};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_component::progress::Progress;
 use gpui_component::separator::Separator;
 use gpui_component::sidebar::{SidebarItem, SidebarMenu, SidebarMenuItem};
 use gpui_component::status_bar::StatusBar;
@@ -3150,10 +3151,11 @@ impl Render for GpuiShell {
             // floating row: work happening to the archive belongs above the
             // archive, and it must not shove the list down a line when it
             // appears.
+            // The bar owns the accessible name and the numeric value; the
+            // strip around it is a status region whose text is read as it
+            // changes. Naming both would announce the same thing twice.
             let mut progress_view = div()
                 .id("progress")
-                .aria_label(s.progress_region)
-                .aria_value(progress.clone())
                 .flex_none()
                 .h(px(30.))
                 .px_2()
@@ -3165,6 +3167,14 @@ impl Render for GpuiShell {
                 .border_b_1()
                 .border_color(cx.theme().border)
                 .child(progress)
+                .child(
+                    Progress::new("job-progress")
+                        .accessibility_label(s.progress_region)
+                        .value(fraction as f32 * 100.)
+                        .loading(total == 0)
+                        .w(px(96.))
+                        .flex_none(),
+                )
                 .child(
                     div()
                         .flex_1()
