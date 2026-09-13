@@ -23,6 +23,7 @@
 
 use crate::ThemePreference;
 use gpui::{px, App, Hsla, Window};
+use gpui_component::scroll::ScrollbarMode;
 use gpui_component::theme::{Theme, ThemeMode, ThemeTokens};
 
 /// Corners. Small enough to read as a finish rather than as a shape.
@@ -118,6 +119,10 @@ pub fn apply(preference: ThemePreference, window: Option<&mut Window>, cx: &mut 
     Theme::change(mode, window, cx);
     paint(mode, cx);
     Theme::sync_base(cx);
+    // The kit only shows a scrollbar while the wheel is turning, so a list that
+    // overflows sideways looks like it simply ends. Hover says the bar is there
+    // before you have to go looking for it.
+    Theme::set_scrollbar_mode(ScrollbarMode::Hover, cx);
 }
 
 fn paint(mode: ThemeMode, cx: &mut App) {
