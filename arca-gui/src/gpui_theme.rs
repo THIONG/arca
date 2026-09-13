@@ -30,11 +30,11 @@ use gpui_component::theme::{Theme, ThemeMode, ThemeTokens};
 const RADIUS: f32 = 4.0;
 const RADIUS_LG: f32 = 6.0;
 
-/// The body size of the window, and the slightly smaller size the columns of
-/// numbers and dates are set in: a monospace face at the same size always looks
-/// a size bigger.
-const FONT_SIZE: f32 = 13.0;
-const MONO_FONT_SIZE: f32 = 12.0;
+/// GPUI Kit uses this as the window's `rem` size, so keep the standard 16px
+/// base used before the kit root was mounted. Monospace text is one step down:
+/// it reads larger at the same nominal size.
+const FONT_SIZE: f32 = 16.0;
+const MONO_FONT_SIZE: f32 = 13.0;
 
 /// The six greys, plus the two states that are allowed to have a hue.
 ///
