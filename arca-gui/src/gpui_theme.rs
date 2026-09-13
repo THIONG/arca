@@ -24,7 +24,7 @@
 
 use crate::ThemePreference;
 use gpui::{px, App, Hsla, Window};
-use gpui_component::theme::{Theme, ThemeMode};
+use gpui_component::theme::{Theme, ThemeMode, ThemeTokens};
 
 /// Corners. Small enough to read as a finish rather than as a shape.
 const RADIUS: f32 = 4.0;
@@ -280,6 +280,14 @@ fn paint(mode: ThemeMode, cx: &mut App) {
     theme.warning_foreground = hex(p.background);
     theme.warning_hover = alpha(p.warning, 0.88);
     theme.warning_active = alpha(p.warning, 0.76);
+
+    // Everything above writes `theme.colors`, but the kit's own components --
+    // `Dialog`, `Button`, `Switch`, `Root` -- read the resolved copy in
+    // `theme.tokens`. Without this the palette stops at Arca's own widgets and
+    // a kit dialog paints in the bundled theme instead: black on black with a
+    // white primary button.
+    let tokens = ThemeTokens::from(&theme.colors);
+    theme.tokens = tokens;
 }
 
 /// The letters the rest of the desktop is written in.
