@@ -1369,8 +1369,7 @@ impl GpuiShell {
             return false;
         };
         let (x, y) = (f32::from(at.x), f32::from(at.y));
-        // The gutter is still the list: crossing into it is not leaving.
-        y < view.top || y > view.bottom || x < view.left - ROW_GUTTER || x > view.right
+        y < view.top || y > view.bottom || x < view.left || x > view.right
     }
 
     fn scroll_to(&self, view: &ListView, offset: f32) {
@@ -1402,12 +1401,11 @@ impl GpuiShell {
 
     /// Pressing the left button inside the list, which is where a band begins.
     ///
-    /// A band belongs to the empty space around the columns: the gutter the
-    /// table is inset by at either end, whatever the columns leave over on the
-    /// right, and the space under the last row. Pressing the row itself is a
-    /// click or the start of a carry. That is the rule in the Explorer's
-    /// details view, and it is the only one that lets both gestures share a
-    /// button without guessing which was meant.
+    /// A band belongs to the empty space around the columns: whatever the
+    /// columns leave over on the right, and the space under the last row.
+    /// Pressing the row itself is a click or the start of a carry. That is the
+    /// rule in the Explorer's details view, and it is the only one that lets
+    /// both gestures share a button without guessing which was meant.
     fn begin_band(&mut self, at: gpui::Point<gpui::Pixels>, secondary: bool, shift: bool) {
         if !self.background_idle() || shift {
             return;
@@ -1417,7 +1415,7 @@ impl GpuiShell {
             return;
         };
         let (x, y) = (f32::from(at.x), f32::from(at.y));
-        if y < view.top || y > view.bottom || x < view.left - ROW_GUTTER || x > view.right {
+        if y < view.top || y > view.bottom || x < view.left || x > view.right {
             return;
         }
         let anchor = Self::row_under(&view, y, rows.len());
@@ -2208,10 +2206,6 @@ impl GpuiShell {
             .min_h(px(1.))
             .flex()
             .flex_col()
-            // The strip the Explorer keeps before the first column: real empty
-            // space, held back from the columns, so there is somewhere to
-            // start a band even on a line where every row is taken.
-            .pl(px(ROW_GUTTER))
             .child(DataTable::new(&self.table).stripe(false).bordered(false))
             .child(
                 div()
@@ -4412,12 +4406,6 @@ struct ListView {
 /// that appeared first would flash over the rows for the pixel or two between
 /// the two thresholds every time a column was resized.
 const DRAG_SLOP: f32 = 10.0;
-
-/// The strip the table is inset by on the left, which belongs to the band
-/// rather than to the rows, the way the Explorer keeps one before the first
-/// column. The right edge has the scrollbar, so the space left over by the
-/// columns is all there is on that side.
-const ROW_GUTTER: f32 = 16.0;
 
 /// The selection while it is in the air. An empty marker rather than the rows
 /// themselves: what is carried is whatever is picked when it lands, and the
