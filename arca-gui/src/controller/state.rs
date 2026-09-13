@@ -54,7 +54,10 @@ pub(crate) struct AppState {
     // it now carries. Set by every job that rebuilds the file, not just the one
     // that changes its password: a rewrite the window does not reread leaves a
     // list that disagrees with the disk.
-    pub(crate) reread_after: Option<(PathBuf, Option<String>)>,
+    pub(crate) reread_after: Option<(PathBuf, Option<String>, String)>,
+    // The folder to restore after rereading a rewritten archive. It is consumed
+    // by the next listing, so opening an archive normally still starts at root.
+    pub(crate) reread_dir: Option<String>,
     // Where the window has been, so the mouse back and forward buttons have
     // somewhere to go. `here` indexes into it; going somewhere new throws away
     // whatever was ahead, the way a browser does.

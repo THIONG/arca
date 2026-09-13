@@ -8,7 +8,7 @@ pub(crate) use state::AppState;
 use crate::archive_ops::*;
 use crate::model::*;
 use crate::settings::Settings;
-use crate::tree::{children_of, entries_under, kind_of, Row};
+use crate::tree::{children_of, entries_under, kind_of, parent_of, Row};
 use crate::{
     clipboard,
     i18n::{strings, Strings},
@@ -291,6 +291,7 @@ impl AppController {
                 add_password: String::new(),
                 archive_password: None,
                 reread_after: None,
+                reread_dir: None,
                 history: vec![String::new()],
                 here: 0,
                 cursor: None,
@@ -1029,9 +1030,15 @@ impl AppController {
                                 .unwrap_or_default()
                         );
                         self.state.archive = Some(path);
+                        let restore_dir = self.state.reread_dir.take();
                         self.state.history = vec![String::new()];
                         self.state.here = 0;
-                        self.state.current_dir = String::new();
+                        self.state.current_dir = restore_dir
+                            .map(|dir| nearest_existing_dir(&self.state.entries, &dir))
+                            .unwrap_or_default();
+                        if !self.state.current_dir.is_empty() {
+                            self.state.history = vec![self.state.current_dir.clone()];
+                        }
                         self.state.busy = false;
                         close = true;
                     }
@@ -1050,6 +1057,7 @@ impl AppController {
                         finished_ok = true;
                     }
                     Message::Failed(text) => {
+                        self.state.reread_dir = None;
                         // Stopping is not failing. Nothing is wrong with the
                         // archive and there is nothing to report in red: the
                         // rewrite gave up before it swapped anything.
@@ -1103,8 +1111,9 @@ impl AppController {
         // with the password it now carries, so the browse view shows the new
         // state and does not ask for a password it was just handed.
         if finished_ok {
-            if let Some((path, pw)) = self.state.reread_after.take() {
+            if let Some((path, pw, dir)) = self.state.reread_after.take() {
                 let notice = std::mem::take(&mut self.state.notice);
+                self.state.reread_dir = Some(dir);
                 self.open(path);
                 self.state.archive_password = pw;
                 self.state.notice = notice;
@@ -1481,7 +1490,7 @@ impl AppController {
         // showing a listing the archive no longer matched until it was reopened
         // by hand. This list is the jobs that rebuild the file, and it is the
         // same one the undo entry below is built from.
-        self.state.reread_after = reread_target(&job);
+        self.state.reread_after = reread_target(&job, &self.state.current_dir);
         // The ones that build the archive again leave the old one beside it.
         // What is kept here is the word for the change, so that offering to
         // take it back can say what it would be taking back.
@@ -1554,36 +1563,95 @@ impl AppController {
     }
 }
 
-/// Where to look again once `job` has finished, and the password the archive
-/// carries by then.
+/// Where to look again once `job` has finished, the password the archive
+/// carries by then, and the folder to restore after rereading it.
 ///
 /// A job that rebuilds the archive leaves the window listing a file that is no
 /// longer there. Every one of them belongs here; the jobs that only read
 /// (testing, extracting) or write somewhere else (compressing to a new archive,
 /// copying, downloading) do not.
-fn reread_target(job: &Job) -> Option<(PathBuf, Option<String>)> {
+fn reread_target(job: &Job, current_dir: &str) -> Option<(PathBuf, Option<String>, String)> {
     match job {
-        Job::Password { archive, new, .. } => Some((archive.clone(), new.clone())),
+        Job::Password { archive, new, .. } => {
+            Some((archive.clone(), new.clone(), current_dir.to_string()))
+        }
         Job::Delete {
             archive, password, ..
         }
         | Job::Add {
             archive, password, ..
         }
-        | Job::Rename {
-            archive, password, ..
-        }
-        | Job::Move {
-            archive, password, ..
-        }
         | Job::NewFolder {
             archive, password, ..
-        } => Some((archive.clone(), password.clone())),
+        } => Some((archive.clone(), password.clone(), current_dir.to_string())),
+        Job::Rename {
+            archive,
+            from,
+            to,
+            folder,
+            password,
+        } => Some((
+            archive.clone(),
+            password.clone(),
+            renamed_dir(current_dir, from, to, *folder),
+        )),
+        Job::Move {
+            archive,
+            moves,
+            password,
+        } => Some((
+            archive.clone(),
+            password.clone(),
+            moved_name(current_dir, moves),
+        )),
         Job::Extract { .. }
         | Job::Test { .. }
         | Job::CopyTo { .. }
         | Job::Compress { .. }
         | Job::Update { .. } => None,
+    }
+}
+
+fn renamed_dir(current_dir: &str, from: &str, to: &str, folder: bool) -> String {
+    if !folder {
+        return current_dir.to_string();
+    }
+    let current = normalized_dir(current_dir);
+    let from = normalized_dir(from);
+    if current == from || current.starts_with(&from) {
+        return format!(
+            "{}{rest}",
+            normalized_dir(to),
+            rest = &current[from.len()..]
+        );
+    }
+    current
+}
+
+fn normalized_dir(dir: &str) -> String {
+    let dir = dir.replace('\\', "/");
+    let dir = dir.trim_end_matches('/');
+    if dir.is_empty() {
+        String::new()
+    } else {
+        format!("{dir}/")
+    }
+}
+
+fn nearest_existing_dir(entries: &[arca_core::Entry], desired: &str) -> String {
+    let mut dir = normalized_dir(desired);
+    loop {
+        if dir.is_empty() {
+            return dir;
+        }
+        let prefix = dir.trim_end_matches('/');
+        if entries.iter().any(|entry| {
+            let name = entry.name.replace('\\', "/");
+            (entry.is_dir && name.trim_end_matches('/') == prefix) || name.starts_with(&dir)
+        }) {
+            return dir;
+        }
+        dir = parent_of(&dir);
     }
 }
 
@@ -1628,7 +1696,7 @@ mod reread_tests {
         // the clear and must not learn to print itself.
         for (ix, job) in rewrites.iter().enumerate() {
             assert_eq!(
-                reread_target(job).map(|(path, _)| path),
+                reread_target(job, "").map(|(path, _, _)| path),
                 Some(archive()),
                 "job {ix} rewrites the archive and must be reread"
             );
@@ -1646,8 +1714,8 @@ mod reread_tests {
             new: Some("new".into()),
         };
         assert_eq!(
-            reread_target(&job),
-            Some((archive(), Some("new".to_string())))
+            reread_target(&job, "folder/"),
+            Some((archive(), Some("new".to_string()), "folder/".to_string()))
         );
     }
 
@@ -1658,7 +1726,59 @@ mod reread_tests {
             archive: archive(),
             only: None,
         };
-        assert!(reread_target(&job).is_none());
+        assert!(reread_target(&job, "").is_none());
+    }
+
+    #[test]
+    fn rewritten_archive_restores_the_folder_after_a_folder_rename() {
+        assert_eq!(
+            renamed_dir(
+                "Projects/Big Ambitions/Levels/",
+                "Projects/Big Ambitions/",
+                "Projects/Renamed",
+                true
+            ),
+            "Projects/Renamed/Levels/"
+        );
+        assert_eq!(
+            renamed_dir(
+                "Other/",
+                "Projects/Big Ambitions/",
+                "Projects/Renamed",
+                true
+            ),
+            "Other/"
+        );
+    }
+
+    #[test]
+    fn rewritten_archive_restores_the_folder_after_a_move() {
+        assert_eq!(
+            moved_name("Old/Levels/", &[("Old".into(), "New/Old".into())]),
+            "New/Old/Levels/"
+        );
+    }
+
+    #[test]
+    fn deleted_folder_restores_the_nearest_existing_parent() {
+        let entries = vec![arca_core::Entry {
+            name: "kept/file.txt".into(),
+            size: 0,
+            compressed_size: 0,
+            method: arca_core::Method::Store,
+            crc32: 0,
+            is_dir: false,
+            mtime: None,
+            created: None,
+            accessed: None,
+            attributes: 0,
+            offset: 0,
+            raw_name: Vec::new(),
+            utf8: true,
+            encrypted: false,
+        }];
+        assert_eq!(nearest_existing_dir(&entries, "gone/child/"), "");
+        assert_eq!(nearest_existing_dir(&entries, "kept/"), "kept/");
     }
 
     #[test]
