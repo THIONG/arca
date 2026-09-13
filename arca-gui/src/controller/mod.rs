@@ -524,7 +524,7 @@ impl AppController {
             self.state.window_title = if self.state.subject.is_empty() {
                 "Arca".to_string()
             } else {
-                format!("{} — {}", self.state.title, self.state.subject)
+                format!("{} - {}", self.state.title, self.state.subject)
             };
         }
     }
@@ -1024,7 +1024,7 @@ impl AppController {
                         // program puts it, which frees a whole row above the
                         // list for nothing at all.
                         self.state.window_title = format!(
-                            "{} — Arca",
+                            "{} - Arca",
                             path.file_name()
                                 .map(|x| x.to_string_lossy().to_string())
                                 .unwrap_or_default()
