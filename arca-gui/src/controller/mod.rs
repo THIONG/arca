@@ -8,7 +8,7 @@ pub(crate) use state::AppState;
 use crate::archive_ops::*;
 use crate::model::*;
 use crate::settings::Settings;
-use crate::tree::{children_of, entries_under, kind_of, parent_of, Row};
+use crate::tree::{children_of, entries_under, kind_of, parent_of, search_under, Row};
 use crate::{
     clipboard,
     i18n::{strings, Strings},
@@ -1147,13 +1147,28 @@ impl AppController {
     // Files from anywhere outside into the folder the window is showing. Both
     // the paste and the drop end here so they cannot answer the same question
     // two different ways.
+    /// The folder the visible rows are read against: a deep search lists what
+    /// is underneath the folder you are in, so the folder shown beside a row is
+    /// the part below here. Empty at the root and in the flat view, where a
+    /// path is already read from the top.
+    pub(crate) fn row_root(&self) -> &str {
+        if self.state.settings.flat || self.state.filter.trim().is_empty() {
+            ""
+        } else {
+            &self.state.current_dir
+        }
+    }
+
     pub(crate) fn visible_rows(&self) -> Vec<Row> {
         let filter = self.state.filter.trim().to_lowercase();
-        // Flat view: every file in the archive at once, wherever it is filed.
-        // It is how you find something when you know its name and not its
-        // folder, and it is the same list a filter builds, only without one.
-        let flat = self.state.settings.flat && filter.is_empty();
-        let mut rows = if flat {
+        // A search reaches down through the folders, so it starts where you
+        // are: from the root it still walks the whole archive, and inside a
+        // folder it stays under that folder. The flat view is the same list
+        // without a name to look for, and it always starts at the root.
+        let flat = self.state.settings.flat;
+        let mut rows = if !filter.is_empty() {
+            search_under(&self.state.entries, self.row_root(), &filter)
+        } else if flat {
             self.state
                 .entries
                 .iter()
@@ -1184,33 +1199,8 @@ impl AppController {
                     }
                 })
                 .collect()
-        } else if filter.is_empty() {
-            children_of(&self.state.entries, &self.state.current_dir)
         } else {
-            self.state
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| !e.is_dir && e.name.to_lowercase().contains(&filter))
-                .map(|(i, e)| Row {
-                    label: e.name.replace('\\', "/"),
-                    path: e.name.replace('\\', "/"),
-                    kind: kind_of(&e.name, false),
-                    is_dir: false,
-                    entry: Some(i),
-                    size: e.size,
-                    packed: e.compressed_size,
-                    method: e.method.name(),
-                    encrypted: e.encrypted,
-                    count: 0,
-                    mtime: e.mtime,
-                    created: e.created,
-                    accessed: e.accessed,
-                    attributes: e.attributes,
-                    crc32: e.crc32,
-                    up: false,
-                })
-                .collect()
+            children_of(&self.state.entries, &self.state.current_dir)
         };
 
         let (col, asc) = self.state.order;
@@ -1269,7 +1259,10 @@ impl AppController {
         let Some(row) = rows.iter().find(|r| r.path == path) else {
             return;
         };
-        if name == row.label {
+        // Against the name the entry is filed under, not the label, which
+        // carries the folder a search found the row in.
+        let trimmed = row.path.trim_end_matches('/');
+        if name == trimmed.rsplit('/').next().unwrap_or(trimmed) {
             return;
         }
         let s = self.s();
@@ -1789,5 +1782,93 @@ mod reread_tests {
             "Projects/Renamed"
         );
         assert_eq!(rename_destination("file.txt", "new.txt"), "new.txt");
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn entry(name: &str) -> arca_core::Entry {
+        arca_core::Entry {
+            raw_name: name.as_bytes().to_vec(),
+            utf8: true,
+            name: name.to_string(),
+            size: 1,
+            compressed_size: 1,
+            method: arca_core::Method::Store,
+            crc32: 0,
+            is_dir: false,
+            mtime: None,
+            created: None,
+            accessed: None,
+            attributes: 0,
+            offset: 0,
+            encrypted: false,
+        }
+    }
+
+    fn searching(dir: &str, filter: &str) -> Vec<String> {
+        let mut controller = AppController::new(Settings::default());
+        controller.state.entries = vec![
+            entry("Game/_CommonRedist/oalinst.exe"),
+            entry("Game/_CommonRedist/dxwebsetup.exe"),
+            entry("Game/_CommonRedist/DirectX/redist.txt"),
+            entry("Game/Data/level.dat"),
+            entry("Other/redistributable.bin"),
+        ];
+        controller.state.current_dir = dir.to_string();
+        controller.state.filter = filter.to_string();
+        controller
+            .visible_rows()
+            .into_iter()
+            .map(|r| r.label)
+            .collect()
+    }
+
+    /// The folder a row sits in is not part of the name it is matched against:
+    /// matching the whole path made a search for `redist` inside
+    /// `_CommonRedist` answer with every file in the folder. Folders match on
+    /// their own name too, and are answered with.
+    #[test]
+    fn a_search_matches_names_and_answers_with_folders_too() {
+        assert_eq!(
+            searching("", "redist"),
+            vec![
+                // The folder first, the way the list always sorts.
+                "Game/_CommonRedist",
+                "Game/_CommonRedist/DirectX/redist.txt",
+                "Other/redistributable.bin",
+            ]
+        );
+    }
+
+    /// A hit is named by the path from the folder being searched down, so it
+    /// says which folder it came out of without repeating the way back to the
+    /// root of the archive.
+    #[test]
+    fn a_hit_is_named_from_the_folder_being_searched_down() {
+        assert_eq!(
+            searching("Game/_CommonRedist/", "redist"),
+            vec!["DirectX/redist.txt"]
+        );
+    }
+
+    /// From the root a search reaches the whole archive; from a folder it stays
+    /// under that folder.
+    #[test]
+    fn a_search_is_deep_but_stays_under_the_folder_it_starts_in() {
+        assert_eq!(
+            searching("", "exe"),
+            vec![
+                "Game/_CommonRedist/dxwebsetup.exe",
+                "Game/_CommonRedist/oalinst.exe",
+            ]
+        );
+        assert_eq!(
+            searching("Game/Data/", "exe"),
+            Vec::<String>::new(),
+            "a search inside one folder does not reach into another"
+        );
     }
 }

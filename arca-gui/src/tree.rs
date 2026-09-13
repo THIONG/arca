@@ -137,6 +137,100 @@ pub fn children_of(entries: &[Entry], dir: &str) -> Vec<Row> {
     rows
 }
 
+/// The leaf of a path: the name at the end, without the folders in front.
+fn leaf_of(path: &str) -> &str {
+    let path = path.trim_end_matches('/');
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Everything underneath `dir`, at any depth, whose own name contains
+/// `needle`, which is expected folded to lowercase already.
+///
+/// A search reaches down through the folders, so it answers with folders as
+/// well as files, and it names a row by the path from `dir` down: the leaf
+/// alone would not say which of five folders the hit came out of, and the
+/// whole path would repeat the way back to the archive root on every row.
+/// Only the leaf is matched -- matching the path made a search for `redist`
+/// inside `_CommonRedist` answer with every file in the folder.
+pub fn search_under(entries: &[Entry], dir: &str, needle: &str) -> Vec<Row> {
+    let mut folders: BTreeMap<String, (u64, u64, usize)> = BTreeMap::new();
+    let mut files: Vec<Row> = Vec::new();
+
+    for (i, e) in entries.iter().enumerate() {
+        let full = normalized(e);
+        let Some(rest) = full.strip_prefix(dir) else {
+            continue;
+        };
+        let rest = rest.trim_end_matches('/').to_string();
+        if rest.is_empty() {
+            continue;
+        }
+        // Every folder on the way down, whether or not the archive ever wrote
+        // an entry of its own for it, and what it holds adds up as we pass.
+        let mut at = 0;
+        while let Some(cut) = rest[at..].find('/') {
+            let end = at + cut;
+            let slot = folders.entry(rest[..end].to_string()).or_insert((0, 0, 0));
+            if !e.is_dir {
+                slot.0 += e.size;
+                slot.1 += e.compressed_size;
+                slot.2 += 1;
+            }
+            at = end + 1;
+        }
+        if e.is_dir {
+            folders.entry(rest).or_insert((0, 0, 0));
+            continue;
+        }
+        if !rest[at..].to_lowercase().contains(needle) {
+            continue;
+        }
+        files.push(Row {
+            kind: kind_of(&rest[at..], false),
+            label: rest,
+            path: full,
+            is_dir: false,
+            entry: Some(i),
+            size: e.size,
+            packed: e.compressed_size,
+            method: e.method.name(),
+            encrypted: e.encrypted,
+            count: 0,
+            mtime: e.mtime,
+            created: e.created,
+            accessed: e.accessed,
+            attributes: e.attributes,
+            crc32: e.crc32,
+            up: false,
+        });
+    }
+
+    let mut rows: Vec<Row> = folders
+        .into_iter()
+        .filter(|(rel, _)| leaf_of(rel).to_lowercase().contains(needle))
+        .map(|(rel, (size, packed, count))| Row {
+            path: format!("{dir}{rel}/"),
+            label: rel,
+            kind: Kind::Dir,
+            is_dir: true,
+            entry: None,
+            size,
+            packed,
+            method: "",
+            encrypted: false,
+            mtime: None,
+            created: None,
+            accessed: None,
+            attributes: 0,
+            crc32: 0,
+            count,
+            up: false,
+        })
+        .collect();
+    rows.append(&mut files);
+    rows
+}
+
 pub fn entries_under(entries: &[Entry], prefix: &str) -> Vec<usize> {
     entries
         .iter()

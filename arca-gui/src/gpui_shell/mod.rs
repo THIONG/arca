@@ -324,6 +324,7 @@ impl GpuiShell {
                 FileTable {
                     shell: owner.clone(),
                     rows: Vec::new(),
+                    root: String::new(),
                     columns: Vec::new(),
                     widths: Settings::default_widths(),
                     checked: Vec::new(),
@@ -1188,7 +1189,11 @@ impl GpuiShell {
         if self.controller.state.format != super::Format::Zip {
             return;
         }
-        let label = row.label.clone();
+        // The name on its own, never the path the row is labelled with while a
+        // search is showing where each hit came from: a rename takes a name,
+        // and a name with a folder in it is refused.
+        let trimmed = row.path.trim_end_matches('/');
+        let label = trimmed.rsplit('/').next().unwrap_or(trimmed).to_string();
         self.controller.state.renaming = Some((row.path.clone(), label.clone()));
         self.rename_input.update(cx, |state, cx| {
             state.set_value(label, window, cx);
@@ -1960,6 +1965,7 @@ impl GpuiShell {
         let strings = self.controller.s();
         let idle = self.background_idle();
         let writable = self.controller.state.format == super::Format::Zip;
+        let root = self.controller.row_root().to_string();
         let rows = rows.to_vec();
         self.table.update(cx, |state, cx| {
             let delegate = state.delegate_mut();
@@ -1968,6 +1974,7 @@ impl GpuiShell {
             // widths, so only rebuild when the column layout actually changed.
             let layout_changed = delegate.columns != columns || delegate.widths != widths;
             delegate.rows = rows;
+            delegate.root = root;
             delegate.columns = columns;
             delegate.widths = widths;
             delegate.checked = checked;
@@ -2017,8 +2024,10 @@ impl GpuiShell {
 /// What a row says under a column.
 ///
 /// A free function rather than a method: the table's delegate draws the cells
-/// and it has the strings but not the shell.
-fn column_text(row: &super::Row, column: SortColumn, s: &'static Strings) -> String {
+/// and it has the strings but not the shell. `root` is the folder the list is
+/// read from, so a searched row says where it is below that folder rather than
+/// repeating the way back to the archive root.
+fn column_text(row: &super::Row, column: SortColumn, s: &'static Strings, root: &str) -> String {
     {
         match column {
             SortColumn::Name => row.label.clone(),
@@ -2046,7 +2055,14 @@ fn column_text(row: &super::Row, column: SortColumn, s: &'static Strings) -> Str
                 }
             }
             SortColumn::Type => arca_icons::cache_key(&row.label, row.is_dir),
-            SortColumn::Path => super::folder_of(&row.path).to_string(),
+            SortColumn::Path => {
+                let folder = super::folder_of(&row.path);
+                folder
+                    .strip_prefix(root.trim_end_matches('/'))
+                    .map(|rest| rest.trim_start_matches('/'))
+                    .unwrap_or(folder)
+                    .to_string()
+            }
         }
     }
 }
@@ -4555,6 +4571,8 @@ impl Render for DragPreview {
 struct FileTable {
     shell: WeakEntity<GpuiShell>,
     rows: Vec<super::Row>,
+    /// The folder the rows are read from, so a path is shown from here down.
+    root: String,
     columns: Vec<SortColumn>,
     widths: Vec<f32>,
     checked: Vec<bool>,
@@ -4700,7 +4718,7 @@ impl TableDelegate for FileTable {
                 .aria_column_index(col_ix + 1)
                 .text_sm()
                 .text_color(ink)
-                .child(column_text(row, column, self.strings));
+                .child(column_text(row, column, self.strings, &self.root));
         }
         let (icon, color) = GpuiShell::kind_icon(row.kind);
         let icon = div()
@@ -4773,7 +4791,10 @@ impl TableDelegate for FileTable {
         let mut description = format!("{} {}", s.col_name, row.label);
         for column in self.columns.iter().copied().skip(1) {
             let label = Columns::label(column, s);
-            description.push_str(&format!("; {label} {}", column_text(&row, column, s)));
+            description.push_str(&format!(
+                "; {label} {}",
+                column_text(&row, column, s, &self.root)
+            ));
         }
         description.push_str("; ");
         description.push_str(if checked { s.checked } else { s.not_checked });
@@ -4915,7 +4936,7 @@ impl TableDelegate for FileTable {
 
     fn cell_text(&self, row_ix: usize, col_ix: usize, _: &App) -> String {
         match (self.rows.get(row_ix), self.columns.get(col_ix).copied()) {
-            (Some(row), Some(column)) => column_text(row, column, self.strings),
+            (Some(row), Some(column)) => column_text(row, column, self.strings, &self.root),
             _ => String::new(),
         }
     }
@@ -5359,5 +5380,44 @@ mod tests {
             assert_eq!(empty_state_aria_label(true, "", s), s.cannot_open);
             assert_ne!(s.empty_folder, s.cannot_open);
         }
+    }
+
+    #[test]
+    fn a_searched_row_says_where_it_is_below_the_folder_searched() {
+        let row = crate::Row {
+            label: "redist.txt".to_string(),
+            path: "Game/_CommonRedist/DirectX/redist.txt".to_string(),
+            kind: crate::tree::Kind::Text,
+            is_dir: false,
+            entry: Some(0),
+            size: 1,
+            packed: 1,
+            method: "deflate",
+            encrypted: false,
+            count: 0,
+            mtime: None,
+            created: None,
+            accessed: None,
+            attributes: 0,
+            crc32: 0,
+            up: false,
+        };
+        let s = super::super::strings(super::super::Lang::En);
+        // Searching from a folder: the way back to the archive root is already
+        // in the breadcrumbs and does not need repeating on every row.
+        assert_eq!(
+            column_text(&row, SortColumn::Path, s, "Game/_CommonRedist/"),
+            "DirectX"
+        );
+        // A hit sitting directly in the folder being searched has nothing to add.
+        assert_eq!(
+            column_text(&row, SortColumn::Path, s, "Game/_CommonRedist/DirectX/"),
+            ""
+        );
+        // The flat view reads from the top, so it keeps the whole folder.
+        assert_eq!(
+            column_text(&row, SortColumn::Path, s, ""),
+            "Game/_CommonRedist/DirectX"
+        );
     }
 }
