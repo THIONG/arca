@@ -370,7 +370,6 @@ impl GpuiShell {
                         shell.controller.state.cursor = Some(*row);
                         cx.notify();
                     }
-                    TableEvent::DoubleClickedRow(row) => shell.open_row(*row, cx),
                     // Written when the kit says the pull is over, so dragging an
                     // edge across the window is not a stream of writes to disk.
                     TableEvent::ColumnWidthsChanged(widths) => {
@@ -1850,24 +1849,6 @@ impl GpuiShell {
             .iter()
             .position(|(candidate, _)| *candidate == column)
             .map_or(0, |index| index + 1)
-    }
-
-    /// Opening what a row stands for: a folder is walked into, a file is handed
-    /// to whatever opens it.
-    fn open_row(&mut self, index: usize, cx: &mut Context<Self>) {
-        if !self.background_idle() {
-            return;
-        }
-        let Some(row) = self.controller.visible_rows().get(index).cloned() else {
-            return;
-        };
-        if row.is_dir {
-            self.controller.dispatch(AppAction::Navigate(row.path));
-            self.route_changed(cx);
-        } else if let Some(entry) = row.entry {
-            self.controller.dispatch(AppAction::OpenFile(entry));
-        }
-        cx.notify();
     }
 
     /// The widths the kit ended a pull with, kept where the rest of the window
