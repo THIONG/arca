@@ -63,9 +63,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # `windows/arca-shell` is outside the workspace and has a target directory
+      # of its own, which the default configuration does not cache: without this
+      # it rebuilt the `windows` crate on every run.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          workspaces: |
+            . -> target
+            windows/arca-shell -> target
 
       - name: Window dependencies
         if: matrix.os == 'ubuntu-latest'
@@ -75,13 +81,15 @@ jobs:
           libxi-dev libgl1-mesa-dev libxcursor-dev libxinerama-dev
           libfontconfig1-dev
 
+      # No `--target` here on purpose. It used to say
+      # `--target x86_64-pc-windows-msvc` on Windows, which is the host triple
+      # anyway, and it moved the artifacts to `target/<triple>/release`, where
+      # the cache did not keep them: the job restored its cache and then rebuilt
+      # all 381 crates, seven and a half minutes, on every run. Linux and macOS
+      # rebuilt eight.
       - name: Build release binaries
-        if: matrix.os != 'windows-latest'
         run: cargo build --release
 
-      - name: Build Windows release binaries
-        if: matrix.os == 'windows-latest'
-        run: cargo build --release --target x86_64-pc-windows-msvc
       - name: Shell extension
         if: matrix.os == 'windows-latest'
         working-directory: windows/arca-shell
