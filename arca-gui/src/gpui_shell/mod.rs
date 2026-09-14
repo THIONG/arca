@@ -2495,7 +2495,7 @@ impl Render for GpuiShell {
             cx,
             "password",
             Icon::empty().path("icons/lock.svg"),
-            format!("{} / {}", s.set_password, s.remove_password),
+            s.password_action.to_string(),
             password_available,
         );
         toolbar = toolbar.child(password.on_click(cx.listener(|this, _, _, cx| {
