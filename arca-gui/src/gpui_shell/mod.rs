@@ -697,7 +697,28 @@ impl GpuiShell {
                             // not a child of the one being shown.
                             let target = entry.item().id.to_string();
                             let shell = dropping.clone();
+                            // The same pull a folder row of the list takes:
+                            // into another folder it is a move, out of the
+                            // window it is arca-drag's lazy extraction. The
+                            // root is the archive itself and has nowhere to go.
+                            let carrier = dropping.clone();
+                            let from = entry.item().id.to_string();
+                            let carried = entry.item().label.clone();
                             ListItem::new(entry.item().id.clone())
+                                .when(!from.is_empty(), |item| {
+                                    item.on_drag(DraggedRows, move |_, offset, _, app| {
+                                        let preview = DragPreview {
+                                            label: carried.to_string(),
+                                            extra: 0,
+                                            offset,
+                                        };
+                                        let _ = carrier.update(app, |shell, _| {
+                                            shell.controller.pick_folder(&from);
+                                            shell.carrying = true;
+                                        });
+                                        app.new(|_| preview)
+                                    })
+                                })
                                 // What is under the pointer is what it lands in,
                                 // and without saying so the whole gesture is a
                                 // guess until the archive has been rewritten.
@@ -1610,8 +1631,12 @@ impl GpuiShell {
         let (x, y) = (f32::from(at.x), f32::from(at.y));
         // The sidebar sits to the left of the list and its folders take a drop,
         // so crossing onto it is not leaving the archive: on that side only the
-        // window's own edge is.
-        y < view.top || y > view.bottom || x < 0.0 || x > view.right
+        // window's own edge is. Its rows also start above the list's, which a
+        // pull begun in the tree would otherwise cross on its first move.
+        if x >= 0.0 && x < view.left {
+            return false;
+        }
+        y < view.top || y > view.bottom || x > view.right
     }
 
     fn scroll_to(&self, view: &ListView, offset: f32) {
