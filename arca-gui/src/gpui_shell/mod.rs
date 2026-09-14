@@ -4349,8 +4349,21 @@ fn build_dialog(
                 .footer(
                     footer.child(
                         DialogAction::new().child(
+                            // Three questions reach this box, and the button
+                            // has to say which one it is answering. "Start"
+                            // answered none of them: nothing starts, the
+                            // archive opens -- and when the password being
+                            // asked for is the one the archive already has,
+                            // pressing this only brings up the second half of
+                            // the question.
                             Button::new("password-submit")
-                                .label(if setting { s.set_password } else { s.start })
+                                .label(if setting {
+                                    s.set_password
+                                } else if opening {
+                                    s.open_word
+                                } else {
+                                    s.continue_word
+                                })
                                 .primary(),
                         ),
                     ),
