@@ -124,8 +124,8 @@ struct GpuiShell {
     dialog_primary_focus: FocusHandle,
     dialog_cancel_focus: FocusHandle,
     add_start_focus: FocusHandle,
-    /// The eleven controls of the settings dialog, in the order they are drawn.
-    /// One vector rather than eleven fields because every one of them is the
+    /// The twelve controls of the settings dialog, in the order they are drawn.
+    /// One vector rather than twelve fields because every one of them is the
     /// same thing -- a row in a list of preferences -- and `SettingsControl`
     /// already says which is which.
     settings_focus: Vec<FocusHandle>,
@@ -284,8 +284,8 @@ fn row_action_icon(action: RowAction) -> Option<Icon> {
 }
 
 /// A control in the settings dialog whose choices are named rather than
-/// listed: the language, the theme, and the switch that extracts into a
-/// subfolder. The settings that pick a value out of a list go through `pick`
+/// listed: the language, the theme, and the switches for updates and
+/// extraction. The settings that pick a value out of a list go through `pick`
 /// and need no name of their own.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsControl {
@@ -295,17 +295,19 @@ enum SettingsControl {
     ThemeSystem,
     ThemeLight,
     ThemeDark,
+    Updates,
     Subfolder,
 }
 
 impl SettingsControl {
-    const ALL: [SettingsControl; 7] = [
+    const ALL: [SettingsControl; 8] = [
         SettingsControl::LangSystem,
         SettingsControl::LangEn,
         SettingsControl::LangEs,
         SettingsControl::ThemeSystem,
         SettingsControl::ThemeLight,
         SettingsControl::ThemeDark,
+        SettingsControl::Updates,
         SettingsControl::Subfolder,
     ];
 }
@@ -1251,6 +1253,10 @@ impl GpuiShell {
                 self.set_theme(super::ThemePreference::Light, window, cx)
             }
             SettingsControl::ThemeDark => self.set_theme(super::ThemePreference::Dark, window, cx),
+            SettingsControl::Updates => {
+                self.controller.state.settings.updates = !self.controller.state.settings.updates;
+                self.controller.state.settings.save();
+            }
             SettingsControl::Subfolder => {
                 self.controller.state.into_subfolder = !self.controller.state.into_subfolder;
             }
@@ -2766,6 +2772,7 @@ impl Render for GpuiShell {
             .update
             .as_ref()
             .map(|release| fill(s.update_ready, &[("version", &release.tag)]));
+        let has_update = release.is_some();
         let flat_view = self.controller.state.settings.flat;
         let visible_columns = Columns::ALL
             .iter()
@@ -2848,8 +2855,16 @@ impl Render for GpuiShell {
             .disabled(!idle)
             .dropdown_menu(move |menu, window, popup_cx| {
                 let mut menu = menu;
+                if let Some(label) = release.clone() {
+                    menu = menu
+                        .item(Self::popup_action(
+                            owner.clone(),
+                            label,
+                            OverflowAction::Release,
+                        ))
+                        .separator();
+                }
                 let archive_owner = owner.clone();
-                let archive_release = release.clone();
                 menu = menu.submenu_with_icon(
                     Some(Icon::new(IconName::Inbox)),
                     s.archive_group,
@@ -2862,7 +2877,7 @@ impl Render for GpuiShell {
                         let folder_owner = archive_owner.clone();
                         let undo_owner = archive_owner.clone();
                         let save_owner = archive_owner.clone();
-                        let mut submenu = submenu
+                        submenu
                             .item(
                                 PopupMenuItem::new(s.test_word)
                                     .disabled(!has_archive)
@@ -2924,16 +2939,7 @@ impl Render for GpuiShell {
                                     OverflowAction::SaveCopy,
                                 )
                                 .disabled(!has_archive),
-                            );
-                        if let Some(label) = archive_release.clone() {
-                            let release_owner = archive_owner.clone();
-                            submenu = submenu.item(Self::popup_action(
-                                release_owner,
-                                label,
-                                OverflowAction::Release,
-                            ));
-                        }
-                        submenu
+                            )
                     },
                 );
 
@@ -3139,7 +3145,20 @@ impl Render for GpuiShell {
                     cx.notify();
                 });
             });
-        toolbar = toolbar.child(settings).child(overflow);
+        let update_indicator = if has_update {
+            div()
+                .id("update-indicator")
+                .size(px(6.))
+                .flex_none()
+                .rounded_full()
+                .bg(cx.theme().accent)
+        } else {
+            div().id("update-indicator").size_0()
+        };
+        toolbar = toolbar
+            .child(settings)
+            .child(overflow)
+            .child(update_indicator);
 
         // The filter sits at the far end of the bar, the way a search field
         // does in every file manager on the desktop, instead of stretching
@@ -4681,6 +4700,7 @@ fn build_dialog(
                 .map(|(page, _, label)| (*page, *label))
                 .collect::<Vec<_>>();
             let subfolder_on = shell.read(cx).controller.state.into_subfolder;
+            let updates_on = shell.read(cx).controller.state.settings.updates;
             let muted = cx.theme().muted_foreground;
             // Radios rather than a row of buttons where one looks pressed:
             // these are one-of-three choices, and the kit's radio says so to
@@ -4738,6 +4758,18 @@ fn build_dialog(
                     .child(div().w(px(110.)).flex_none().child(label))
                     .child(control)
             };
+            let updates = {
+                let weak = weak.clone();
+                Switch::new("settings-updates")
+                    .label(s.check_updates)
+                    .checked(updates_on)
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.settings_activate(SettingsControl::Updates, window, cx);
+                            cx.notify();
+                        });
+                    })
+            };
             let subfolder = {
                 let weak = weak.clone();
                 Switch::new("settings-subfolder")
@@ -4784,6 +4816,7 @@ fn build_dialog(
                             codec_pick("settings-codec", shell, &weak, is_zip, cx),
                         ))
                         .child(row(s.level, level_pick("settings-level", shell, &weak, cx)))
+                        .child(updates)
                         .child(subfolder),
                 )
         }
