@@ -334,8 +334,6 @@ impl AppController {
                 cut_names: HashSet::new(),
                 confirm_drop: None,
                 renaming: None,
-                default_password: None,
-                asking_default_password: false,
                 asking_folder: false,
                 undo: None,
                 update: None,

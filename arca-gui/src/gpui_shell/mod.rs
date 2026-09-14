@@ -320,7 +320,6 @@ enum ModalKind {
     Viewer,
     NewFolder,
     Mask,
-    DefaultPassword,
     Settings,
     Shortcuts,
 }
@@ -1063,10 +1062,6 @@ impl GpuiShell {
             ModalKind::Add => self.controller.state.view = View::Browse,
             ModalKind::Viewer => self.controller.state.viewing = None,
             ModalKind::NewFolder | ModalKind::Mask => self.close_name(),
-            ModalKind::DefaultPassword => {
-                self.controller.state.asking_default_password = false;
-                self.controller.state.password_input.clear();
-            }
             ModalKind::Settings => self.controller.state.show_settings = false,
             ModalKind::Shortcuts => self.controller.state.show_shortcuts = false,
         }
@@ -1083,7 +1078,6 @@ impl GpuiShell {
                 | ModalKind::Drop
                 | ModalKind::Shortcuts
                 | ModalKind::Password
-                | ModalKind::DefaultPassword
                 | ModalKind::NewFolder
                 | ModalKind::Mask
                 | ModalKind::Settings
@@ -1098,9 +1092,7 @@ impl GpuiShell {
     /// and the first keystroke lost.
     fn modal_text_field(&self, kind: ModalKind, cx: &App) -> Option<FocusHandle> {
         match kind {
-            ModalKind::Password | ModalKind::DefaultPassword => {
-                Some(self.password.read(cx).focus_handle(cx).clone())
-            }
+            ModalKind::Password => Some(self.password.read(cx).focus_handle(cx).clone()),
             ModalKind::NewFolder | ModalKind::Mask => {
                 Some(self.name_input.read(cx).focus_handle(cx).clone())
             }
@@ -1131,7 +1123,7 @@ impl GpuiShell {
             // Every password box opens hidden, whatever the last one that was
             // open was left showing.
             match kind {
-                ModalKind::Password | ModalKind::DefaultPassword => self
+                ModalKind::Password => self
                     .password
                     .update(cx, |input, cx| input.set_masked(true, window, cx)),
                 ModalKind::Add => self
@@ -1171,8 +1163,6 @@ impl GpuiShell {
             Some(ModalKind::NewFolder)
         } else if self.controller.state.picking_group.is_some() {
             Some(ModalKind::Mask)
-        } else if self.controller.state.asking_default_password {
-            Some(ModalKind::DefaultPassword)
         } else if self.controller.state.show_settings {
             Some(ModalKind::Settings)
         } else if self.controller.state.show_shortcuts {
@@ -1219,7 +1209,6 @@ impl GpuiShell {
             Some(ModalKind::NewFolder | ModalKind::Mask) => {
                 self.name_input.read(cx).focus_handle(cx).clone()
             }
-            Some(ModalKind::DefaultPassword) => self.password.read(cx).focus_handle(cx).clone(),
             Some(ModalKind::Settings) => self.settings_focus[0].clone(),
             Some(ModalKind::Shortcuts) => self.dialog_cancel_focus.clone(),
             None => match self.dialog_return_focus.clone() {
@@ -1312,10 +1301,6 @@ impl GpuiShell {
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from("."));
                 self.begin_dialog(DialogKind::SaveCopy { name, directory }, cx);
-            }
-            OverflowAction::DefaultPassword => {
-                self.controller.state.password_input.clear();
-                self.controller.state.asking_default_password = true;
             }
         }
     }
@@ -1476,26 +1461,6 @@ impl GpuiShell {
             _ => self.close_name(),
         }
         cx.notify();
-    }
-
-    /// The password to try on anything that asks for one, so a folder full of
-    /// archives locked with the same word is opened once and not fifteen
-    /// times. In memory and nowhere else: a password in plain text beside the
-    /// theme and the column widths is how an encrypted archive stops being
-    /// encrypted.
-    fn keep_default_password(&mut self) {
-        let given = std::mem::take(&mut self.controller.state.password_input);
-        self.controller.state.default_password = (!given.is_empty()).then_some(given);
-        self.controller.state.asking_default_password = false;
-    }
-
-    fn forget_default_password(&mut self) {
-        let s = self.controller.s();
-        self.controller.state.default_password = None;
-        self.controller.state.asking_default_password = false;
-        self.controller.state.password_input.clear();
-        self.controller.state.notice = s.password_forgotten.to_string();
-        self.controller.state.error = false;
     }
 
     fn start_add(&mut self, cx: &mut Context<Self>) {
@@ -1964,10 +1929,6 @@ impl GpuiShell {
             // One step back from the last change to the archive, which is the
             // step anybody wants: the one they just took by mistake.
             Shortcut::Undo if self.controller.state.undo.is_some() => self.controller.undo_last(),
-            Shortcut::DefaultPassword => {
-                self.controller.state.password_input.clear();
-                self.controller.state.asking_default_password = true;
-            }
             Shortcut::Rename if archive.is_some() => {
                 let cursor = self.controller.state.cursor;
                 let rows = self.controller.visible_rows();
@@ -2640,13 +2601,7 @@ impl Render for GpuiShell {
         let add_password_value = self.controller.state.add_password.clone();
         self.password.update(cx, |input, cx| {
             input.set_placeholder(s.password_word, window, cx);
-            input.set_disabled(
-                !matches!(
-                    modal,
-                    Some(ModalKind::Password | ModalKind::DefaultPassword)
-                ),
-                cx,
-            );
+            input.set_disabled(!matches!(modal, Some(ModalKind::Password)), cx);
             if input.value() != password_value.as_str() {
                 input.set_value(password_value.clone(), window, cx);
             }
@@ -2902,7 +2857,6 @@ impl Render for GpuiShell {
                         let folder_owner = archive_owner.clone();
                         let undo_owner = archive_owner.clone();
                         let save_owner = archive_owner.clone();
-                        let password_owner = archive_owner.clone();
                         let mut submenu = submenu
                             .item(
                                 PopupMenuItem::new(s.test_word)
@@ -2965,14 +2919,6 @@ impl Render for GpuiShell {
                                     OverflowAction::SaveCopy,
                                 )
                                 .disabled(!has_archive),
-                            )
-                            .item(
-                                Self::popup_action(
-                                    password_owner,
-                                    s.default_password,
-                                    OverflowAction::DefaultPassword,
-                                )
-                                .disabled(!idle),
                             );
                         if let Some(label) = archive_release.clone() {
                             let release_owner = archive_owner.clone();
@@ -4280,7 +4226,7 @@ fn build_dialog(
             // Keystrokes, not printed key names: the kit spells each one the
             // way the platform does, so the window stops claiming Supr on a
             // keyboard whose key says Delete.
-            let left: [(&[&str], &str); 17] = [
+            let left: [(&[&str], &str); 16] = [
                 (&["ctrl-o"], s.open),
                 (&["ctrl-n"], s.compress),
                 (&["ctrl-e"], s.extract_all),
@@ -4290,7 +4236,6 @@ fn build_dialog(
                 (&["f5"], s.refresh_word),
                 (&["ctrl-f"], s.find_word),
                 (&["ctrl-z"], s.undo_word),
-                (&["ctrl-p"], s.default_password),
                 (&["ctrl-a"], s.select_all),
                 (&["ctrl-i"], s.invert_selection),
                 (&["escape"], s.clear_selection),
@@ -4368,33 +4313,13 @@ fn build_dialog(
                     .iter()
                     .any(|entry| entry.encrypted);
             let field = shell.read(cx).password.clone();
-            // The one kept for this window, offered rather than filled in: a
-            // password put on an archive by accident costs a full rewrite to
-            // take off again. Offered to all three questions, which is what it
-            // is for: a folder of archives locked with the same word is typed
-            // once whether they are being opened, unlocked or locked again.
-            let default_password = shell.read(cx).controller.state.default_password.clone();
             let submit = weak.clone();
             let remove = weak.clone();
-            let fill_default = weak.clone();
-            let mut box_ = div()
+            let box_ = div()
                 .flex()
                 .flex_col()
                 .gap_2()
                 .child(Input::new(&field).mask_toggle());
-            if let Some(kept) = default_password {
-                box_ = box_.child(
-                    Button::new("password-use-default")
-                        .label(s.use_default_password)
-                        .ghost()
-                        .on_click(move |_, _, cx| {
-                            let _ = fill_default.update(cx, |this, cx| {
-                                this.controller.state.password_input = kept.clone();
-                                cx.notify();
-                            });
-                        }),
-                );
-            }
             let mut footer = DialogFooter::new().child(cancel_button("password-cancel", s.cancel));
             if removable {
                 footer = footer.child(
@@ -4446,51 +4371,6 @@ fn build_dialog(
                     close
                 })
         }
-        ModalKind::DefaultPassword => {
-            let field = shell.read(cx).password.clone();
-            let keep = weak.clone();
-            let forget = weak.clone();
-            let muted = cx.theme().muted_foreground;
-            dialog
-                .title(s.default_password)
-                .child(DialogDescription::new().child(s.password_hint))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(Input::new(&field).mask_toggle())
-                        .child(div().text_xs().text_color(muted).child(s.password_kept)),
-                )
-                .footer(
-                    DialogFooter::new()
-                        .child(cancel_button("default-password-cancel", s.cancel))
-                        .child(
-                            Button::new("default-password-forget")
-                                .label(s.remove_password)
-                                .on_click(move |_, _, cx| {
-                                    let _ = forget.update(cx, |this, cx| {
-                                        this.forget_default_password();
-                                        cx.notify();
-                                    });
-                                }),
-                        )
-                        .child(
-                            DialogAction::new().child(
-                                Button::new("default-password-keep")
-                                    .label(s.start)
-                                    .primary(),
-                            ),
-                        ),
-                )
-                .on_ok(move |_, _, cx| {
-                    let _ = keep.update(cx, |this, cx| {
-                        this.keep_default_password();
-                        cx.notify();
-                    });
-                    true
-                })
-        }
         ModalKind::Add => {
             let is_zip = shell.read(cx).controller.state.format == super::Format::Zip;
             let count = shell.read(cx).controller.state.pending_inputs.len();
@@ -4533,25 +4413,7 @@ fn build_dialog(
                         .child(labelled(s.level, level_pick("add-level", shell, &weak, cx))),
                 );
             if is_zip {
-                let mut row = div()
-                    .flex()
-                    .gap_2()
-                    .child(Input::new(&add_password).mask_toggle());
-                if let Some(kept) = shell.read(cx).controller.state.default_password.clone() {
-                    let fill_default = weak.clone();
-                    row = row.child(
-                        Button::new("add-use-default-password")
-                            .label(s.use_default_password)
-                            .ghost()
-                            .on_click(move |_, _, cx| {
-                                let _ = fill_default.update(cx, |this, cx| {
-                                    this.controller.state.add_password = kept.clone();
-                                    cx.notify();
-                                });
-                            }),
-                    );
-                }
-                body = body.child(row);
+                body = body.child(Input::new(&add_password).mask_toggle());
             }
             // One button with two entries under it, because Windows has two
             // dialogs: one picks files, the other picks folders, and neither
@@ -5057,7 +4919,6 @@ enum OverflowAction {
     NewFolder,
     Undo,
     SaveCopy,
-    DefaultPassword,
 }
 
 /// A selection being drawn by pulling across the list.
@@ -5592,7 +5453,6 @@ enum Shortcut {
     CopyNames,
     Shortcuts,
     Undo,
-    DefaultPassword,
     Rename,
     View,
     /// A mask that picks names, or one that drops them.
@@ -5622,7 +5482,6 @@ fn shortcut_for(
             "t" => Some(Shortcut::Test),
             "i" => Some(Shortcut::Invert),
             "z" => Some(Shortcut::Undo),
-            "p" => Some(Shortcut::DefaultPassword),
             _ => None,
         };
     }

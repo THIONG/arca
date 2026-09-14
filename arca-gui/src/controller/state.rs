@@ -74,10 +74,6 @@ pub(crate) struct AppState {
     // path rather than by row number so that sorting or filtering underneath a
     // half typed name cannot move the box onto somebody else's row.
     pub(crate) renaming: Option<(String, String)>,
-    // One password to try before asking, for a folder of archives all locked
-    // with the same word. Never written anywhere: see `default_password_window`.
-    pub(crate) default_password: Option<String>,
-    pub(crate) asking_default_password: bool,
     // Set while the box that asks for a new folder's name is up.
     pub(crate) asking_folder: bool,
     // The archive that has a previous version kept beside it, and the word for
