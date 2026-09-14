@@ -142,7 +142,6 @@ pub struct Strings {
     pub password_optional: &'static str,
     pub password_needed: &'static str,
     pub password_hint: &'static str,
-    pub show_password: &'static str,
     pub set_password: &'static str,
     pub remove_password: &'static str,
     pub password_action: &'static str,
@@ -206,7 +205,6 @@ pub struct Strings {
     pub ascending: &'static str,
     pub descending: &'static str,
     pub not_checked: &'static str,
-    pub hide_word: &'static str,
     pub working_word: &'static str,
 }
 
@@ -318,7 +316,6 @@ const EN: Strings = Strings {
     password_optional: "Password (optional, AES-256)",
     password_needed: "This archive is encrypted",
     password_hint: "Type the password to open it",
-    show_password: "Show",
     set_password: "Set password…",
     remove_password: "Remove password",
     password_action: "Set/Remove Password",
@@ -379,7 +376,6 @@ const EN: Strings = Strings {
     ascending: "ascending",
     descending: "descending",
     not_checked: "not checked",
-    hide_word: "Hide",
     working_word: "Working",
 };
 
@@ -491,7 +487,6 @@ const ES: Strings = Strings {
     password_optional: "Contraseña (opcional, AES-256)",
     password_needed: "Este archivo está cifrado",
     password_hint: "Escribe la contraseña para abrirlo",
-    show_password: "Ver",
     set_password: "Poner contraseña…",
     remove_password: "Quitar contraseña",
     password_action: "Poner/Quitar contraseña",
@@ -552,7 +547,6 @@ const ES: Strings = Strings {
     ascending: "ascendente",
     descending: "descendente",
     not_checked: "sin marcar",
-    hide_word: "Ocultar",
     working_word: "Trabajando",
 };
 

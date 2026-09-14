@@ -45,7 +45,6 @@ pub(crate) struct AppState {
     // encrypted with the same password, and asking again per file is noise.
     pub(crate) waiting_on_password: Option<Pending>,
     pub(crate) password_input: String,
-    pub(crate) show_password: bool,
     pub(crate) add_password: String,
     // Held for the archive currently open in the window, so extracting from it
     // does not ask again for every button press.

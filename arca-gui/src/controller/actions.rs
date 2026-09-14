@@ -77,7 +77,6 @@ pub(crate) enum AppAction {
     CancelPassword,
     SetPasswordInput(String),
     SubmitPassword(String),
-    TogglePasswordVisibility,
     BeginPasswordChange,
     RequestDelete,
     ConfirmDelete(bool),

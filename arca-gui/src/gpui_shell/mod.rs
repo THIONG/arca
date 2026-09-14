@@ -1113,6 +1113,17 @@ impl GpuiShell {
             // time something marks an active descendant.
             let neutral = self.focus_handle.clone();
             window.focus(&neutral, cx);
+            // Every password box opens hidden, whatever the last one that was
+            // open was left showing.
+            match kind {
+                ModalKind::Password | ModalKind::DefaultPassword => self
+                    .password
+                    .update(cx, |input, cx| input.set_masked(true, window, cx)),
+                ModalKind::Add => self
+                    .add_password
+                    .update(cx, |input, cx| input.set_masked(true, window, cx)),
+                _ => {}
+            }
             let shell = cx.weak_entity();
             window.open_dialog(cx, move |dialog, window, cx| {
                 let Some(shell) = shell.upgrade() else {
@@ -2566,7 +2577,6 @@ impl Render for GpuiShell {
         self.sync_modal_focus(window, cx);
         let password_value = self.controller.state.password_input.clone();
         let add_password_value = self.controller.state.add_password.clone();
-        let password_masked = !self.controller.state.show_password;
         self.password.update(cx, |input, cx| {
             input.set_placeholder(s.password_word, window, cx);
             input.set_disabled(
@@ -2576,7 +2586,6 @@ impl Render for GpuiShell {
                 ),
                 cx,
             );
-            input.set_masked(password_masked, window, cx);
             if input.value() != password_value.as_str() {
                 input.set_value(password_value.clone(), window, cx);
             }
@@ -2609,7 +2618,6 @@ impl Render for GpuiShell {
         self.add_password.update(cx, |input, cx| {
             input.set_placeholder(s.password_optional, window, cx);
             input.set_disabled(!(matches!(modal, Some(ModalKind::Add)) && zip), cx);
-            input.set_masked(password_masked, window, cx);
             if input.value() != add_password_value.as_str() {
                 input.set_value(add_password_value.clone(), window, cx);
             }
@@ -4087,22 +4095,6 @@ fn build_dialog(
                 });
             })
     };
-    // Reveals what is being typed. Does not answer the dialog, so it never
-    // closes it.
-    let reveal_button = |id: &'static str| {
-        let weak = weak.clone();
-        let shown = shell.read(cx).controller.state.show_password;
-        Button::new(id)
-            .label(if shown { s.hide_word } else { s.show_password })
-            .ghost()
-            .on_click(move |_, _, cx| {
-                let _ = weak.update(cx, |this, cx| {
-                    this.controller
-                        .dispatch(AppAction::TogglePasswordVisibility);
-                    cx.notify();
-                });
-            })
-    };
     match kind {
         ModalKind::Delete => {
             let names = shell
@@ -4362,8 +4354,7 @@ fn build_dialog(
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .child(Input::new(&field))
-                        .child(reveal_button("password-visibility")),
+                        .child(Input::new(&field).mask_toggle()),
                 )
                 .footer(
                     footer.child(
@@ -4403,8 +4394,7 @@ fn build_dialog(
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .child(Input::new(&field))
-                        .child(reveal_button("default-password-visibility"))
+                        .child(Input::new(&field).mask_toggle())
                         .child(div().text_xs().text_color(muted).child(s.password_kept)),
                 )
                 .footer(
@@ -4482,8 +4472,7 @@ fn build_dialog(
                     div()
                         .flex()
                         .gap_2()
-                        .child(Input::new(&add_password))
-                        .child(reveal_button("add-password-visibility")),
+                        .child(Input::new(&add_password).mask_toggle()),
                 );
             }
             dialog

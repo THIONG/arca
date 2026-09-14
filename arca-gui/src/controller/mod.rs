@@ -80,9 +80,6 @@ impl AppController {
             AppAction::CancelPassword => self.cancel_password(),
             AppAction::SetPasswordInput(password) => self.state.password_input = password,
             AppAction::SubmitPassword(password) => self.submit_password(password),
-            AppAction::TogglePasswordVisibility => {
-                self.state.show_password = !self.state.show_password
-            }
             AppAction::BeginPasswordChange => self.begin_password_change(),
             AppAction::RequestDelete => self.request_delete(),
             AppAction::ConfirmDelete(confirmed) => self.confirm_delete(confirmed),
@@ -184,7 +181,6 @@ impl AppController {
             return;
         };
         self.state.password_input.clear();
-        self.state.show_password = false;
         match pending {
             Pending::Extract(job) => {
                 if let Job::Extract { archives, dest, .. } = *job {
@@ -311,7 +307,6 @@ impl AppController {
                 replies: None,
                 waiting_on_password: None,
                 password_input: String::new(),
-                show_password: false,
                 add_password: String::new(),
                 archive_password: None,
                 reread_after: None,
