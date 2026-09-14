@@ -3581,24 +3581,35 @@ impl Render for GpuiShell {
             }
             // Pausing lets go at the end of an entry, not the end of a byte, so
             // a file that has started still has to finish.
-            let hold_button = Self::button(
+            // Transport marks rather than words: the strip already ends in a
+            // line of grey text, and two more words at the end of it read as
+            // the rest of the sentence instead of as something to press.
+            let hold_button = Self::icon_button(
+                cx,
                 "pause-job",
-                if held { s.resume_word } else { s.pause_word },
+                if held {
+                    IconName::Play
+                } else {
+                    IconName::Pause
+                },
                 if held { s.resume_word } else { s.pause_word }.to_string(),
                 !self.background_blocked() && !asked,
             )
+            .xsmall()
             .on_click(cx.listener(move |this, _, _, cx| {
                 if !this.background_blocked() {
                     this.controller.state.hold.store(!held, Ordering::Relaxed);
                     cx.notify();
                 }
             }));
-            let cancel = Self::button(
+            let cancel = Self::icon_button(
+                cx,
                 "cancel-job",
-                s.cancel,
-                format!("{} · {}", s.cancel, s.progress_region),
+                IconName::Close,
+                s.cancel.to_string(),
                 !self.background_blocked() && !asked,
             )
+            .xsmall()
             .on_click(cx.listener(|this, _, _, cx| {
                 if !this.background_blocked() {
                     this.controller.dispatch(AppAction::CancelJob);
