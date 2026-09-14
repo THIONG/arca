@@ -314,6 +314,21 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_path_is_found_among_the_children_of_the_folder_above_it() {
+        // A rename is checked against what shares the folder with it, and the
+        // tree renames folders the list is not showing. Both panels look the
+        // name up this way, so a path that did not come back here would make
+        // the rename quietly do nothing.
+        for path in ["arbol/docs/", "arbol/LEEME.md", "arbol/"] {
+            let rows = children_of(&corpus(), &parent_of(path));
+            assert!(
+                rows.iter().any(|row| row.path == path),
+                "{path} is missing from its own folder"
+            );
+        }
+    }
+
+    #[test]
     fn folders_appear_even_without_their_own_entry() {
         let flat = vec![entry("a/b/c/deep.txt", false, 7)];
         assert_eq!(children_of(&flat, "").len(), 1);

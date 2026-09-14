@@ -643,6 +643,17 @@ impl AppController {
             password: self.state.archive_password.clone(),
         });
     }
+    /// Everything under a folder picked, and nothing else.
+    ///
+    /// The tree points at folders the list may not be showing, so the pick is
+    /// made from the path and not from a row on screen.
+    pub(crate) fn pick_folder(&mut self, path: &str) {
+        self.clear_picked();
+        for i in entries_under(&self.state.entries, path) {
+            self.state.checked[i] = true;
+        }
+    }
+
     pub(crate) fn set_checked(&mut self, row: &Row, value: bool) {
         // Nothing behind it, and its path is the folder above: ticking it would
         // pick everything in the archive up to and including where you came

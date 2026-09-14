@@ -1,7 +1,8 @@
 use gpui::{AssetSource, Result, SharedString};
 use std::borrow::Cow;
 
-const CUSTOM: [&str; 4] = [
+const CUSTOM: [&str; 5] = [
+    "icons/clipboard-paste.svg",
     "icons/file-output.svg",
     "icons/lock.svg",
     "icons/scissors.svg",
@@ -13,6 +14,7 @@ pub struct Assets;
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         let data: &'static [u8] = match path {
+            "icons/clipboard-paste.svg" => include_bytes!("../assets/icons/clipboard-paste.svg"),
             "icons/file-output.svg" => include_bytes!("../assets/icons/file-output.svg"),
             "icons/lock.svg" => include_bytes!("../assets/icons/lock.svg"),
             "icons/scissors.svg" => include_bytes!("../assets/icons/scissors.svg"),

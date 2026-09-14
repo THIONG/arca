@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
     clipboard, gpui_theme,
-    tree::{Folder, Kind},
+    tree::{children_of, Folder, Kind},
 };
 use gpui::{actions, point};
 use gpui::{
@@ -87,10 +87,14 @@ enum DialogResult {
 struct GpuiShell {
     controller: AppController,
     filter: Entity<InputState>,
-    /// The field that replaces a row's name while it is being renamed. Renaming
-    /// happens in the row, the way every file manager does it, so there is no
+    /// The field that replaces a name while it is being renamed. Renaming
+    /// happens in place, the way every file manager does it, so there is no
     /// dialog for it.
     rename_input: Entity<InputState>,
+    /// Which panel the field belongs to. One field cannot be drawn twice, and
+    /// a folder being renamed is a row of the list and a branch of the tree at
+    /// the same time: whichever was pointed at is the one that gets to show it.
+    renaming_in_tree: bool,
     password: Entity<InputState>,
     output_name: Entity<InputState>,
     add_password: Entity<InputState>,
@@ -187,10 +191,11 @@ enum RowAction {
     Paste,
     CopyNames,
     SelectAll,
+    NewFolder,
 }
 
 impl RowAction {
-    const ALL: [RowAction; 12] = [
+    const ALL: [RowAction; 13] = [
         RowAction::Open,
         RowAction::ExtractSelection,
         RowAction::ExtractHere,
@@ -203,7 +208,23 @@ impl RowAction {
         RowAction::Paste,
         RowAction::CopyNames,
         RowAction::SelectAll,
+        RowAction::NewFolder,
     ];
+
+    /// What the menu offers where there is no row under the pointer: the
+    /// space under the last one is the folder itself, not an entry.
+    const EMPTY_SPACE: [RowAction; 3] =
+        [RowAction::NewFolder, RowAction::Paste, RowAction::SelectAll];
+
+    /// Whether the entry is about the place being pointed at rather than the
+    /// thing sitting in it. The tree runs the first kind inside the folder and
+    /// the second from the folder above it, with that folder picked alone.
+    fn about_the_place(self) -> bool {
+        matches!(
+            self,
+            RowAction::Open | RowAction::Paste | RowAction::SelectAll | RowAction::NewFolder
+        )
+    }
 
     /// What it is called, and the keys that do the same thing. A menu that does
     /// not name the shortcut is a menu nobody graduates from.
@@ -221,6 +242,7 @@ impl RowAction {
             RowAction::Paste => (s.paste_word, "Ctrl+V"),
             RowAction::CopyNames => (s.copy_names, "Ctrl+Shift+C"),
             RowAction::SelectAll => (s.select_all, "Ctrl+A"),
+            RowAction::NewFolder => (s.new_folder, ""),
         }
     }
 
@@ -230,7 +252,7 @@ impl RowAction {
     fn starts_group(self) -> bool {
         matches!(
             self,
-            RowAction::Rename | RowAction::Copy | RowAction::CopyNames
+            RowAction::Rename | RowAction::Copy | RowAction::CopyNames | RowAction::NewFolder
         )
     }
 
@@ -253,9 +275,10 @@ fn row_action_icon(action: RowAction) -> Option<Icon> {
         RowAction::Delete => Some(Icon::empty().path("icons/trash-2.svg")),
         RowAction::Copy => Some(Icon::new(IconName::Copy)),
         RowAction::Cut => Some(Icon::empty().path("icons/scissors.svg")),
-        RowAction::Paste => None,
+        RowAction::Paste => Some(Icon::empty().path("icons/clipboard-paste.svg")),
         RowAction::CopyNames => Some(Icon::new(IconName::FileText)),
         RowAction::SelectAll => Some(Icon::new(IconName::Check)),
+        RowAction::NewFolder => Some(Icon::new(IconName::Folder)),
     }
 }
 
@@ -529,6 +552,7 @@ impl GpuiShell {
             controller,
             filter,
             rename_input,
+            renaming_in_tree: false,
             password,
             output_name,
             add_password,
@@ -616,6 +640,18 @@ impl GpuiShell {
         let folders = self.controller.s().archive_folders;
         let widest = self.widest_folder_row(cx);
         let dropping = cx.weak_entity();
+        let menu_owner = cx.weak_entity();
+        let writable = self.controller.state.format == super::Format::Zip;
+        let strings = self.controller.s();
+        // The branch being renamed, and only while the field is the tree's.
+        let renaming = self
+            .controller
+            .state
+            .renaming
+            .as_ref()
+            .filter(|_| self.renaming_in_tree)
+            .map(|(path, _)| path.clone());
+        let rename_input = self.rename_input.clone();
         div()
             .id("archive-folders")
             .size_full()
@@ -634,7 +670,7 @@ impl GpuiShell {
                     .size_full()
                     .overflow_x_scrollbar()
                     .child(
-                        tree(&self.folders, move |_, entry, selected, _, _| {
+                        tree(&self.folders, move |_, entry, selected, _, cx| {
                             let open = entry.is_expanded();
                             let icon = if entry.is_root() {
                                 IconName::Inbox
@@ -702,13 +738,81 @@ impl GpuiShell {
                                                 .children(chevron.map(|icon| icon.small())),
                                         )
                                         .child(Icon::new(icon).small())
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .truncate()
-                                                .child(entry.item().label.clone()),
-                                        ),
+                                        // The name is typed over where it is
+                                        // read, so the branch does not move
+                                        // under the hand mid-rename.
+                                        .map(|row| {
+                                            if renaming.as_deref() == Some(entry.item().id.as_ref())
+                                            {
+                                                row.child(
+                                                    div()
+                                                        .flex_1()
+                                                        .h(px(22.))
+                                                        .border_1()
+                                                        .border_color(cx.theme().border)
+                                                        .bg(cx.theme().background)
+                                                        .px_1()
+                                                        .child(
+                                                            Input::new(&rename_input)
+                                                                .small()
+                                                                .appearance(false),
+                                                        ),
+                                                )
+                                            } else {
+                                                row.child(
+                                                    div()
+                                                        .flex_1()
+                                                        .truncate()
+                                                        .child(entry.item().label.clone()),
+                                                )
+                                            }
+                                        }),
                                 )
+                        })
+                        // The same menu a folder row of the list carries, plus
+                        // the folder being made inside it: a folder is the same
+                        // thing in both panels, and a menu that offered less
+                        // here would be a second set of rules to learn.
+                        .context_menu(move |_, entry, menu, _, _| {
+                            let path = entry.item().id.to_string();
+                            // The archive itself, which is a place and nothing
+                            // else: it cannot be renamed, copied or deleted
+                            // from inside the window that has it open.
+                            let root = path.is_empty();
+                            let mut menu = menu;
+                            let mut drawn = false;
+                            for action in RowAction::ALL.into_iter().filter(|action| {
+                                action.offered()
+                                    // The list is where an entry is looked at,
+                                    // and what "all" is counted against. The
+                                    // tree has no bytes to show and no rows.
+                                    && !matches!(
+                                        action,
+                                        RowAction::View | RowAction::SelectAll
+                                    )
+                                    && (!root || action.about_the_place())
+                                    && (!matches!(action, RowAction::Rename | RowAction::NewFolder)
+                                        || writable)
+                            }) {
+                                if action.starts_group() && drawn {
+                                    menu = menu.separator();
+                                }
+                                drawn = true;
+                                let (label, _) = action.label(strings);
+                                let shell = menu_owner.clone();
+                                let path = path.clone();
+                                let item =
+                                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                                        let _ = shell.update(cx, |shell, cx| {
+                                            shell.folder_action(action, &path, window, cx);
+                                        });
+                                    });
+                                menu = menu.item(match row_action_icon(action) {
+                                    Some(icon) => item.icon(icon),
+                                    None => item,
+                                });
+                            }
+                            menu
                         })
                         .h_full()
                         .w(px(widest))
@@ -1203,20 +1307,27 @@ impl GpuiShell {
         self.name_value.clear();
     }
 
-    /// Start renaming a row in place.
+    /// Start renaming in place, in the panel that was pointed at.
     ///
-    /// One entry point for the shortcut and the row menu, so the field can
-    /// never be shown without the state that says which row it belongs to.
-    fn begin_rename(&mut self, row: &super::Row, window: &mut Window, cx: &mut Context<Self>) {
+    /// One entry point for the shortcut, the row menu and the tree, so the
+    /// field can never be shown without the state that says what it belongs to.
+    fn begin_rename(
+        &mut self,
+        path: &str,
+        in_tree: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.controller.state.format != super::Format::Zip {
             return;
         }
         // The name on its own, never the path the row is labelled with while a
         // search is showing where each hit came from: a rename takes a name,
         // and a name with a folder in it is refused.
-        let trimmed = row.path.trim_end_matches('/');
+        let trimmed = path.trim_end_matches('/');
         let label = trimmed.rsplit('/').next().unwrap_or(trimmed).to_string();
-        self.controller.state.renaming = Some((row.path.clone(), label.clone()));
+        self.renaming_in_tree = in_tree;
+        self.controller.state.renaming = Some((path.to_string(), label.clone()));
         self.rename_input.update(cx, |state, cx| {
             state.set_value(label, window, cx);
             // Renaming usually replaces the name rather than appends to it, so
@@ -1233,8 +1344,12 @@ impl GpuiShell {
             return;
         };
         let name = self.rename_input.read(cx).value().trim().to_string();
-        let rows = self.controller.visible_rows();
+        // What is in the folder the entry lives in, which is what the name has
+        // to be free of. Not the rows on screen: the tree renames folders the
+        // list is not showing, and a search shows rows from everywhere.
+        let rows = children_of(&self.controller.state.entries, &parent_of(&path));
         self.controller.state.renaming = None;
+        self.renaming_in_tree = false;
         // Back to the list, or the keyboard would be left on a field that is
         // no longer drawn.
         let list = self.list_focus.clone();
@@ -1244,6 +1359,7 @@ impl GpuiShell {
     }
 
     fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        self.renaming_in_tree = false;
         if self.controller.state.renaming.take().is_some() {
             cx.notify();
         }
@@ -1405,7 +1521,7 @@ impl GpuiShell {
             // left out rather than offered and refused.
             RowAction::Rename => {
                 if let Some(row) = row {
-                    self.begin_rename(&row, window, cx);
+                    self.begin_rename(&row.path, false, window, cx);
                 }
             }
             RowAction::Delete => {
@@ -1422,8 +1538,45 @@ impl GpuiShell {
                 }
             }
             RowAction::SelectAll => self.controller.dispatch(AppAction::SelectAllVisible),
+            RowAction::NewFolder => self.overflow_action(OverflowAction::NewFolder, cx),
         }
         cx.notify();
+    }
+
+    /// A menu entry of the tree, run against the folder it was opened on.
+    ///
+    /// Opening it, pasting into it and making a folder in it are about the
+    /// place, so the window goes there. Everything else is about the folder
+    /// itself: it becomes the selection and the entry works on the selection
+    /// the way it does anywhere else, with the list left where it was.
+    /// Dragging the other panel somewhere to explain an action is not an
+    /// explanation, which is why nothing here reaches into a row.
+    fn folder_action(
+        &mut self,
+        action: RowAction,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.background_idle() {
+            return;
+        }
+        // The name is edited where it was pointed at, which for the tree is
+        // the branch itself. Nothing is picked and nothing moves.
+        if action == RowAction::Rename {
+            self.begin_rename(path, true, window, cx);
+            return;
+        }
+        if action.about_the_place() {
+            self.controller
+                .dispatch(AppAction::Navigate(path.to_string()));
+            self.route_changed(cx);
+        } else {
+            self.controller.pick_folder(path);
+        }
+        // No row: every entry the tree offers works on the selection or on the
+        // folder now being shown, and none of them reads one.
+        self.row_action(action, usize::MAX, window, cx);
     }
 
     /// The list's geometry, or nothing before it has been laid out once.
@@ -1504,7 +1657,8 @@ impl GpuiShell {
             return;
         };
         let (x, y) = (f32::from(at.x), f32::from(at.y));
-        if y < view.top || y > view.bottom || x < view.left || x > view.right {
+        if y < view.top || y > view.bottom || x <= view.left + SIDEBAR_RESIZE_SLOP || x > view.right
+        {
             return;
         }
         let anchor = Self::row_under(&view, y, rows.len());
@@ -1524,6 +1678,34 @@ impl GpuiShell {
             },
             head: at,
             live: false,
+        });
+    }
+
+    /// Pressing the right button inside the list, where the kit only marks a
+    /// row when the press landed on one.
+    ///
+    /// Under the last row there is no row to mark, and without a mark the kit
+    /// asks its delegate for nothing -- or worse, for the menu of whatever was
+    /// right clicked before. An index past the end is the mark for that space,
+    /// and the delegate reads it as the folder's own menu.
+    fn right_press(&mut self, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        if !self.background_idle() {
+            return;
+        }
+        let rows = self.controller.visible_rows();
+        let Some(view) = self.list_view(rows.len()) else {
+            return;
+        };
+        let (x, y) = (f32::from(at.x), f32::from(at.y));
+        if y < view.top || y > view.bottom || x <= view.left || x > view.right {
+            return;
+        }
+        if Self::row_under(&view, y, rows.len()).is_some() {
+            return;
+        }
+        let past_the_end = rows.len();
+        self.table.update(cx, |state, cx| {
+            state.set_right_clicked_row(Some(past_the_end), cx);
         });
     }
 
@@ -1732,7 +1914,7 @@ impl GpuiShell {
                 let cursor = self.controller.state.cursor;
                 let rows = self.controller.visible_rows();
                 match cursor.and_then(|index| rows.get(index)).cloned() {
-                    Some(row) => self.begin_rename(&row, window, cx),
+                    Some(row) => self.begin_rename(&row.path, false, window, cx),
                     None => return,
                 }
             }
@@ -1973,11 +2155,14 @@ impl GpuiShell {
                 })
             })
             .collect();
+        // Not while the tree is the one showing the field: one field cannot be
+        // drawn in two panels at once.
         let renaming = self
             .controller
             .state
             .renaming
             .as_ref()
+            .filter(|_| !self.renaming_in_tree)
             .and_then(|(path, _)| rows.iter().position(|row| row.path == *path));
         let widths = (0..Settings::default_widths().len())
             .map(|slot| self.column_width(slot))
@@ -3230,6 +3415,9 @@ impl Render for GpuiShell {
                                         event.modifiers.secondary(),
                                         event.modifiers.shift,
                                     );
+                                }
+                                gpui::MouseButton::Right => {
+                                    shell.right_press(event.position, cx);
                                 }
                                 _ => {}
                             }
@@ -4616,6 +4804,9 @@ struct ListView {
 /// the two thresholds every time a column was resized.
 const DRAG_SLOP: f32 = 10.0;
 
+/// The resize handle overlaps the list's left edge by five pixels.
+const SIDEBAR_RESIZE_SLOP: f32 = 5.0;
+
 /// The selection while it is in the air. An empty marker rather than the rows
 /// themselves: what is carried is whatever is picked when it lands, and the
 /// selection cannot change while the button is down.
@@ -5010,13 +5201,22 @@ impl TableDelegate for FileTable {
         _: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
         let is_file = self.rows.get(row_ix).is_some_and(|row| row.entry.is_some());
+        // The shell marks a press that landed past the last row with an index
+        // no row has, which is how the menu of the folder gets asked for.
+        let empty_space = self.rows.get(row_ix).is_none();
         let writable = self.writable;
         let strings = self.strings;
         let shell = self.shell.clone();
         let mut menu = menu;
         let mut drawn = false;
-        for action in RowAction::ALL.into_iter().filter(|action| {
+        let offered = if empty_space {
+            RowAction::EMPTY_SPACE.to_vec()
+        } else {
+            RowAction::ALL.to_vec()
+        };
+        for action in offered.into_iter().filter(|action| {
             action.offered()
+                && (*action != RowAction::NewFolder || (empty_space && writable))
                 && (*action != RowAction::Rename || writable)
                 && (*action != RowAction::View || is_file)
         }) {
@@ -5409,6 +5609,47 @@ mod tests {
         // an action added out of order would silently share an id.
         for (index, action) in RowAction::ALL.iter().enumerate() {
             assert_eq!(*action as usize, index);
+        }
+    }
+
+    #[test]
+    fn the_menu_under_the_last_row_asks_for_nothing_that_needs_a_row() {
+        // It is built with an index past the end, so an entry that reads the
+        // row would do nothing at best, and act on a stale one at worst.
+        for action in RowAction::EMPTY_SPACE {
+            assert!(matches!(
+                action,
+                RowAction::NewFolder | RowAction::Paste | RowAction::SelectAll
+            ));
+        }
+        // Making a folder is the reason the menu exists, and it is the one
+        // entry the row menu must not repeat.
+        assert!(RowAction::EMPTY_SPACE.contains(&RowAction::NewFolder));
+    }
+
+    #[test]
+    fn the_tree_works_a_place_from_inside_it_and_a_thing_from_above_it() {
+        // `folder_action` navigates by this. Reading it the wrong way round
+        // would make a folder in the folder above the one clicked, or rename
+        // that one instead of the one the menu was opened on.
+        for action in [
+            RowAction::Open,
+            RowAction::Paste,
+            RowAction::SelectAll,
+            RowAction::NewFolder,
+        ] {
+            assert!(action.about_the_place());
+        }
+        for action in [
+            RowAction::Rename,
+            RowAction::Delete,
+            RowAction::Copy,
+            RowAction::Cut,
+            RowAction::CopyNames,
+            RowAction::ExtractSelection,
+            RowAction::TestSelection,
+        ] {
+            assert!(!action.about_the_place());
         }
     }
 
