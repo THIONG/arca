@@ -24,7 +24,9 @@ los dos formatos que lo hacen, solo uno es viable:
 | 7z con `-mhe=on` | Sí, la cabecera va cifrada | Sí: formato abierto, implementación de referencia LGPL, SDK de LZMA en dominio público |
 | RAR con `-hp` | Sí | No: el algoritmo es de win.rar GmbH. Publican el código de `unrar`, pero su licencia prohíbe expresamente usarlo para hacer un compresor compatible. Leer arrastraría esa licencia y código C; escribir requiere licencia comercial |
 
-RAR queda descartado y no se vuelve sobre ello.
+RAR queda descartado **como formato que Arca escriba**. Leerlo sí es legal y
+tiene su propio documento: `formato-rar.md`. Tres de los cambios de fondo que
+pide este trabajo son los mismos que pide aquel; quien vaya primero los paga.
 
 ## Lo que 7z aporta además de ocultar los nombres
 
