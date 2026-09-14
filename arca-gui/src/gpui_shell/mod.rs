@@ -2295,7 +2295,12 @@ fn column_text(row: &super::Row, column: SortColumn, s: &'static Strings, root: 
                 if row.is_dir {
                     format!("{} {}", row.count, s.items_word)
                 } else if row.encrypted {
-                    format!("AES-256 {}", row.method)
+                    let scheme = if row.zipcrypto {
+                        "ZipCrypto"
+                    } else {
+                        "AES-256"
+                    };
+                    format!("{scheme} {}", row.method)
                 } else {
                     row.method.to_string()
                 }
@@ -5931,6 +5936,7 @@ mod tests {
             packed: 1,
             method: "deflate",
             encrypted: false,
+            zipcrypto: false,
             count: 0,
             mtime: None,
             created: None,

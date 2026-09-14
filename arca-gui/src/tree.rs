@@ -42,6 +42,7 @@ pub struct Row {
     pub packed: u64,
     pub method: &'static str,
     pub encrypted: bool,
+    pub zipcrypto: bool,
     pub count: usize,
     // Straight off the entry, for the columns that can be turned on. A folder
     // has none of its own: it is not a thing the archive recorded.
@@ -97,6 +98,7 @@ pub fn children_of(entries: &[Entry], dir: &str) -> Vec<Row> {
                         packed: e.compressed_size,
                         method: e.method.name(),
                         encrypted: e.encrypted,
+                        zipcrypto: e.zipcrypto,
                         count: 0,
                         mtime: e.mtime,
                         created: e.created,
@@ -122,6 +124,7 @@ pub fn children_of(entries: &[Entry], dir: &str) -> Vec<Row> {
             packed,
             method: "",
             encrypted: false,
+            zipcrypto: false,
             // A folder in the list is made up out of the names under it, not
             // read from an entry: there is nothing of its own to report.
             mtime: None,
@@ -195,6 +198,7 @@ pub fn search_under(entries: &[Entry], dir: &str, needle: &str) -> Vec<Row> {
             packed: e.compressed_size,
             method: e.method.name(),
             encrypted: e.encrypted,
+            zipcrypto: e.zipcrypto,
             count: 0,
             mtime: e.mtime,
             created: e.created,
@@ -218,6 +222,7 @@ pub fn search_under(entries: &[Entry], dir: &str, needle: &str) -> Vec<Row> {
             packed,
             method: "",
             encrypted: false,
+            zipcrypto: false,
             mtime: None,
             created: None,
             accessed: None,
@@ -269,6 +274,7 @@ mod tests {
             attributes: 0,
             offset: 0,
             encrypted: false,
+            zipcrypto: false,
         }
     }
 
@@ -448,6 +454,7 @@ mod folder_tests {
             accessed: None,
             attributes: 0,
             encrypted: false,
+            zipcrypto: false,
             offset: 0,
         }
     }

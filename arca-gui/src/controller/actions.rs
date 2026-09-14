@@ -514,6 +514,7 @@ pub(crate) fn up_row(dir: &str) -> Row {
         packed: 0,
         method: "",
         encrypted: false,
+        zipcrypto: false,
         count: 0,
         mtime: None,
         created: None,

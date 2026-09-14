@@ -173,10 +173,14 @@ pub struct Entry {
     // flag its names says nothing about which page they are in.
     pub raw_name: Vec<u8>,
     pub utf8: bool,
-    // WinZip AES: the entry is encrypted and `method` holds the real compressor,
-    // read out of the 0x9901 extra field rather than the method field, which
-    // says 99 for every encrypted entry.
+    // The entry needs a password. For WinZip AES `method` holds the real
+    // compressor, read out of the 0x9901 extra field rather than the method
+    // field, which says 99 for every encrypted entry.
     pub encrypted: bool,
+    // Only meaningful when `encrypted`: the old PKWARE cipher instead of AES.
+    // Arca reads it and never writes it, so this is always false on anything it
+    // produces.
+    pub zipcrypto: bool,
 }
 
 impl Entry {

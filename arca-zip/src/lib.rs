@@ -2,6 +2,7 @@
 
 pub mod aes;
 pub mod pages;
+pub mod zipcrypto;
 
 use arca_core::{limits, Codec, Cursor, Entry, Error, Level, Method, Result};
 use flate2::write::DeflateEncoder;
@@ -234,9 +235,15 @@ pub fn copy_compressed<R: Read + Seek, W: Write + ?Sized>(
     dest: &mut W,
     password: Option<&str>,
 ) -> Result<u64> {
-    let mut bounded = open_data(source, e)?;
-    if !e.encrypted {
-        return Ok(io::copy(&mut bounded, dest)?);
+    let (mut bounded, crypt) = open_data(source, e)?;
+    let crypt = match crypt {
+        Crypt::None => return Ok(io::copy(&mut bounded, dest)?),
+        other => other,
+    };
+    if let Crypt::Zip { check } = crypt {
+        let pw = need_password(e, password)?;
+        let mut reader = zipcrypto::open(&mut bounded, pw, check, &e.name)?;
+        return Ok(io::copy(&mut reader, dest)?);
     }
     let (keys, cipher_len) = unlock(&mut bounded, e, password)?;
     let mut reader = aes::AesReader::new(&mut bounded, &keys, cipher_len)?;
@@ -254,7 +261,10 @@ pub fn copy_compressed<R: Read + Seek, W: Write + ?Sized>(
 
 // Reads the local header, checks it agrees with the central directory, and
 // hands back a reader stopped at the end of this entry's data.
-fn open_data<'a, R: Read + Seek>(source: &'a mut R, e: &Entry) -> Result<io::Take<&'a mut R>> {
+fn open_data<'a, R: Read + Seek>(
+    source: &'a mut R,
+    e: &Entry,
+) -> Result<(io::Take<&'a mut R>, Crypt)> {
     source.seek(SeekFrom::Start(e.offset))?;
     let mut lfh = [0u8; LFH_FIXED];
     source.read_exact(&mut lfh)?;
@@ -267,28 +277,61 @@ fn open_data<'a, R: Read + Seek>(source: &'a mut R, e: &Entry) -> Result<io::Tak
     }
     c.skip(2, "version")?;
     let flags = c.u16le("flags")?;
-    if flags & 1 != 0 && !e.encrypted {
-        return Err(Error::Unsupported(format!(
-            "'{}' uses ZipCrypto, the old password scheme (only AES-256 is supported)",
-            e.name
-        )));
-    }
-    c.skip(18, "rest of the local header")?;
+    let method_code = c.u16le("method")?;
+    let time_val = c.u16le("time")?;
+    c.skip(2, "date")?;
+    let crc_val = c.u32le("crc32")?;
+    c.skip(8, "sizes")?;
     let n_len = c.u16le("name length")? as u64;
     let x_len = c.u16le("extra field length")? as u64;
 
+    // A streamed entry has no CRC yet when its header is written, so the byte
+    // that checks the password is taken from the modification time instead.
+    let crypt = if flags & 1 == 0 {
+        Crypt::None
+    } else if method_code == aes::METHOD_AE {
+        Crypt::Aes
+    } else {
+        Crypt::Zip {
+            check: if flags & 8 != 0 {
+                (time_val >> 8) as u8
+            } else {
+                (crc_val >> 24) as u8
+            },
+        }
+    };
+    if e.encrypted != !matches!(crypt, Crypt::None) {
+        return Err(Error::Format(format!(
+            "'{}': the local header and the central directory disagree on encryption",
+            e.name
+        )));
+    }
+
     let data_start = e.offset + LFH_FIXED as u64 + n_len + x_len;
     source.seek(SeekFrom::Start(data_start))?;
-    Ok(source.take(e.compressed_size))
+    Ok((source.take(e.compressed_size), crypt))
+}
+
+// Which password scheme an entry uses, taken from its local header: AES hides
+// the real compression method behind method 99, everything else with the
+// encryption flag set is the old PKWARE cipher.
+enum Crypt {
+    None,
+    Aes,
+    Zip { check: u8 },
+}
+
+fn need_password<'a>(e: &Entry, password: Option<&'a str>) -> Result<&'a str> {
+    password.ok_or_else(|| {
+        Error::Unsupported(format!("'{}' is encrypted and needs a password", e.name))
+    })
 }
 
 // Eats the salt and the verifier off the front of the entry and returns the
 // keys, plus how many bytes of ciphertext follow before the authentication
 // code. A wrong password stops here, before anything is decrypted.
 fn unlock<R: Read>(bounded: &mut R, e: &Entry, password: Option<&str>) -> Result<(aes::Keys, u64)> {
-    let pw = password.ok_or_else(|| {
-        Error::Unsupported(format!("'{}' is encrypted and needs a password", e.name))
-    })?;
+    let pw = need_password(e, password)?;
     let cipher_len = e
         .compressed_size
         .checked_sub(aes::OVERHEAD as u64)
@@ -316,10 +359,14 @@ fn extract_inner<R: Read + Seek, W: Write>(
     dest: W,
     password: Option<&str>,
 ) -> Result<(u32, u64)> {
-    let mut bounded = open_data(source, e)?;
+    let (mut bounded, crypt) = open_data(source, e)?;
     let mut cw = CrcWriter::new(dest);
 
-    if e.encrypted {
+    if let Crypt::Zip { check } = crypt {
+        let pw = need_password(e, password)?;
+        let reader = zipcrypto::open(&mut bounded, pw, check, &e.name)?;
+        decompress_into(reader, e.method, &mut cw)?;
+    } else if matches!(crypt, Crypt::Aes) {
         let (keys, cipher_len) = unlock(&mut bounded, e, password)?;
         let reader = aes::AesReader::new(&mut bounded, &keys, cipher_len)?;
         let reader = decompress_into(reader, e.method, &mut cw)?;
@@ -590,8 +637,10 @@ fn read_central_header(c: &mut Cursor<'_>) -> Result<Entry> {
 
     // Method 99 means WinZip AES, and the field no longer says how the entry
     // was compressed: the real method lives in the 0x9901 extra field.
-    let encrypted = method_code == aes::METHOD_AE;
-    let real_code = if encrypted {
+    let aes_entry = method_code == aes::METHOD_AE;
+    let encrypted = aes_entry || flags & 1 != 0;
+    let zipcrypto = encrypted && !aes_entry;
+    let real_code = if aes_entry {
         let info = aes::parse_extra(extra).ok_or_else(|| {
             Error::Format("entry says AES but carries no 0x9901 extra field".into())
         })?;
@@ -607,11 +656,6 @@ fn read_central_header(c: &mut Cursor<'_>) -> Result<Entry> {
         }
         info.real_method
     } else {
-        if flags & 1 != 0 {
-            return Err(Error::Unsupported(
-                "ZipCrypto, the old password scheme (only AES-256 is supported)".into(),
-            ));
-        }
         method_code
     };
 
@@ -652,6 +696,7 @@ fn read_central_header(c: &mut Cursor<'_>) -> Result<Entry> {
         attributes: (ext_attr & 0xFF) as u8,
         offset,
         encrypted,
+        zipcrypto,
     })
 }
 
@@ -2836,6 +2881,92 @@ mod tests {
         assert!(a.extract_to(added, io::sink()).is_err());
 
         std::fs::remove_dir_all(&room).unwrap();
+    }
+
+    // Arca never writes ZipCrypto, so the only way to test reading it is to lay
+    // the bytes out by hand the way the old tools do: a stored entry whose data
+    // is the 12 byte header and the plaintext, encrypted as one run.
+    fn zipcrypto_archive(name: &str, plain: &[u8], password: &str) -> Vec<u8> {
+        let crc = crc32fast::hash(plain);
+        let mut body = vec![0u8; zipcrypto::HEADER];
+        body[zipcrypto::HEADER - 1] = (crc >> 24) as u8;
+        body.extend_from_slice(plain);
+        zipcrypto::Keys::new(password.as_bytes()).encrypt(&mut body);
+
+        let flags: u16 = 0x0801;
+        let mut out = Vec::new();
+        out.extend_from_slice(&SIG_LFH.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&body);
+
+        let cd_at = out.len();
+        out.extend_from_slice(&SIG_CD.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        let cd_size = out.len() - cd_at;
+
+        out.extend_from_slice(&SIG_EOCD.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&(cd_size as u32).to_le_bytes());
+        out.extend_from_slice(&(cd_at as u32).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn zipcrypto_entry_comes_back_whole() {
+        let plain = b"Un archivo del siglo pasado. ".repeat(70);
+        let buf = zipcrypto_archive("viejo.txt", &plain, "secreto");
+
+        let mut a = ZipArchive::open(IoCursor::new(buf.clone())).unwrap();
+        assert!(a.has_encrypted());
+        let mut got = Vec::new();
+        a.extract_to_with(0, &mut got, Some("secreto")).unwrap();
+        assert_eq!(got, plain);
+
+        let mut a = ZipArchive::open(IoCursor::new(buf.clone())).unwrap();
+        assert!(
+            a.extract_to_with(0, io::sink(), Some("otra")).is_err(),
+            "a wrong password must not produce a file"
+        );
+        let mut a = ZipArchive::open(IoCursor::new(buf.clone())).unwrap();
+        assert!(
+            a.extract_to_with(0, io::sink(), None).is_err(),
+            "no password must not produce a file"
+        );
+    }
+
+    #[test]
+    fn truncated_zipcrypto_entry_does_not_panic() {
+        let buf = zipcrypto_archive("viejo.txt", &b"contenido".repeat(20), "secreto");
+        for cut_at in 0..buf.len() {
+            if let Ok(mut a) = ZipArchive::open(IoCursor::new(buf[..cut_at].to_vec())) {
+                let _ = a.extract_to_with(0, io::sink(), Some("secreto"));
+            }
+        }
     }
 
     #[test]

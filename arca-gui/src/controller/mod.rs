@@ -1232,6 +1232,7 @@ impl AppController {
                         packed: e.compressed_size,
                         method: e.method.name(),
                         encrypted: e.encrypted,
+                        zipcrypto: e.zipcrypto,
                         count: 0,
                         mtime: e.mtime,
                         created: e.created,
@@ -1826,6 +1827,7 @@ mod reread_tests {
             raw_name: Vec::new(),
             utf8: true,
             encrypted: false,
+            zipcrypto: false,
         }];
         assert_eq!(nearest_existing_dir(&entries, "gone/child/"), "");
         assert_eq!(nearest_existing_dir(&entries, "kept/"), "kept/");
@@ -1964,6 +1966,7 @@ mod password_tests {
             raw_name: Vec::new(),
             utf8: true,
             encrypted,
+            zipcrypto: false,
         }];
         controller.state.checked = vec![false];
         controller
@@ -2045,6 +2048,7 @@ mod filter_tests {
             attributes: 0,
             offset: 0,
             encrypted: false,
+            zipcrypto: false,
         }
     }
 
