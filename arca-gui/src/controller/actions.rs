@@ -42,6 +42,7 @@ pub(crate) enum Pending {
     Extract(Box<Job>),
     OpenArchive,
     CurrentPassword(Box<Job>),
+    NewPassword(Box<Job>),
 }
 
 pub(crate) enum View {

@@ -110,13 +110,17 @@ impl AppController {
             new: None,
         };
         self.state.password_input.clear();
-        if self.state.entries.iter().any(|entry| entry.encrypted)
-            && self.state.archive_password.is_none()
-        {
-            self.state.waiting_on_password = Some(Pending::CurrentPassword(Box::new(job)));
+        // Two questions at most, and never none: the password the archive
+        // already has, when it has one and the window does not know it, and
+        // then the one it is about to get. Going straight to the job here is
+        // what left the button only able to take a password off.
+        let locked = self.state.entries.iter().any(|entry| entry.encrypted)
+            && self.state.archive_password.is_none();
+        self.state.waiting_on_password = Some(if locked {
+            Pending::CurrentPassword(Box::new(job))
         } else {
-            self.run_job(job);
-        }
+            Pending::NewPassword(Box::new(job))
+        });
     }
 
     pub(crate) fn sort_by(&mut self, column: SortColumn) {
@@ -166,7 +170,14 @@ impl AppController {
     }
 
     pub(crate) fn submit_password(&mut self, password: String) {
-        if password.is_empty() {
+        // Empty is an answer only to "what should it be": nothing, meaning take
+        // the password off. Everywhere else it is a press on an empty box.
+        if password.is_empty()
+            && !matches!(
+                self.state.waiting_on_password,
+                Some(Pending::NewPassword(_))
+            )
+        {
             return;
         }
         let Some(pending) = self.state.waiting_on_password.take() else {
@@ -188,10 +199,23 @@ impl AppController {
             Pending::CurrentPassword(job) => {
                 if let Job::Password { archive, new, .. } = *job {
                     self.state.archive_password = Some(password.clone());
+                    self.state.waiting_on_password =
+                        Some(Pending::NewPassword(Box::new(Job::Password {
+                            archive,
+                            current: Some(password),
+                            new,
+                        })));
+                }
+            }
+            Pending::NewPassword(job) => {
+                if let Job::Password {
+                    archive, current, ..
+                } = *job
+                {
                     self.run_job(Job::Password {
                         archive,
-                        current: Some(password),
-                        new,
+                        current,
+                        new: (!password.is_empty()).then_some(password),
                     });
                 }
             }
@@ -1793,6 +1817,93 @@ mod reread_tests {
             "Projects/Renamed"
         );
         assert_eq!(rename_destination("file.txt", "new.txt"), "new.txt");
+    }
+}
+
+/// The password button asks before it writes.
+///
+/// It used to build the job with no new password in it and run it, so the one
+/// thing the button could do was take a password off.
+#[cfg(test)]
+mod password_tests {
+    use super::*;
+
+    fn controller(encrypted: bool) -> AppController {
+        let mut controller = AppController::new(Settings::default());
+        controller.state.archive = Some(std::env::temp_dir().join("arca-password-test.zip"));
+        controller.state.entries = vec![arca_core::Entry {
+            name: "a.txt".into(),
+            size: 0,
+            compressed_size: 0,
+            method: arca_core::Method::Store,
+            crc32: 0,
+            is_dir: false,
+            mtime: None,
+            created: None,
+            accessed: None,
+            attributes: 0,
+            offset: 0,
+            raw_name: Vec::new(),
+            utf8: true,
+            encrypted,
+        }];
+        controller.state.checked = vec![false];
+        controller
+    }
+
+    #[test]
+    fn a_plain_archive_is_asked_what_password_to_put_on_it() {
+        let mut controller = controller(false);
+        controller.begin_password_change();
+        assert!(matches!(
+            controller.state.waiting_on_password,
+            Some(Pending::NewPassword(_))
+        ));
+        assert!(!controller.state.busy);
+    }
+
+    /// The password it already has does not answer the question of what it
+    /// should have next, so the window stays up for the second one.
+    #[test]
+    fn a_locked_archive_is_asked_for_both_passwords() {
+        let mut controller = controller(true);
+        controller.begin_password_change();
+        assert!(matches!(
+            controller.state.waiting_on_password,
+            Some(Pending::CurrentPassword(_))
+        ));
+        controller.submit_password("old".into());
+        match &controller.state.waiting_on_password {
+            Some(Pending::NewPassword(job)) => match &**job {
+                Job::Password { current, new, .. } => {
+                    assert_eq!(current.as_deref(), Some("old"));
+                    assert!(new.is_none());
+                }
+                _ => panic!("the held job is the password one"),
+            },
+            _ => panic!("the new password is still to be asked for"),
+        }
+    }
+
+    /// What is typed into the second window is the password the archive ends up
+    /// with. `reread_after` carries it because the listing has to be reopened
+    /// with it; an empty answer is the way to take the password off.
+    #[test]
+    fn the_answer_is_the_password_the_archive_ends_up_with() {
+        for (given, expected) in [("new", Some("new".to_string())), ("", None)] {
+            let mut controller = controller(false);
+            controller.begin_password_change();
+            controller.submit_password(given.into());
+            assert_eq!(
+                controller
+                    .state
+                    .reread_after
+                    .as_ref()
+                    .map(|(_, password, _)| password.clone()),
+                Some(expected),
+                "password {given:?}"
+            );
+        }
     }
 }
 

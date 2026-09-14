@@ -4309,18 +4309,48 @@ fn build_dialog(
             )
         }
         ModalKind::Password => {
+            // Three questions wear this one window: the password to open an
+            // archive with, the one it already has, and the one it is about to
+            // get. Only the last of them is a password being chosen.
             let setting = matches!(
                 shell.read(cx).controller.state.waiting_on_password,
-                Some(Pending::CurrentPassword(_))
+                Some(Pending::NewPassword(_))
             );
+            let opening = matches!(
+                shell.read(cx).controller.state.waiting_on_password,
+                Some(Pending::Extract(_) | Pending::OpenArchive)
+            );
+            // Only worth offering where there is a password to take off.
+            let removable = setting
+                && shell
+                    .read(cx)
+                    .controller
+                    .state
+                    .entries
+                    .iter()
+                    .any(|entry| entry.encrypted);
             let field = shell.read(cx).password.clone();
             let submit = weak.clone();
-            let submit_label = if setting { s.set_password } else { s.start };
+            let remove = weak.clone();
+            let mut footer = DialogFooter::new().child(cancel_button("password-cancel", s.cancel));
+            if removable {
+                footer = footer.child(
+                    Button::new("password-remove")
+                        .label(s.remove_password)
+                        .on_click(move |_, _, cx| {
+                            let _ = remove.update(cx, |this, cx| {
+                                this.controller
+                                    .dispatch(AppAction::SubmitPassword(String::new()));
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
             dialog
-                .title(if setting {
-                    s.set_password
-                } else {
+                .title(if opening {
                     s.password_needed
+                } else {
+                    s.set_password
                 })
                 .child(DialogDescription::new().child(if setting {
                     s.new_password
@@ -4336,22 +4366,28 @@ fn build_dialog(
                         .child(reveal_button("password-visibility")),
                 )
                 .footer(
-                    DialogFooter::new()
-                        .child(cancel_button("password-cancel", s.cancel))
-                        .child(
-                            DialogAction::new().child(
-                                Button::new("password-submit").label(submit_label).primary(),
-                            ),
+                    footer.child(
+                        DialogAction::new().child(
+                            Button::new("password-submit")
+                                .label(if setting { s.set_password } else { s.start })
+                                .primary(),
                         ),
+                    ),
                 )
                 .on_ok(move |_, _, cx| {
+                    let mut close = true;
                     let _ = submit.update(cx, |this, cx| {
                         let password = this.password.read(cx).value().to_string();
                         this.controller
                             .dispatch(AppAction::SubmitPassword(password));
+                        // The current password is the first of two questions,
+                        // and an empty box is no answer at all: closing on
+                        // either leaves the window waiting on a window that is
+                        // no longer there.
+                        close = this.controller.state.waiting_on_password.is_none();
                         cx.notify();
                     });
-                    true
+                    close
                 })
         }
         ModalKind::DefaultPassword => {
