@@ -4322,8 +4322,33 @@ fn build_dialog(
                     .iter()
                     .any(|entry| entry.encrypted);
             let field = shell.read(cx).password.clone();
+            // The one kept for this window, offered rather than filled in: a
+            // password put on an archive by accident costs a full rewrite to
+            // take off again. Offered to all three questions, which is what it
+            // is for: a folder of archives locked with the same word is typed
+            // once whether they are being opened, unlocked or locked again.
+            let default_password = shell.read(cx).controller.state.default_password.clone();
             let submit = weak.clone();
             let remove = weak.clone();
+            let fill_default = weak.clone();
+            let mut box_ = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(Input::new(&field).mask_toggle());
+            if let Some(kept) = default_password {
+                box_ = box_.child(
+                    Button::new("password-use-default")
+                        .label(s.use_default_password)
+                        .ghost()
+                        .on_click(move |_, _, cx| {
+                            let _ = fill_default.update(cx, |this, cx| {
+                                this.controller.state.password_input = kept.clone();
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
             let mut footer = DialogFooter::new().child(cancel_button("password-cancel", s.cancel));
             if removable {
                 footer = footer.child(
@@ -4349,13 +4374,7 @@ fn build_dialog(
                 } else {
                     s.password_hint
                 }))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(Input::new(&field).mask_toggle()),
-                )
+                .child(box_)
                 .footer(
                     footer.child(
                         DialogAction::new().child(
@@ -4468,12 +4487,25 @@ fn build_dialog(
                         .child(labelled(s.level, level_pick("add-level", shell, &weak, cx))),
                 );
             if is_zip {
-                body = body.child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(Input::new(&add_password).mask_toggle()),
-                );
+                let mut row = div()
+                    .flex()
+                    .gap_2()
+                    .child(Input::new(&add_password).mask_toggle());
+                if let Some(kept) = shell.read(cx).controller.state.default_password.clone() {
+                    let fill_default = weak.clone();
+                    row = row.child(
+                        Button::new("add-use-default-password")
+                            .label(s.use_default_password)
+                            .ghost()
+                            .on_click(move |_, _, cx| {
+                                let _ = fill_default.update(cx, |this, cx| {
+                                    this.controller.state.add_password = kept.clone();
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                body = body.child(row);
             }
             dialog
                 .title(s.add_to_archive)
