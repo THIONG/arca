@@ -1532,7 +1532,16 @@ impl AppController {
         // showing a listing the archive no longer matched until it was reopened
         // by hand. This list is the jobs that rebuild the file, and it is the
         // same one the undo entry below is built from.
-        self.state.reread_after = reread_target(&job, &self.state.current_dir);
+        //
+        // A window that leaves when the job ends has nothing to show, and
+        // pointing it at the new archive would cancel its own departure: what
+        // decides the window closes is still being on View::Running, and
+        // rereading is what puts it back on View::Browse.
+        self.state.reread_after = if self.state.close_when_done {
+            None
+        } else {
+            reread_target(&job, &self.state.current_dir)
+        };
         // The ones that build the archive again leave the old one beside it.
         // What is kept here is the word for the change, so that offering to
         // take it back can say what it would be taking back.
@@ -1610,8 +1619,12 @@ impl AppController {
 ///
 /// A job that rebuilds the archive leaves the window listing a file that is no
 /// longer there. Every one of them belongs here; the jobs that only read
-/// (testing, extracting) or write somewhere else (compressing to a new archive,
-/// copying, downloading) do not.
+/// (testing, extracting) or write somewhere else (copying, downloading) do not.
+///
+/// Compressing is the odd one: nothing that was open changed, but what it wrote
+/// is an archive and the window that asked for it has nothing else to show.
+/// Opening it answers "where did it go", which is the question a window left
+/// sitting on its own success is asking.
 fn reread_target(job: &Job, current_dir: &str) -> Option<(PathBuf, Option<String>, String)> {
     match job {
         Job::Password { archive, new, .. } => {
@@ -1646,11 +1659,8 @@ fn reread_target(job: &Job, current_dir: &str) -> Option<(PathBuf, Option<String
             password.clone(),
             moved_name(current_dir, moves),
         )),
-        Job::Extract { .. }
-        | Job::Test { .. }
-        | Job::CopyTo { .. }
-        | Job::Compress { .. }
-        | Job::Update { .. } => None,
+        Job::Compress { out, password, .. } => Some((out.clone(), password.clone(), String::new())),
+        Job::Extract { .. } | Job::Test { .. } | Job::CopyTo { .. } | Job::Update { .. } => None,
     }
 }
 
@@ -1879,22 +1889,58 @@ mod compress_tests {
 
     #[test]
     fn a_window_opened_by_hand_stays_open_when_the_job_ends() {
-        let job = || Job::Compress {
+        let mut by_hand = AppController::new(Settings::default());
+        by_hand.run_job(compressing(None));
+        assert!(!by_hand.state.close_when_done);
+
+        let mut from_explorer = AppController::new(Settings::default());
+        from_explorer.state.one_shot = true;
+        from_explorer.run_job(compressing(None));
+        assert!(from_explorer.state.close_when_done);
+    }
+
+    fn compressing(password: Option<String>) -> Job {
+        Job::Compress {
             out: std::env::temp_dir().join("arca-close-test.zip"),
             inputs: vec![std::env::temp_dir().join("arca-close-test-input")],
             format: Format::Zip,
             codec: Codec::Deflate,
             level: Level::Normal,
-            password: None,
-        };
-        let mut by_hand = AppController::new(Settings::default());
-        by_hand.run_job(job());
-        assert!(!by_hand.state.close_when_done);
+            password,
+        }
+    }
 
-        let mut from_explorer = AppController::new(Settings::default());
-        from_explorer.state.one_shot = true;
-        from_explorer.run_job(job());
-        assert!(from_explorer.state.close_when_done);
+    /// The archive that was just written is what the window then shows, with
+    /// the password it was given so it does not turn round and ask for one it
+    /// already knows.
+    ///
+    /// Without this the window sat on "Created ..." and an empty list, and the
+    /// only way to see what had just been built was to go and open it by hand.
+    #[test]
+    fn the_new_archive_is_what_the_window_opens_next() {
+        let mut controller = AppController::new(Settings::default());
+        controller.run_job(compressing(Some("secret".into())));
+        assert_eq!(
+            controller.state.reread_after,
+            Some((
+                std::env::temp_dir().join("arca-close-test.zip"),
+                Some("secret".to_string()),
+                String::new(),
+            ))
+        );
+    }
+
+    /// The two halves have to agree: a window that is leaving must not be sent
+    /// to the new archive, because arriving there is what would keep it. What
+    /// closes the window is still being on `View::Running`, and a reread is
+    /// exactly what puts it back on `View::Browse`.
+    #[test]
+    fn a_window_that_is_leaving_is_not_sent_to_the_new_archive() {
+        let mut controller = AppController::new(Settings::default());
+        controller.state.one_shot = true;
+        controller.run_job(compressing(None));
+        assert!(controller.state.close_when_done);
+        assert!(controller.state.reread_after.is_none());
     }
 }
 
