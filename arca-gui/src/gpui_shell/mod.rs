@@ -17,8 +17,8 @@ use crate::{
 use gpui::{actions, point};
 use gpui::{
     canvas, div, prelude::*, px, size, uniform_list, App, Bounds, ClickEvent, Context, ElementId,
-    Entity, FocusHandle, Focusable, KeyBinding, KeyDownEvent, Role, ScrollStrategy, Stateful,
-    UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowOptions,
+    Entity, ExternalPaths, FocusHandle, Focusable, KeyBinding, KeyDownEvent, Role, ScrollStrategy,
+    Stateful, UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants};
 use gpui_component::dialog::{Dialog, DialogAction, DialogClose, DialogDescription, DialogFooter};
@@ -75,7 +75,9 @@ actions!(arca_gpui, [FocusFilter, CopyFiles, CutFiles, PasteFiles]);
 /// What came back from a native file dialog, which runs off the main thread.
 enum DialogResult {
     Open(Option<PathBuf>),
-    Compress(Option<Vec<PathBuf>>),
+    /// What to compress into a new archive, added to whatever was picked
+    /// before it.
+    Inputs(Option<Vec<PathBuf>>),
     Extract {
         only_checked: bool,
         destination: Option<PathBuf>,
@@ -171,7 +173,6 @@ struct GpuiShell {
     folders_key: Option<(Option<PathBuf>, usize, u64)>,
     /// How the sidebar and the file list divide the window between them.
     sidebar_state: Entity<ResizableState>,
-    drop_paths: Vec<PathBuf>,
 }
 
 /// What the menu on a row offers. Everything here already exists as a
@@ -588,7 +589,6 @@ impl GpuiShell {
             folders,
             folders_key: None,
             sidebar_state: cx.new(|_| ResizableState::default()),
-            drop_paths: Vec::new(),
         }
     }
 
@@ -879,7 +879,14 @@ impl GpuiShell {
     }
 
     fn begin_dialog(&mut self, kind: DialogKind, cx: &mut Context<Self>) {
-        if self.dialog.is_some() || self.controller.state.busy || self.modal_kind().is_some() {
+        // Picking what to compress is the one dialog that opens on top of a
+        // modal: the add box is where the list of picks lives, so adding to it
+        // has to work from inside it.
+        let modal_allows = match (&kind, self.modal_kind()) {
+            (DialogKind::PickInputs { .. }, Some(ModalKind::Add)) => true,
+            (_, modal) => modal.is_none(),
+        };
+        if self.dialog.is_some() || self.controller.state.busy || !modal_allows {
             return;
         }
         if matches!(kind, DialogKind::Extract { .. })
@@ -898,12 +905,20 @@ impl GpuiShell {
                         .add_filter("Archives", &["zip", "tar", "gz", "tgz"])
                         .pick_file(),
                 ),
-                DialogKind::Compress => DialogResult::Compress(rfd::FileDialog::new().pick_files()),
+                DialogKind::PickInputs { folders } => DialogResult::Inputs(if folders {
+                    rfd::FileDialog::new().pick_folders()
+                } else {
+                    rfd::FileDialog::new().pick_files()
+                }),
                 DialogKind::Extract { only_checked } => DialogResult::Extract {
                     only_checked,
                     destination: rfd::FileDialog::new().pick_folder(),
                 },
-                DialogKind::AddFiles => DialogResult::AddFiles(rfd::FileDialog::new().pick_files()),
+                DialogKind::AddFiles { folders } => DialogResult::AddFiles(if folders {
+                    rfd::FileDialog::new().pick_folders()
+                } else {
+                    rfd::FileDialog::new().pick_files()
+                }),
                 DialogKind::SaveCopy { name, directory } => DialogResult::SaveCopy(
                     rfd::FileDialog::new()
                         .set_file_name(&name)
@@ -926,7 +941,7 @@ impl GpuiShell {
         self.dialog = None;
         match result {
             DialogResult::Open(Some(path)) => self.controller.dispatch(AppAction::Open(path)),
-            DialogResult::Compress(Some(paths)) if !paths.is_empty() => {
+            DialogResult::Inputs(Some(paths)) if !paths.is_empty() => {
                 self.controller.dispatch(AppAction::PrepareCompress(paths))
             }
             DialogResult::Extract {
@@ -1270,7 +1285,12 @@ impl GpuiShell {
     fn overflow_action(&mut self, action: OverflowAction, cx: &mut Context<Self>) {
         match action {
             OverflowAction::Release => self.controller.start_update(),
-            OverflowAction::AddFiles => self.begin_dialog(DialogKind::AddFiles, cx),
+            OverflowAction::AddFiles => {
+                self.begin_dialog(DialogKind::AddFiles { folders: false }, cx)
+            }
+            OverflowAction::AddFolders => {
+                self.begin_dialog(DialogKind::AddFiles { folders: true }, cx)
+            }
             // Asked for in a box rather than made as "New folder" and renamed
             // after: making it rewrites the whole archive, and doing that twice
             // for one folder would be silly.
@@ -1890,7 +1910,9 @@ impl GpuiShell {
         }
         match shortcut {
             Shortcut::Open => self.begin_dialog(DialogKind::Open, cx),
-            Shortcut::Compress => self.begin_dialog(DialogKind::Compress, cx),
+            Shortcut::Compress => self
+                .controller
+                .dispatch(AppAction::PrepareCompress(Vec::new())),
             Shortcut::ExtractAll if archive.is_some() => self.begin_dialog(
                 DialogKind::Extract {
                     only_checked: false,
@@ -1983,6 +2005,38 @@ impl GpuiShell {
     /// The keys, and what each one does, in the two columns they are read in.
     fn background_idle(&self) -> bool {
         !self.controller.state.busy && self.modal_kind().is_none() && self.dialog.is_none()
+    }
+
+    /// Whether files dragged in from outside have somewhere to land. Wider than
+    /// `background_idle` by exactly one box: the add box is a list of things to
+    /// compress, so dropping onto it means something.
+    fn accepts_drop(&self) -> bool {
+        if self.controller.state.busy || self.dialog.is_some() {
+            return false;
+        }
+        matches!(self.modal_kind(), None | Some(ModalKind::Add))
+    }
+
+    /// Files and folders dragged in from the Explorer.
+    ///
+    /// The one gesture on Windows that carries both at once, which is why the
+    /// add box takes it straight into the list instead of asking what it meant.
+    fn drop_external(&mut self, paths: Vec<PathBuf>, window: &Window, cx: &mut Context<Self>) {
+        if paths.is_empty() || !self.accepts_drop() {
+            return;
+        }
+        if matches!(self.controller.state.view, View::Add) {
+            self.controller.dispatch(AppAction::PrepareCompress(paths));
+        } else {
+            // Keep the element that had focus before the drop. The existing
+            // modal focus sync will move into the confirmation and return here
+            // when it is answered.
+            if let Some(focus) = window.focused(cx) {
+                self.dialog_return_focus = Some(focus);
+            }
+            self.controller.dispatch(AppAction::Drop(paths));
+        }
+        cx.notify();
     }
 
     fn menu_enabled(&self) -> bool {
@@ -2533,12 +2587,19 @@ impl GpuiShell {
 #[derive(Clone)]
 enum DialogKind {
     Open,
-    Compress,
+    /// What to put in a new archive. Windows has one native dialog for files
+    /// and another for folders, so which one this opens has to be said up
+    /// front; the picks pile up in the same list either way.
+    PickInputs {
+        folders: bool,
+    },
     Extract {
         only_checked: bool,
     },
-    /// Files to put inside the archive that is already open.
-    AddFiles,
+    /// Files or folders to put inside the archive that is already open.
+    AddFiles {
+        folders: bool,
+    },
     /// A copy of the open archive under another name, which is the thing to do
     /// before a change nobody is sure about.
     SaveCopy {
@@ -2673,7 +2734,9 @@ impl Render for GpuiShell {
         );
         toolbar = toolbar.child(compress.on_click(cx.listener(|this, _, _, cx| {
             if this.background_idle() {
-                this.begin_dialog(DialogKind::Compress, cx);
+                this.controller
+                    .dispatch(AppAction::PrepareCompress(Vec::new()));
+                cx.notify();
             }
         })));
         toolbar = toolbar.child(div().px_1().child(Separator::vertical().h(px(16.))));
@@ -2832,9 +2895,10 @@ impl Render for GpuiShell {
                     s.archive_group,
                     window,
                     popup_cx,
-                    move |submenu, _, _| {
+                    move |submenu, window, popup_cx| {
                         let test_owner = archive_owner.clone();
                         let add_owner = archive_owner.clone();
+                        let add_folders_owner = archive_owner.clone();
                         let folder_owner = archive_owner.clone();
                         let undo_owner = archive_owner.clone();
                         let save_owner = archive_owner.clone();
@@ -2860,14 +2924,28 @@ impl Render for GpuiShell {
                                     }),
                             )
                             .separator()
-                            .item(
-                                Self::popup_action(
-                                    add_owner,
-                                    s.add_to_archive,
-                                    OverflowAction::AddFiles,
-                                )
-                                .disabled(!writable),
-                            )
+                            // Two entries and not one, for the same reason the
+                            // add box has two: the native dialog picks files or
+                            // folders, never both.
+                            .submenu(s.add_to_archive, window, popup_cx, move |inner, _, _| {
+                                inner
+                                    .item(
+                                        Self::popup_action(
+                                            add_owner.clone(),
+                                            s.add_files_word,
+                                            OverflowAction::AddFiles,
+                                        )
+                                        .disabled(!writable),
+                                    )
+                                    .item(
+                                        Self::popup_action(
+                                            add_folders_owner.clone(),
+                                            s.add_folders_word,
+                                            OverflowAction::AddFolders,
+                                        )
+                                        .disabled(!writable),
+                                    )
+                            })
                             .item(
                                 Self::popup_action(
                                     folder_owner,
@@ -3337,40 +3415,28 @@ impl Render for GpuiShell {
             .child(toolbar_bar)
             .child(nav_bar);
 
+        // Files from outside arrive as an ordinary GPUI drag carrying
+        // `ExternalPaths`, not as a `FileDropEvent`: the window translates
+        // Entered into a MouseMove and Submit into a MouseUp before anything
+        // gets to see them, so only `Exited` ever reaches a `FileDropEvent`
+        // listener. Watching for the event was watching for something that
+        // never comes, which is why nothing dropped on this window did
+        // anything at all.
+        root = root
+            .drag_over::<ExternalPaths>(|style, _, _, cx| {
+                style
+                    .bg(cx.theme().drop_target)
+                    .border_color(cx.theme().drag_border)
+            })
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.drop_external(paths.paths().to_vec(), window, cx);
+            }));
+
         let drop_probe = {
             let view = cx.entity();
             canvas(
                 |_, _, _| (),
                 move |_, _, window, _| {
-                    let dropped = view.clone();
-                    window.on_mouse_event(move |event: &gpui::FileDropEvent, _, window, app| {
-                        let current_focus = window.focused(app);
-                        dropped.update(app, |shell, cx| match event {
-                            gpui::FileDropEvent::Entered { paths, .. } => {
-                                shell.drop_paths =
-                                    drop_paths_for_enter(paths.paths(), shell.background_idle());
-                            }
-                            gpui::FileDropEvent::Submit { .. } => {
-                                let paths = std::mem::take(&mut shell.drop_paths);
-                                if !paths.is_empty() && shell.background_idle() {
-                                    // Keep the element that had focus before
-                                    // the drop. The existing modal focus sync
-                                    // will move into confirmation and return
-                                    // here when it is answered.
-                                    if let Some(focus) = current_focus {
-                                        shell.dialog_return_focus = Some(focus);
-                                    }
-                                    shell.controller.dispatch(AppAction::Drop(paths));
-                                    cx.notify();
-                                }
-                            }
-                            gpui::FileDropEvent::Exited | gpui::FileDropEvent::Ended => {
-                                shell.drop_paths.clear();
-                            }
-                            gpui::FileDropEvent::Pending { .. } => {}
-                        });
-                    });
-
                     // A column edge in hand, a band being pulled, and the list
                     // running after the pointer all have to keep working once
                     // the pointer has left the thing it started on, so the move
@@ -3522,26 +3588,6 @@ impl Render for GpuiShell {
                     .track_focus(&self.add_start_focus)
                     .size_0(),
             );
-
-        if !self.drop_paths.is_empty() && self.background_idle() {
-            let count = self.drop_paths.len();
-            root = root.child(
-                div()
-                    .id("drop-feedback")
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(cx.theme().drop_target)
-                    .border_2()
-                    .border_color(cx.theme().drag_border)
-                    .rounded(cx.theme().radius_lg)
-                    .role(Role::Status)
-                    .aria_label(format!("{} ({count})", s.dropped_word))
-                    .child(format!("{} ({count})", s.dropped_word)),
-            );
-        }
 
         if self.controller.state.busy {
             use std::sync::atomic::Ordering;
@@ -4507,17 +4553,91 @@ fn build_dialog(
                 }
                 body = body.child(row);
             }
+            // One button with two entries under it, because Windows has two
+            // dialogs: one picks files, the other picks folders, and neither
+            // picks both. Each pick adds to the list instead of replacing it,
+            // so a mixed selection is built up in as many passes as it takes --
+            // or in one, by dropping it on the list below.
+            let pick_files = weak.clone();
+            let pick_folders = weak.clone();
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        Button::new("add-pick")
+                            .label(s.add_word)
+                            .icon(IconName::ChevronDown)
+                            .dropdown_menu(move |menu, _, _| {
+                                let files = pick_files.clone();
+                                let folders = pick_folders.clone();
+                                menu.item(PopupMenuItem::new(s.add_files_word).on_click(
+                                    move |_, _, cx| {
+                                        let _ = files.update(cx, |this, cx| {
+                                            this.begin_dialog(
+                                                DialogKind::PickInputs { folders: false },
+                                                cx,
+                                            );
+                                        });
+                                    },
+                                ))
+                                .item(
+                                    PopupMenuItem::new(s.add_folders_word).on_click(
+                                        move |_, _, cx| {
+                                            let _ = folders.update(cx, |this, cx| {
+                                                this.begin_dialog(
+                                                    DialogKind::PickInputs { folders: true },
+                                                    cx,
+                                                );
+                                            });
+                                        },
+                                    ),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{count} {}", s.items_word)),
+                            )
+                            .child({
+                                let empty = weak.clone();
+                                Button::new("add-clear")
+                                    .label(s.remove_all)
+                                    .ghost()
+                                    .disabled(count == 0)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = empty.update(cx, |this, cx| {
+                                            this.controller.state.pending_inputs.clear();
+                                            cx.notify();
+                                        });
+                                    })
+                            }),
+                    ),
+            );
+            body = body.child(pending_list(shell, &weak, s, cx));
             dialog
                 .title(s.add_to_archive)
                 .w(px(600.))
                 .child(DialogDescription::new().child(s.defaults_title))
-                .child(body.child(format!("{count} {}", s.files_word)))
+                .child(body)
                 .footer(
                     DialogFooter::new()
                         .child(cancel_button("add-cancel", s.cancel))
                         .child(
-                            DialogAction::new()
-                                .child(Button::new("add-start").label(s.start).primary()),
+                            DialogAction::new().child(
+                                Button::new("add-start")
+                                    .label(s.start)
+                                    .primary()
+                                    .disabled(count == 0),
+                            ),
                         ),
                 )
                 .on_ok(move |_, _, cx| {
@@ -4828,12 +4948,112 @@ fn build_dialog(
     }
 }
 
+/// What is about to be compressed, one row each, with a cross to take a row
+/// back out.
+///
+/// The list is the answer to the question the count alone cannot answer: a
+/// selection built out of several passes through the native dialog is only
+/// trustworthy if it can be read back before the work starts. It is also where
+/// a mixed pile of files and folders can be dropped in one go, which is the
+/// one gesture Windows has that its file dialog does not.
+fn pending_list(
+    shell: &Entity<GpuiShell>,
+    weak: &WeakEntity<GpuiShell>,
+    s: &'static Strings,
+    cx: &mut App,
+) -> Stateful<gpui::Div> {
+    let inputs = shell.read(cx).controller.state.pending_inputs.clone();
+    let dropped = weak.clone();
+    let mut list = div()
+        .id("add-inputs")
+        .flex()
+        .flex_col()
+        .gap_px()
+        .p_1()
+        .min_h(px(96.))
+        .max_h(px(200.))
+        .overflow_scroll()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border)
+        // The modal is painted above the shell, so the drop has to be taken
+        // here as well: the window behind it never sees the pointer.
+        .drag_over::<ExternalPaths>(|style, _, _, cx| {
+            style
+                .bg(cx.theme().drop_target)
+                .border_color(cx.theme().drag_border)
+        })
+        .on_drop(move |paths: &ExternalPaths, window, cx| {
+            let paths = paths.paths().to_vec();
+            let _ = dropped.update(cx, |this, cx| this.drop_external(paths, window, cx));
+        });
+    if inputs.is_empty() {
+        return list.child(
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(cx.theme().muted_foreground)
+                .child(s.drop_inputs_here),
+        );
+    }
+    for (index, path) in inputs.iter().enumerate() {
+        // ponytail: one stat per row per frame, to pick the icon. Fine for a
+        // list a hand builds; carry the kind in `pending_inputs` if it ever
+        // holds more than a screenful.
+        let folder = path.is_dir();
+        let drop_it = weak.clone();
+        list = list.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_1()
+                .rounded(cx.theme().radius)
+                .hover(|style| style.bg(cx.theme().accent))
+                .child(
+                    Icon::new(if folder {
+                        IconName::Folder
+                    } else {
+                        IconName::File
+                    })
+                    .size_4()
+                    .text_color(cx.theme().muted_foreground),
+                )
+                .child(div().flex_1().truncate().child(path.display().to_string()))
+                .child(
+                    Button::new(("add-drop-input", index))
+                        .icon(IconName::Close)
+                        .accessibility_label(s.remove_input.to_string())
+                        .tooltip(s.remove_input)
+                        .ghost()
+                        .compact()
+                        .on_click(move |_, _, cx| {
+                            let _ = drop_it.update(cx, |this, cx| {
+                                // By index and not by value: the same path
+                                // cannot be in the list twice, but reading the
+                                // list back to find it would be one more place
+                                // for the two to disagree.
+                                if index < this.controller.state.pending_inputs.len() {
+                                    this.controller.state.pending_inputs.remove(index);
+                                }
+                                cx.notify();
+                            });
+                        }),
+                ),
+        );
+    }
+    list
+}
+
 /// The overflow entries that write to the archive, as a value rather than a
 /// closure: the menu is built while the shell is still borrowed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum OverflowAction {
     Release,
     AddFiles,
+    AddFolders,
     NewFolder,
     Undo,
     SaveCopy,
@@ -5466,14 +5686,6 @@ fn clipboard_action_allowed(
     available && idle && has_archive && (!needs_selection || selected > 0)
 }
 
-fn drop_paths_for_enter(paths: &[PathBuf], allowed: bool) -> Vec<PathBuf> {
-    if allowed {
-        paths.to_vec()
-    } else {
-        Vec::new()
-    }
-}
-
 fn empty_state_aria_label(error: bool, filter: &str, s: &'static Strings) -> &'static str {
     if error {
         s.cannot_open
@@ -5485,6 +5697,9 @@ fn empty_state_aria_label(error: bool, filter: &str, s: &'static Strings) -> &'s
 }
 
 fn apply_startup(controller: &mut AppController, startup: Startup) {
+    // A window opened by the Explorer entries exists for that one job and
+    // closes when it is done; one opened to browse stays.
+    controller.state.one_shot = !matches!(startup, Startup::Browse(_));
     match startup {
         Startup::Browse(Some(path)) => controller.open(path),
         Startup::Browse(None) => {}
@@ -5620,13 +5835,6 @@ mod tests {
         assert!(!clipboard_action_allowed(true, true, true, 0, true));
         assert!(clipboard_action_allowed(true, true, true, 0, false));
         assert!(!clipboard_action_allowed(true, true, false, 0, false));
-    }
-
-    #[test]
-    fn blocked_drop_enter_clears_pending_paths() {
-        let paths = vec![PathBuf::from("queued.zip")];
-        assert_eq!(drop_paths_for_enter(&paths, true), paths);
-        assert!(drop_paths_for_enter(&paths, false).is_empty());
     }
 
     #[test]

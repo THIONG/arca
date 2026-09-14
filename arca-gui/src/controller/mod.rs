@@ -218,15 +218,29 @@ impl AppController {
         }
     }
 
+    /// Opens the add box, with whatever was just picked added to it.
+    ///
+    /// Adding rather than replacing is what lets a selection be built out of
+    /// both files and folders: the native dialog only offers one or the other,
+    /// so a mixed selection takes more than one pass through here.
     pub(crate) fn prepare_compress(&mut self, inputs: Vec<PathBuf>) {
-        if inputs.is_empty() {
-            return;
+        if !matches!(self.state.view, View::Add) {
+            self.state.pending_inputs.clear();
+            self.state.output_name.clear();
         }
-        self.state.output_name = quick_output(&inputs, self.state.format)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        self.state.pending_inputs = inputs;
+        for path in inputs {
+            if !self.state.pending_inputs.contains(&path) {
+                self.state.pending_inputs.push(path);
+            }
+        }
+        // Only while the box has no name in it, so a name typed by hand is not
+        // overwritten by the next folder added.
+        if self.state.output_name.is_empty() && !self.state.pending_inputs.is_empty() {
+            self.state.output_name = quick_output(&self.state.pending_inputs, self.state.format)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+        }
         self.state.view = View::Add;
     }
     pub(crate) fn select_all_visible(&mut self) {
@@ -299,6 +313,7 @@ impl AppController {
                 pending_inputs: Vec::new(),
                 output_name: String::new(),
                 close_when_done: false,
+                one_shot: false,
                 title: String::new(),
                 window_title: "Arca".to_string(),
                 current_dir: String::new(),
@@ -1495,17 +1510,21 @@ impl AppController {
         // rest can come from the Explorer, and then there is no list behind it.
         let from_here = self.state.archive.is_some() || matches!(job, Job::Update { .. });
         self.show_job(&verb, subject_of(&job), from_here);
-        self.state.close_when_done = !matches!(
-            job,
-            Job::Test { .. }
-                | Job::Password { .. }
-                | Job::Delete { .. }
-                | Job::Rename { .. }
-                | Job::CopyTo { .. }
-                | Job::NewFolder { .. }
-                | Job::Move { .. }
-                | Job::Add { .. }
-        );
+        // Only a window that was opened to do this one job goes away when it is
+        // done. Started from the toolbar, finishing a job and closing the whole
+        // program is indistinguishable from a crash.
+        self.state.close_when_done = self.state.one_shot
+            && !matches!(
+                job,
+                Job::Test { .. }
+                    | Job::Password { .. }
+                    | Job::Delete { .. }
+                    | Job::Rename { .. }
+                    | Job::CopyTo { .. }
+                    | Job::NewFolder { .. }
+                    | Job::Move { .. }
+                    | Job::Add { .. }
+            );
         // The file on disk is about to change, so the listing has to be redone.
         //
         // One match rather than a copy of the same `if let` per job: written as
@@ -1819,6 +1838,66 @@ mod reread_tests {
 ///
 /// It used to build the job with no new password in it and run it, so the one
 /// thing the button could do was take a password off.
+/// The add box is built up, not replaced, and a window nobody handed a job to
+/// on the command line survives the job it was asked for.
+///
+/// Both of these were bugs: compressing from the toolbar closed the whole
+/// program when it finished, and a second pass through the picker threw away
+/// the first one, which is why a selection could never mix files and folders.
+#[cfg(test)]
+mod compress_tests {
+    use super::*;
+
+    #[test]
+    fn picking_twice_keeps_both_picks_and_the_typed_name() {
+        let mut controller = AppController::new(Settings::default());
+        controller.prepare_compress(vec![PathBuf::from("/tmp/a.txt")]);
+        let derived = controller.state.output_name.clone();
+        assert!(!derived.is_empty());
+        controller.state.output_name = "mine.zip".into();
+        controller.prepare_compress(vec![
+            PathBuf::from("/tmp/folder"),
+            PathBuf::from("/tmp/a.txt"),
+        ]);
+        assert_eq!(
+            controller.state.pending_inputs,
+            vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/folder")]
+        );
+        assert_eq!(controller.state.output_name, "mine.zip");
+    }
+
+    #[test]
+    fn opening_the_box_afresh_starts_from_nothing() {
+        let mut controller = AppController::new(Settings::default());
+        controller.prepare_compress(vec![PathBuf::from("/tmp/a.txt")]);
+        controller.state.view = View::Browse;
+        controller.prepare_compress(Vec::new());
+        assert!(controller.state.pending_inputs.is_empty());
+        assert!(controller.state.output_name.is_empty());
+        assert!(matches!(controller.state.view, View::Add));
+    }
+
+    #[test]
+    fn a_window_opened_by_hand_stays_open_when_the_job_ends() {
+        let job = || Job::Compress {
+            out: std::env::temp_dir().join("arca-close-test.zip"),
+            inputs: vec![std::env::temp_dir().join("arca-close-test-input")],
+            format: Format::Zip,
+            codec: Codec::Deflate,
+            level: Level::Normal,
+            password: None,
+        };
+        let mut by_hand = AppController::new(Settings::default());
+        by_hand.run_job(job());
+        assert!(!by_hand.state.close_when_done);
+
+        let mut from_explorer = AppController::new(Settings::default());
+        from_explorer.state.one_shot = true;
+        from_explorer.run_job(job());
+        assert!(from_explorer.state.close_when_done);
+    }
+}
+
 #[cfg(test)]
 mod password_tests {
     use super::*;
