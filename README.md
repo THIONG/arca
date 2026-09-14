@@ -226,9 +226,14 @@ An altered byte does not come out as content, it fails the authentication code.
 Decryption is streaming, so that verdict arrives once the bytes are already
 written: the caller has to throw away what it wrote if extraction fails.
 
-What it does **not** do: ZipCrypto, the old password scheme, which is broken and
-is neither read nor written. File names are not encrypted, because the ZIP format
-does not allow it: the listing is visible without the password.
+ZipCrypto, the old password scheme, is read but never written: an archive from
+another tool opens with its password, and `arca password` moves it to AES-256.
+The scheme is broken by design, so nothing new is created with it. Its password
+check is a single byte, so one wrong password in 256 gets past it and fails on
+the checksum instead.
+
+File names are not encrypted, because the ZIP format does not allow it: the
+listing is visible without the password.
 
 ```sh
 arca create secret.zip folder/ -p "a password"

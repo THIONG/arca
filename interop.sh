@@ -136,14 +136,26 @@ $ARCA test out/a-normal.zip >/dev/null 2>&1 && ok "accepts the intact archive" |
 
 echo
 echo "F) Security: Zip Slip"
+# Built and checked relative to the working directory, both here and in the
+# entry name. Anchored at /tmp this tested nothing on Windows: Git Bash puts
+# /tmp under AppData while a native python3 reads it as C:\tmp, so the fixture
+# was never written, the extraction failed for want of a file, no escaped file
+# appeared, and a security control reported a pass having run nothing. An
+# escape one level up lands somewhere both platforms can name.
 python3 - <<'PY'
 import zipfile
-z=zipfile.ZipFile('/tmp/interop/out/slip.zip','w')
-z.writestr('../../../../tmp/PWNED','malicious'); z.close()
+z = zipfile.ZipFile('out/slip.zip', 'w')
+z.writestr('../PWNED', 'malicious')
+z.close()
 PY
-rm -rf y; mkdir y
-$ARCA extract out/slip.zip -o y >/dev/null 2>&1
-if [ -f /tmp/PWNED ]; then ko "WROTE OUTSIDE THE DESTINATION"; rm -f /tmp/PWNED; else ok "rejects the path escaping the destination"; fi
+if [ ! -s out/slip.zip ]; then
+  ko "the zip slip archive was not built, this control tested nothing"
+else
+  rm -rf y; mkdir y
+  $ARCA extract out/slip.zip -o y >/dev/null 2>&1 && ko "extracted an archive that escapes the destination" || ok "rejects the path escaping the destination"
+  # Beside the destination and not inside it, which is where the entry aimed.
+  if [ -f PWNED ]; then ko "WROTE OUTSIDE THE DESTINATION"; rm -f PWNED; else ok "nothing was written outside the destination"; fi
+fi
 
 echo
 echo "-------------------------------------------"

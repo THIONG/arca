@@ -1,5 +1,4 @@
 use arca_core::Entry;
-use eframe::egui;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -11,20 +10,6 @@ pub enum Kind {
     Audio,
     Video,
     Other,
-}
-
-impl Kind {
-    fn color(self) -> egui::Color32 {
-        match self {
-            Kind::Dir => egui::Color32::from_rgb(232, 184, 92),
-            Kind::Image => egui::Color32::from_rgb(122, 192, 132),
-            Kind::Text => egui::Color32::from_rgb(142, 172, 214),
-            Kind::Archive => egui::Color32::from_rgb(190, 142, 214),
-            Kind::Audio => egui::Color32::from_rgb(214, 142, 160),
-            Kind::Video => egui::Color32::from_rgb(214, 160, 112),
-            Kind::Other => egui::Color32::from_rgb(150, 152, 158),
-        }
-    }
 }
 
 pub fn kind_of(name: &str, is_dir: bool) -> Kind {
@@ -46,45 +31,6 @@ pub fn kind_of(name: &str, is_dir: bool) -> Kind {
     }
 }
 
-/// The hand drawn icon, in the space the layout gives it.
-pub fn draw_icon(ui: &mut egui::Ui, kind: Kind) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
-    draw_icon_at(ui, rect, kind);
-}
-
-/// The same, in a rectangle the caller has already decided on: the tree places
-/// its own rows and has nowhere to allocate from.
-pub fn draw_icon_at(ui: &mut egui::Ui, rect: egui::Rect, kind: Kind) {
-    let p = ui.painter();
-    let c = kind.color();
-    let faded = egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 110);
-
-    if kind == Kind::Dir {
-        let tab =
-            egui::Rect::from_min_size(rect.left_top() + egui::vec2(1.0, 2.5), egui::vec2(6.0, 2.5));
-        p.rect_filled(tab, 1.0, c);
-        let body = egui::Rect::from_min_max(
-            rect.left_top() + egui::vec2(1.0, 4.5),
-            rect.right_bottom() - egui::vec2(1.0, 2.0),
-        );
-        p.rect_filled(body, 2.0, c);
-        return;
-    }
-
-    let body = egui::Rect::from_min_max(
-        rect.left_top() + egui::vec2(2.5, 1.5),
-        rect.right_bottom() - egui::vec2(2.5, 1.5),
-    );
-    p.rect_filled(body, 1.5, faded);
-    p.rect_stroke(body, 1.5, egui::Stroke::new(1.0_f32, c));
-    let fold = vec![
-        egui::pos2(body.right() - 4.5, body.top()),
-        egui::pos2(body.right(), body.top() + 4.5),
-        egui::pos2(body.right() - 4.5, body.top() + 4.5),
-    ];
-    p.add(egui::Shape::convex_polygon(fold, c, egui::Stroke::NONE));
-}
-
 #[derive(Clone)]
 pub struct Row {
     pub label: String,
@@ -96,6 +42,7 @@ pub struct Row {
     pub packed: u64,
     pub method: &'static str,
     pub encrypted: bool,
+    pub zipcrypto: bool,
     pub count: usize,
     // Straight off the entry, for the columns that can be turned on. A folder
     // has none of its own: it is not a thing the archive recorded.
@@ -151,6 +98,7 @@ pub fn children_of(entries: &[Entry], dir: &str) -> Vec<Row> {
                         packed: e.compressed_size,
                         method: e.method.name(),
                         encrypted: e.encrypted,
+                        zipcrypto: e.zipcrypto,
                         count: 0,
                         mtime: e.mtime,
                         created: e.created,
@@ -176,8 +124,105 @@ pub fn children_of(entries: &[Entry], dir: &str) -> Vec<Row> {
             packed,
             method: "",
             encrypted: false,
+            zipcrypto: false,
             // A folder in the list is made up out of the names under it, not
             // read from an entry: there is nothing of its own to report.
+            mtime: None,
+            created: None,
+            accessed: None,
+            attributes: 0,
+            crc32: 0,
+            count,
+            up: false,
+        })
+        .collect();
+    rows.append(&mut files);
+    rows
+}
+
+/// The leaf of a path: the name at the end, without the folders in front.
+fn leaf_of(path: &str) -> &str {
+    let path = path.trim_end_matches('/');
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Everything underneath `dir`, at any depth, whose own name contains
+/// `needle`, which is expected folded to lowercase already.
+///
+/// A search reaches down through the folders, so it answers with folders as
+/// well as files, and it names a row by the path from `dir` down: the leaf
+/// alone would not say which of five folders the hit came out of, and the
+/// whole path would repeat the way back to the archive root on every row.
+/// Only the leaf is matched -- matching the path made a search for `redist`
+/// inside `_CommonRedist` answer with every file in the folder.
+pub fn search_under(entries: &[Entry], dir: &str, needle: &str) -> Vec<Row> {
+    let mut folders: BTreeMap<String, (u64, u64, usize)> = BTreeMap::new();
+    let mut files: Vec<Row> = Vec::new();
+
+    for (i, e) in entries.iter().enumerate() {
+        let full = normalized(e);
+        let Some(rest) = full.strip_prefix(dir) else {
+            continue;
+        };
+        let rest = rest.trim_end_matches('/').to_string();
+        if rest.is_empty() {
+            continue;
+        }
+        // Every folder on the way down, whether or not the archive ever wrote
+        // an entry of its own for it, and what it holds adds up as we pass.
+        let mut at = 0;
+        while let Some(cut) = rest[at..].find('/') {
+            let end = at + cut;
+            let slot = folders.entry(rest[..end].to_string()).or_insert((0, 0, 0));
+            if !e.is_dir {
+                slot.0 += e.size;
+                slot.1 += e.compressed_size;
+                slot.2 += 1;
+            }
+            at = end + 1;
+        }
+        if e.is_dir {
+            folders.entry(rest).or_insert((0, 0, 0));
+            continue;
+        }
+        if !rest[at..].to_lowercase().contains(needle) {
+            continue;
+        }
+        files.push(Row {
+            kind: kind_of(&rest[at..], false),
+            label: rest,
+            path: full,
+            is_dir: false,
+            entry: Some(i),
+            size: e.size,
+            packed: e.compressed_size,
+            method: e.method.name(),
+            encrypted: e.encrypted,
+            zipcrypto: e.zipcrypto,
+            count: 0,
+            mtime: e.mtime,
+            created: e.created,
+            accessed: e.accessed,
+            attributes: e.attributes,
+            crc32: e.crc32,
+            up: false,
+        });
+    }
+
+    let mut rows: Vec<Row> = folders
+        .into_iter()
+        .filter(|(rel, _)| leaf_of(rel).to_lowercase().contains(needle))
+        .map(|(rel, (size, packed, count))| Row {
+            path: format!("{dir}{rel}/"),
+            label: rel,
+            kind: Kind::Dir,
+            is_dir: true,
+            entry: None,
+            size,
+            packed,
+            method: "",
+            encrypted: false,
+            zipcrypto: false,
             mtime: None,
             created: None,
             accessed: None,
@@ -229,6 +274,7 @@ mod tests {
             attributes: 0,
             offset: 0,
             encrypted: false,
+            zipcrypto: false,
         }
     }
 
@@ -271,6 +317,21 @@ mod tests {
         assert_eq!(parent_of("arbol/docs/"), "arbol/");
         assert_eq!(parent_of("arbol/"), "");
         assert_eq!(parent_of(""), "");
+    }
+
+    #[test]
+    fn a_renamed_path_is_found_among_the_children_of_the_folder_above_it() {
+        // A rename is checked against what shares the folder with it, and the
+        // tree renames folders the list is not showing. Both panels look the
+        // name up this way, so a path that did not come back here would make
+        // the rename quietly do nothing.
+        for path in ["arbol/docs/", "arbol/LEEME.md", "arbol/"] {
+            let rows = children_of(&corpus(), &parent_of(path));
+            assert!(
+                rows.iter().any(|row| row.path == path),
+                "{path} is missing from its own folder"
+            );
+        }
     }
 
     #[test]
@@ -348,12 +409,6 @@ pub struct Folder {
     pub kids: BTreeMap<String, Folder>,
 }
 
-impl Folder {
-    pub fn is_empty(&self) -> bool {
-        self.kids.is_empty()
-    }
-}
-
 pub fn folders_of(entries: &[Entry]) -> Folder {
     let mut root = Folder::default();
     for e in entries {
@@ -399,6 +454,7 @@ mod folder_tests {
             accessed: None,
             attributes: 0,
             encrypted: false,
+            zipcrypto: false,
             offset: 0,
         }
     }
@@ -422,7 +478,7 @@ mod folder_tests {
             "loose files bring no folder with them"
         );
         assert_eq!(root.kids["a"].kids.keys().collect::<Vec<_>>(), ["b"]);
-        assert!(root.kids["a"].kids["b"].is_empty());
-        assert!(root.kids["empty"].is_empty());
+        assert!(root.kids["a"].kids["b"].kids.is_empty());
+        assert!(root.kids["empty"].kids.is_empty());
     }
 }

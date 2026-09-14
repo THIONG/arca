@@ -147,6 +147,7 @@ impl<R: Read> TarReader<R> {
             attributes: 0,
             offset: self.pos,
             encrypted: false,
+            zipcrypto: false,
         };
         Ok(Some(TarEntry {
             entry,

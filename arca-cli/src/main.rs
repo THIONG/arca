@@ -77,14 +77,22 @@ enum Cmd {
             help = "Threads to use. 0 means every core. Only .zip can go parallel"
         )]
         threads: usize,
-        #[arg(short = 'p', long, help = "Password of an AES-256 encrypted archive")]
+        #[arg(
+            short = 'p',
+            long,
+            help = "Password of an encrypted archive (AES-256 or ZipCrypto)"
+        )]
         password: Option<String>,
     },
     #[command(visible_alias = "t", about = "Check integrity without writing to disk")]
     Test {
         #[arg(help = "Archive to check")]
         archive: PathBuf,
-        #[arg(short = 'p', long, help = "Password of an AES-256 encrypted archive")]
+        #[arg(
+            short = 'p',
+            long,
+            help = "Password of an encrypted archive (AES-256 or ZipCrypto)"
+        )]
         password: Option<String>,
     },
     #[command(
