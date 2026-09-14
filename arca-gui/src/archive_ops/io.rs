@@ -56,6 +56,18 @@ pub(crate) fn is_encrypted(archive: &Path) -> bool {
         .unwrap_or(false)
 }
 
+// Reads a handful of bytes off the first encrypted entry, so a wrong password
+// is answered while the box is still open instead of at the first extraction.
+pub(crate) fn password_opens(archive: &Path, entries: &[Entry], password: &str) -> bool {
+    if detect(archive) != Some(Format::Zip) {
+        return true;
+    }
+    let Ok(mut f) = File::open(archive) else {
+        return true;
+    };
+    arca_zip::check_password(&mut f, entries, password).is_ok()
+}
+
 // The icon the desktop shows for this kind of file, kept as a texture per
 // extension. Without the cache a listing of 1513 entries would ask the shell
 // 1513 times a frame; with it, once per kind for the life of the window.

@@ -225,6 +225,32 @@ pub fn checksum_entry<R: Read + Seek>(
     Ok(extract_inner(source, e, io::sink(), password)?.0)
 }
 
+// Says whether a password can open the archive, reading only the few bytes at
+// the front of the first encrypted entry. It is a check and not a proof: AES
+// stores two verifier bytes and ZipCrypto one, so a wrong password gets through
+// once in 65536 or once in 256. What it buys is telling somebody the password
+// is wrong when they type it, rather than when they extract.
+pub fn check_password<R: Read + Seek>(
+    source: &mut R,
+    entries: &[Entry],
+    password: &str,
+) -> Result<()> {
+    let Some(e) = entries.iter().find(|e| e.encrypted && !e.is_dir) else {
+        return Ok(());
+    };
+    let (mut bounded, crypt) = open_data(source, e)?;
+    match crypt {
+        Crypt::Aes => {
+            unlock(&mut bounded, e, Some(password))?;
+        }
+        Crypt::Zip { check } => {
+            zipcrypto::open(&mut bounded, password, check, &e.name)?;
+        }
+        Crypt::None => {}
+    }
+    Ok(())
+}
+
 // Decrypts without decompressing, which is what changing a password comes down
 // to. WinZip AES encrypts the already compressed bytes, so taking the
 // encryption off gives back the exact deflate stream that was there before:
@@ -2957,6 +2983,35 @@ mod tests {
             a.extract_to_with(0, io::sink(), None).is_err(),
             "no password must not produce a file"
         );
+    }
+
+    #[test]
+    fn the_password_check_answers_before_anything_is_extracted() {
+        let zc = zipcrypto_archive("viejo.txt", &b"contenido".repeat(30), "secreto");
+        let mut w = ZipWriter::new(IoCursor::new(Vec::new()));
+        w.add_with_password(
+            "nuevo.txt",
+            &b"contenido".repeat(30)[..],
+            Codec::Deflate,
+            Level::Normal,
+            None,
+            Some("secreto"),
+        )
+        .unwrap();
+        let aes = w.finish().unwrap().into_inner();
+
+        for buf in [zc, aes] {
+            let entries = ZipArchive::open(IoCursor::new(buf.clone()))
+                .unwrap()
+                .entries()
+                .to_vec();
+            let mut src = IoCursor::new(buf);
+            assert!(check_password(&mut src, &entries, "secreto").is_ok());
+            assert!(
+                check_password(&mut src, &entries, "otra").is_err(),
+                "a wrong password has to be caught here, not at extraction"
+            );
+        }
     }
 
     #[test]

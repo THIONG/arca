@@ -191,7 +191,19 @@ impl AppController {
                     });
                 }
             }
-            Pending::OpenArchive => self.state.archive_password = Some(password),
+            Pending::OpenArchive => {
+                let ok = match &self.state.archive {
+                    Some(path) => password_opens(path, &self.state.entries, &password),
+                    None => true,
+                };
+                if !ok {
+                    self.state.password_wrong = true;
+                    self.state.waiting_on_password = Some(Pending::OpenArchive);
+                    return;
+                }
+                self.state.password_wrong = false;
+                self.state.archive_password = Some(password);
+            }
             Pending::CurrentPassword(job) => {
                 if let Job::Password { archive, new, .. } = *job {
                     self.state.archive_password = Some(password.clone());
@@ -321,6 +333,7 @@ impl AppController {
                 conflict: None,
                 replies: None,
                 waiting_on_password: None,
+                password_wrong: false,
                 password_input: String::new(),
                 add_password: String::new(),
                 archive_password: None,
@@ -1047,6 +1060,7 @@ impl AppController {
                     Message::Listing(path, v) => {
                         if v.iter().any(|e| e.encrypted) && self.state.archive_password.is_none() {
                             self.state.password_input.clear();
+                            self.state.password_wrong = false;
                             self.state.archive_password = None;
                             self.state.waiting_on_password = Some(Pending::OpenArchive);
                         }

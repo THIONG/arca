@@ -4347,6 +4347,8 @@ fn build_dialog(
                 })
                 .child(DialogDescription::new().child(if setting {
                     s.new_password
+                } else if shell.read(cx).controller.state.password_wrong {
+                    s.password_wrong
                 } else {
                     s.password_hint
                 }))

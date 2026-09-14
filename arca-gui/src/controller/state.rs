@@ -48,6 +48,9 @@ pub(crate) struct AppState {
     // once, before it starts, rather than per entry: every entry in a .zip is
     // encrypted with the same password, and asking again per file is noise.
     pub(crate) waiting_on_password: Option<Pending>,
+    // The last password typed to open the archive did not match. The box stays
+    // open and says so, which is the one moment the answer is still to hand.
+    pub(crate) password_wrong: bool,
     pub(crate) password_input: String,
     pub(crate) add_password: String,
     // Held for the archive currently open in the window, so extracting from it
