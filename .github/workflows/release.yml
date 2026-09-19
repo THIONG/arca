@@ -49,6 +49,19 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Lo que la ventana necesita para construirse en Linux. Las mismas que
+      # instala el CI, y tienen que seguir siendo las mismas: aqui no habia
+      # ninguna porque con egui bastaba lo que el runner ya trae, y al pasar la
+      # ventana a GPUI el CI se actualizo y esto no. Resultado: la 0.7.0
+      # compilo en Windows y en macOS, fallo en Linux, y no se publico nada.
+      - name: Window dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxrandr-dev
+          libxi-dev libgl1-mesa-dev libxcursor-dev libxinerama-dev
+          libfontconfig1-dev
+
       # A binary that does not pass the tests does not get published. The tag
       # can point at a commit CI never saw.
       - name: Tests
