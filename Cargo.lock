@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "arca-cli"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "arca-core",
  "arca-tar",
@@ -261,14 +261,14 @@ dependencies = [
 
 [[package]]
 name = "arca-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "crc32fast",
 ]
 
 [[package]]
 name = "arca-drag"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "windows 0.58.0",
  "windows-core 0.58.0",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "arca-gui"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "arca-core",
  "arca-drag",
@@ -300,28 +300,28 @@ dependencies = [
 
 [[package]]
 name = "arca-icons"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "windows 0.58.0",
 ]
 
 [[package]]
 name = "arca-net"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "windows 0.58.0",
 ]
 
 [[package]]
 name = "arca-tar"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "arca-core",
 ]
 
 [[package]]
 name = "arca-zip"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "aes",
  "arca-core",

@@ -25,6 +25,7 @@ use gpui_component::dialog::{Dialog, DialogAction, DialogClose, DialogDescriptio
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::kbd::Kbd;
 use gpui_component::list::ListItem;
+use gpui_component::menu::ContextMenuExt;
 use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::progress::Progress;
 use gpui_component::radio::RadioGroup;
@@ -62,9 +63,19 @@ fn sidebar_inner(width: f32) -> f32 {
     (width - 17.0).max(1.0)
 }
 
-const COMPACT_SIZE: (f32, f32) = (560.0, 300.0);
+/// La ventana que abre el menu contextual del Explorador: existe para un
+/// formulario y se cierra cuando el trabajo acaba.
+///
+/// Medida para que el formulario de anadir quepa entero. A 560 de ancho no
+/// cabia -- el formulario pide 600 -- y asomaba la ventana por los lados.
+const COMPACT_SIZE: (f32, f32) = (660.0, 380.0);
 const NORMAL_SIZE: (f32, f32) = (1000.0, 660.0);
-const MINIMUM_SIZE: (f32, f32) = (720.0, 320.0);
+/// Lo mas pequena que se le deja ser a la ventana.
+///
+/// El ancho es el que necesita la fila de comandos con el campo de filtrar
+/// entero detras. A 720 no le queda y el campo se sale por el borde derecho.
+/// Medido: a 727 cortado, a 745 ya no, y 800 deja margen.
+const MINIMUM_SIZE: (f32, f32) = (800.0, 320.0);
 
 /// How many recently opened archives the menu keeps room for. Ten is about as
 /// many as anybody scans before giving up and going to the folder instead.
@@ -863,20 +874,21 @@ impl GpuiShell {
         cx.notify();
     }
 
-    /// How wide the widest open folder row wants to be, so a deep branch can be
-    /// scrolled to instead of being cut off at the sidebar's edge.
+    /// Lo ancha que se dibuja una fila del arbol: lo que se ve del panel, y no
+    /// mas.
+    ///
+    /// Antes se medía el nombre mas largo -- a siete pixeles por letra -- y se
+    /// dibujaba el arbol de ese ancho, de modo que un nombre profundo se leia
+    /// desplazandose a lo ancho en vez de quedar cortado. El precio era que la
+    /// fila señalada se pintaba mas ancha que el panel y su recuadro se cerraba
+    /// fuera de lo que se ve: por la derecha parecia abierto siempre, con el
+    /// panel estrecho, porque el borde estaba a 240 con el panel en 160.
+    ///
+    /// Encajandolas, el nombre se recorta con puntos suspensivos y el recuadro
+    /// se cierra. Un nombre que no cabe se lee ensanchando el panel, que se
+    /// arrastra entre 160 y 520.
     fn widest_folder_row(&self, cx: &App) -> f32 {
-        let state = self.folders.read(cx);
-        let mut widest = sidebar_inner(self.sidebar_width(cx));
-        let mut at = 0;
-        while let Some(entry) = state.entry(at) {
-            // The label is estimated rather than measured: laying out every row
-            // twice per frame to gain a few pixels of accuracy is not worth it.
-            let label = entry.item().label.chars().count() as f32 * 7.0;
-            widest = widest.max(46.0 + 12.0 * entry.depth() as f32 + label);
-            at += 1;
-        }
-        widest
+        sidebar_inner(self.sidebar_width(cx))
     }
 
     fn begin_dialog(&mut self, kind: DialogKind, cx: &mut Context<Self>) {
@@ -2774,6 +2786,7 @@ impl Render for GpuiShell {
             .map(|release| fill(s.update_ready, &[("version", &release.tag)]));
         let has_update = release.is_some();
         let flat_view = self.controller.state.settings.flat;
+        let folders_on = self.controller.state.settings.folders;
         let visible_columns = Columns::ALL
             .iter()
             .map(|(column, _)| (*column, self.controller.state.settings.columns.on(*column)))
@@ -3067,40 +3080,72 @@ impl Render for GpuiShell {
 
                 let view_owner = owner.clone();
                 let columns_menu = visible_columns.clone();
-                menu = menu.submenu(s.view_group, window, popup_cx, move |submenu, _, _| {
-                    let flat_owner = view_owner.clone();
-                    let column_owner = view_owner.clone();
-                    let mut submenu = submenu.item(
-                        PopupMenuItem::new(s.flat_view)
-                            .disabled(!has_archive)
-                            .checked(flat_view)
-                            .on_click(move |_, _, cx| {
-                                let _ = flat_owner.update(cx, |this, cx| {
-                                    let settings = &mut this.controller.state.settings;
-                                    settings.flat = !settings.flat;
-                                    if settings.flat && !settings.columns.on(SortColumn::Path) {
-                                        settings.columns.set(SortColumn::Path, true);
-                                    }
-                                    settings.save();
-                                    this.controller.dispatch(AppAction::ClearSelection);
-                                    cx.notify();
-                                });
-                            }),
-                    );
-                    for (column, shown) in columns_menu.iter().copied() {
-                        let label = Columns::label(column, s);
-                        let column_owner = column_owner.clone();
-                        submenu = submenu.item(PopupMenuItem::new(label).checked(shown).on_click(
-                            move |_, _, cx| {
-                                let _ = column_owner.update(cx, |this, cx| {
-                                    this.controller.dispatch(AppAction::ToggleColumn(column));
-                                    cx.notify();
-                                });
-                            },
-                        ));
-                    }
-                    submenu
-                });
+                menu = menu.submenu(
+                    s.view_group,
+                    window,
+                    popup_cx,
+                    move |submenu, window, popup_cx| {
+                        let flat_owner = view_owner.clone();
+                        let column_owner = view_owner.clone();
+                        let folders_owner = view_owner.clone();
+                        // Esconder el panel de carpetas. El ajuste seguia
+                        // guardandose y leyendose, pero nadie lo miraba al dibujar:
+                        // el panel salia siempre y no habia donde quitarlo.
+                        let mut submenu = submenu.item(
+                            PopupMenuItem::new(s.folder_tree)
+                                .disabled(!has_archive)
+                                .checked(folders_on)
+                                .on_click(move |_, _, cx| {
+                                    let _ = folders_owner.update(cx, |this, cx| {
+                                        let settings = &mut this.controller.state.settings;
+                                        settings.folders = !settings.folders;
+                                        settings.save();
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                        submenu = submenu.item(
+                            PopupMenuItem::new(s.flat_view)
+                                .disabled(!has_archive)
+                                .checked(flat_view)
+                                .on_click(move |_, _, cx| {
+                                    let _ = flat_owner.update(cx, |this, cx| {
+                                        let settings = &mut this.controller.state.settings;
+                                        settings.flat = !settings.flat;
+                                        if settings.flat && !settings.columns.on(SortColumn::Path) {
+                                            settings.columns.set(SortColumn::Path, true);
+                                        }
+                                        settings.save();
+                                        this.controller.dispatch(AppAction::ClearSelection);
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                        // Las columnas, en su propio sitio. Estaban sueltas debajo
+                        // de estas dos, y son otra cosa: una dice como se dispone
+                        // la ventana y la otra que datos se ensenan de cada fila.
+                        // Trece entradas seguidas sin separar no son un menu, son
+                        // una lista.
+                        let columns_menu = columns_menu.clone();
+                        submenu.submenu(s.columns_word, window, popup_cx, move |mut cols, _, _| {
+                            for (column, shown) in columns_menu.iter().copied() {
+                                let label = Columns::label(column, s);
+                                let column_owner = column_owner.clone();
+                                cols =
+                                    cols.item(PopupMenuItem::new(label).checked(shown).on_click(
+                                        move |_, _, cx| {
+                                            let _ = column_owner.update(cx, |this, cx| {
+                                                this.controller
+                                                    .dispatch(AppAction::ToggleColumn(column));
+                                                cx.notify();
+                                            });
+                                        },
+                                    ));
+                            }
+                            cols
+                        })
+                    },
+                );
 
                 let app_owner = owner.clone();
                 menu.submenu(
@@ -3373,6 +3418,13 @@ impl Render for GpuiShell {
                 .child(self.controller.state.window_title.clone()),
         );
 
+        // Abierta desde el menu del Explorador para anadir, la ventana existe
+        // para el formulario y nada mas: no hay archivo que navegar detras.
+        // Dibujar la barra de herramientas, la lista vacia y el pie solo
+        // ponia pellizcos de una Arca que no hace nada asomando por los lados
+        // del formulario.
+        let solo_el_formulario =
+            self.controller.state.one_shot && matches!(modal, Some(ModalKind::Add));
         let mut root = div()
             .id("arca-gpui-background")
             .on_action(cx.listener(Self::focus_filter))
@@ -3382,8 +3434,9 @@ impl Render for GpuiShell {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(title_bar)
-            .child(toolbar_bar)
-            .child(nav_bar);
+            .when(!solo_el_formulario, |root| {
+                root.child(toolbar_bar).child(nav_bar)
+            });
 
         // Files from outside arrive as an ordinary GPUI drag carrying
         // `ExternalPaths`, not as a `FileDropEvent`: the window translates
@@ -3780,7 +3833,7 @@ impl Render for GpuiShell {
             .min_h(px(1.))
             .flex()
             .flex_row();
-        if has_archive {
+        if has_archive && self.controller.state.settings.folders {
             let sidebar = self.sidebar(cx);
             let width = self.sidebar_width(cx);
             body = body.child(
@@ -3813,23 +3866,28 @@ impl Render for GpuiShell {
         } else {
             body = body.child(content);
         }
-        root = root.child(body).child(
-            StatusBar::new()
-                .left(status_view)
-                .right(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("{visible} {}", s.visible_of))
-                        .child(Separator::vertical().h(px(10.)))
-                        .child(format!("{selected} {}", s.checked)),
-                )
-                .border_t_1()
-                .border_color(cx.theme().border),
-        );
+        root = if solo_el_formulario {
+            // Nada detras: el formulario se queda con la ventana entera.
+            root.child(div().flex_1())
+        } else {
+            root.child(body).child(
+                StatusBar::new()
+                    .left(status_view)
+                    .right(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{visible} {}", s.visible_of))
+                            .child(Separator::vertical().h(px(10.)))
+                            .child(format!("{selected} {}", s.checked)),
+                    )
+                    .border_t_1()
+                    .border_color(cx.theme().border),
+            )
+        };
 
         let background = root;
         let mut root = div()
@@ -3860,7 +3918,13 @@ impl Render for GpuiShell {
                 let (y0, y1) = minmax(band.origin.y, band.head.y);
                 let top = y0.max(view.top);
                 let bottom = y1.min(view.bottom);
-                if bottom > top {
+                // Recortada a la lista tambien por los lados. Lo que marca son
+                // filas, y filas solo hay aqui: a lo ancho se metia sobre el
+                // panel de carpetas y parecia marcar algo de ahi, que no lo
+                // hacia -- la seleccion la decide solo la altura.
+                let x0 = x0.max(view.left);
+                let x1 = x1.min(view.right);
+                if bottom > top && x1 > x0 {
                     // A quarter of the selection ink, so the rows underneath
                     // stay readable while they are being swept: the band says
                     // what it is reaching, and a solid one would hide it.
@@ -4817,7 +4881,32 @@ fn build_dialog(
                         ))
                         .child(row(s.level, level_pick("settings-level", shell, &weak, cx)))
                         .child(updates)
-                        .child(subfolder),
+                        .child(subfolder)
+                        .child(Separator::horizontal())
+                        // Que version es esta. El numero se compila dentro del
+                        // binario, asi que es el del programa abierto y no el
+                        // de lo que haya instalado en otro sitio: con dos
+                        // copias en el disco las ventanas son identicas y no
+                        // habia forma de distinguirlas desde dentro. Al lado,
+                        // cuando la hay, la que ha salido.
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_sm()
+                                .text_color(muted)
+                                .child(format!("Arca {}", env!("CARGO_PKG_VERSION")))
+                                .children(
+                                    shell
+                                        .read(cx)
+                                        .controller
+                                        .state
+                                        .update
+                                        .as_ref()
+                                        .map(|r| format!("· {}", r.tag)),
+                                ),
+                        ),
                 )
         }
         ModalKind::NewFolder | ModalKind::Mask => {
@@ -5197,10 +5286,11 @@ impl TableDelegate for FileTable {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let Some(column) = self.columns.get(col_ix).copied() else {
-            return div().id("header-cell");
+            return div().id("header-cell").into_any_element();
         };
         let s = self.strings;
         let label = Columns::label(column, s);
+        let shell = self.shell.clone();
         let role = Role::ColumnHeader;
         let accessible = if self.order.0 == column {
             let direction = if self.order.1 {
@@ -5228,6 +5318,36 @@ impl TableDelegate for FileTable {
                     .perform_sort(col_ix, ColumnSort::Default, window, cx);
             }))
             .child(label)
+            // Que columnas se ven, pulsando con el derecho sobre cualquier
+            // cabecera. Es donde lo tienen el Explorador, WinRAR y NanaZip, y
+            // donde se mira primero; sin esto las once columnas no tenian mas
+            // sitio que el menu de la barra, y por eso estaban alli mezcladas
+            // con la disposicion de la ventana.
+            //
+            // Lo marcado se lee al abrirlo, no al dibujar la cabecera: el menu
+            // se construye cuando se pide y tiene que decir lo que hay ahora.
+            .context_menu(move |menu, _, cx| {
+                let Some(shell) = shell.upgrade() else {
+                    return menu;
+                };
+                let on = shell.read(cx).controller.state.settings.columns;
+                let mut menu = menu;
+                for (which, _) in Columns::ALL {
+                    let owner = shell.downgrade();
+                    menu = menu.item(
+                        PopupMenuItem::new(Columns::label(which, s))
+                            .checked(on.on(which))
+                            .on_click(move |_, _, cx| {
+                                let _ = owner.update(cx, |this, cx| {
+                                    this.controller.dispatch(AppAction::ToggleColumn(which));
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
     }
 
     fn render_td(
@@ -5632,6 +5752,7 @@ pub(crate) fn run() {
     let startup = super::parse_args();
     let compact = !matches!(startup, Startup::Browse(_));
     let (width, height) = shell_size(compact);
+    let floor = if compact { COMPACT_SIZE } else { MINIMUM_SIZE };
 
     // The kit's icons are SVG assets, not glyphs; without an asset source every
     // `IconName` resolves to nothing and the toolbar renders blank.
@@ -5659,7 +5780,12 @@ pub(crate) fn run() {
                     // tokens as everything below it.
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(bounds)),
-                        window_min_size: Some(size(px(MINIMUM_SIZE.0), px(MINIMUM_SIZE.1))),
+                        // El suelo de la ventana de navegar no vale para la que
+                        // abre el menu contextual: esa existe para un formulario
+                        // y nada mas. Con un solo minimo para las dos, Windows
+                        // estiraba la pequena hasta el ancho de la grande y el
+                        // formulario quedaba flotando sobre una Arca vacia.
+                        window_min_size: Some(size(px(floor.0), px(floor.1))),
                         ..TitleBar::window_options()
                     },
                     |window, cx| {

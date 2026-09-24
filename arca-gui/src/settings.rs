@@ -29,8 +29,14 @@ pub(crate) struct Settings {
     pub(crate) updates: bool,
     // Every file in the archive at once, instead of one folder at a time.
     pub(crate) flat: bool,
-    // The folders of the archive down the left hand side.
-    pub(crate) tree: bool,
+    // El panel de carpetas del archivo, a la izquierda.
+    //
+    // La clave se llama `folders` y no `tree` a proposito. La vieja existe en
+    // los ajustes de todo el mundo puesta a `no`, porque asi venia de fabrica
+    // y durante una version entera no la leyo nadie: honrarla ahora escondería
+    // el panel a quien nunca pidio esconderlo. Con otro nombre, la vieja se
+    // ignora y el panel sigue saliendo.
+    pub(crate) folders: bool,
     // Which code page an unflagged zip has its names written in. Only the
     // person looking at the archive can know, so it is remembered: somebody
     // whose archives all come from one machine says it once.
@@ -76,7 +82,7 @@ impl Default for Settings {
             columns: Columns::default(),
             updates: true,
             flat: false,
-            tree: false,
+            folders: true,
             page: arca_zip::pages::Page::default(),
             window: None,
             recent: Vec::new(),
@@ -114,7 +120,7 @@ impl Settings {
                 ("theme", "dark") => s.theme = ThemePreference::Dark,
                 ("theme", _) => s.theme = ThemePreference::System,
                 ("flat", v) => s.flat = v == "yes",
-                ("tree", v) => s.tree = v == "yes",
+                ("folders", v) => s.folders = v == "yes",
                 ("updates", v) => s.updates = v != "no",
                 ("page", v) => {
                     if let Some(p) = arca_zip::pages::Page::from_code(v) {
@@ -212,7 +218,11 @@ impl Settings {
         out.push_str(&format!("lang = {lang}\n"));
         out.push_str(&format!("theme = {theme}\n"));
         out.push_str(&format!("flat = {}\n", yes(self.flat)));
-        out.push_str(&format!("tree = {}\n", yes(self.tree)));
+        out.push_str(&format!(
+            "folders = {}
+",
+            yes(self.folders)
+        ));
         out.push_str(&format!("updates = {}\n", yes(self.updates)));
         out.push_str(&format!("page = {}\n", self.page.code()));
         out.push_str(&format!("columns = {}\n", columns.join(",")));

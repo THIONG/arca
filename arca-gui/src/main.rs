@@ -176,7 +176,7 @@ c76ecf12e8e05b8f4730fb9933450ea121fe1ce3699ab9b7d20b058f872815f4 *arca-setup-0.6
             lang: Some(Lang::Es),
             theme: ThemePreference::Light,
             flat: true,
-            tree: true,
+            folders: true,
             updates: false,
             page: arca_zip::pages::Page::Cp1252,
             ..Default::default()
@@ -194,7 +194,7 @@ c76ecf12e8e05b8f4730fb9933450ea121fe1ce3699ab9b7d20b058f872815f4 *arca-setup-0.6
         assert_eq!(after.lang, before.lang);
         assert_eq!(after.theme, before.theme);
         assert_eq!(after.flat, before.flat);
-        assert_eq!(after.tree, before.tree);
+        assert_eq!(after.folders, before.folders);
         assert_eq!(after.updates, before.updates);
         assert_eq!(after.page, before.page);
         assert_eq!(after.widths, before.widths);
